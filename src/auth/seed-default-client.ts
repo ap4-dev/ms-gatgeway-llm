@@ -25,6 +25,10 @@ export function ensureDefaultAdminClient(
     const { client, plaintextApiKey } = clients.create({
         id,
         name,
+        // First-boot admin gets every scope so the operator can manage
+        // clients + chat + everything from the same key. Operators that
+        // prefer least-privilege can rotate or replace this client.
+        scopes: ['admin', 'chat.read', 'chat.write'],
         rateLimitRpm,
     });
 

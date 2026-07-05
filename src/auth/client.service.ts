@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ClientRepository, type Client } from './client.repository';
 import {
     extractPrefix,
@@ -75,6 +75,90 @@ export class ClientService {
 
     revoke(id: string): void {
         this.repo.revoke(id, Math.floor(Date.now() / 1000));
+    }
+
+    /**
+     * Phase 5.5 partial update. Fields not provided keep their current
+     * values (`scope` defaults to the existing list; `rateLimitTpm` set
+     * to `null` clears the token cap).
+     */
+    update(
+        id: string,
+        fields: {
+            name?: string;
+            scopes?: string[];
+            rateLimitRpm?: number;
+            rateLimitTpm?: number | null;
+        },
+    ): Client {
+        const existing = this.repo.findById(id);
+        if (!existing) {
+            throw new NotFoundException(`Client "${id}" not found`);
+        }
+        const next = {
+            name: fields.name ?? existing.name,
+            scopes: fields.scopes ?? existing.scopes,
+            rateLimitRpm: fields.rateLimitRpm ?? existing.rateLimitRpm,
+            rateLimitTpm:
+                fields.rateLimitTpm !== undefined
+                    ? fields.rateLimitTpm
+                    : existing.rateLimitTpm,
+        };
+        if (next.scopes.length === 0) {
+            throw new Error('client must keep at least one scope');
+        }
+        if (next.rateLimitRpm <= 0) {
+            throw new Error('rate_limit_rpm must be > 0');
+        }
+        this.repo.update(id, next);
+        const updated = this.repo.findById(id);
+        if (!updated) {
+            // Should never happen — update just succeeded.
+            throw new Error(`Failed to load client after update: ${id}`);
+        }
+        return updated;
+    }
+
+    /**
+     * Phase 5.5 key rotation. Generates a new plaintext key, hashes it,
+     * replaces the api_key_hash + api_key_prefix in the row, and returns
+     * the plaintext so the operator can hand it out exactly once.
+     * The old key is invalidated immediately.
+     */
+    rotateKey(id: string): { client: Client; plaintextApiKey: string } {
+        const existing = this.repo.findById(id);
+        if (!existing) {
+            throw new NotFoundException(`Client "${id}" not found`);
+        }
+        if (existing.revoked) {
+            // Rotating a revoked client resurrects it. That seems wrong —
+            // refuse so the operator can create a new client instead.
+            throw new Error(
+                `Client "${id}" is revoked; create a new client instead`,
+            );
+        }
+        const plaintext = generateApiKey();
+        const apiKeyHash = hashApiKey(plaintext);
+        const apiKeyPrefix = extractPrefix(plaintext);
+        this.repo.update(id, {
+            name: existing.name,
+            scopes: existing.scopes,
+            rateLimitRpm: existing.rateLimitRpm,
+            rateLimitTpm: existing.rateLimitTpm,
+        });
+        // The repo.update above doesn't touch the hash/prefix (it doesn't
+        // own those columns). Rotate them via two extra statements.
+        this.repo.rotateKey(id, apiKeyHash, apiKeyPrefix);
+        const updated = this.repo.findById(id);
+        if (!updated) {
+            throw new Error(`Failed to load client after rotate: ${id}`);
+        }
+        return { client: updated, plaintextApiKey: plaintext };
+    }
+
+    /** Phase 5.5 hard delete. Idempotent — missing id returns silently. */
+    delete(id: string): void {
+        this.repo.delete(id);
     }
 
     /** Internal — used by tests that want to inject a known plaintext. */

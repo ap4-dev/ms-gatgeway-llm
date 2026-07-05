@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ClientRepository } from './client.repository';
 import { ClientService } from './client.service';
-import { hashApiKey } from './api-key-hash.util';
+import { extractPrefix as extractPrefixLocal, hashApiKey } from './api-key-hash.util';
 
 function makeDbWithSchema(): Database.Database {
     const db = new Database(':memory:');
@@ -103,6 +103,103 @@ describe('ClientService', () => {
             expect(client.revoked).toBe(false);
             svc.revoke('a');
             expect(svc.findById('a')?.revoked).toBe(true);
+        });
+    });
+
+    describe('update', () => {
+        beforeEach(() => {
+            svc.insertWithPlaintext(
+                { id: 'a', name: 'A', rateLimitRpm: 60 },
+                'sk-aaaaaaaaaaaaa',
+            );
+        });
+
+        it('updates only the supplied fields and keeps the rest', () => {
+            const updated = svc.update('a', { rateLimitRpm: 120 });
+            expect(updated.rateLimitRpm).toBe(120);
+            expect(updated.name).toBe('A');
+        });
+
+        it('updates name + scopes together', () => {
+            const updated = svc.update('a', {
+                name: 'Renamed',
+                scopes: ['admin'],
+            });
+            expect(updated.name).toBe('Renamed');
+            expect(updated.scopes).toEqual(['admin']);
+        });
+
+        it('clears rateLimitTpm when passed null', () => {
+            svc.update('a', { rateLimitTpm: 5000 });
+            expect(svc.findById('a')?.rateLimitTpm).toBe(5000);
+            svc.update('a', { rateLimitTpm: null });
+            expect(svc.findById('a')?.rateLimitTpm).toBeNull();
+        });
+
+        it('throws NotFoundException on unknown id', () => {
+            expect(() => svc.update('missing', { name: 'X' })).toThrow(/not found/i);
+        });
+
+        it('rejects updating to zero scopes', () => {
+            expect(() => svc.update('a', { scopes: [] })).toThrow(/at least one scope/);
+        });
+
+        it('rejects updating to rateLimitRpm <= 0', () => {
+            expect(() => svc.update('a', { rateLimitRpm: 0 })).toThrow(/rate_limit_rpm/);
+        });
+    });
+
+    describe('rotateKey', () => {
+        it('returns a new plaintext key and updates the row', () => {
+            const { plaintextApiKey: old } = svc.insertWithPlaintext(
+                { id: 'a', name: 'A' },
+                'sk-aaaaaaaaaaaaa',
+            );
+            const { client, plaintextApiKey: next } = svc.rotateKey('a');
+            expect(next).not.toBe(old);
+            expect(next.startsWith('sk-')).toBe(true);
+            // The new key now verifies.
+            expect(svc.verifyApiKey(next)?.id).toBe('a');
+            // The old key no longer verifies.
+            expect(svc.verifyApiKey(old)).toBeUndefined();
+            // The prefix reflects the new key.
+            expect(client.apiKeyPrefix).toBe(extractPrefixLocal(next));
+        });
+
+        it('throws on unknown id', () => {
+            expect(() => svc.rotateKey('missing')).toThrow(/not found/i);
+        });
+
+        it('refuses to rotate a revoked client', () => {
+            svc.insertWithPlaintext({ id: 'a', name: 'A' }, 'sk-aaaaaaaaaaaaa');
+            svc.revoke('a');
+            expect(() => svc.rotateKey('a')).toThrow(/create a new client/);
+        });
+
+        it('never persists the plaintext', () => {
+            const { plaintextApiKey } = svc.insertWithPlaintext(
+                { id: 'a', name: 'A' },
+                'sk-aaaaaaaaaaaaa',
+            );
+            const { plaintextApiKey: rotated } = svc.rotateKey('a');
+            const row = db.prepare('SELECT api_key_hash, api_key_prefix FROM clients WHERE id = ?').get('a') as any;
+            expect(row.api_key_hash.includes(plaintextApiKey)).toBe(false);
+            expect(row.api_key_hash.includes(rotated)).toBe(false);
+            expect(row.api_key_prefix).toBe(extractPrefixLocal(rotated));
+        });
+    });
+
+    describe('delete', () => {
+        it('removes a client', () => {
+            svc.insertWithPlaintext({ id: 'a', name: 'A' }, 'sk-aaaaaaaaaaaaa');
+            expect(svc.findById('a')).toBeDefined();
+            svc.delete('a');
+            expect(svc.findById('a')).toBeUndefined();
+        });
+
+        it('is a no-op on an unknown id', () => {
+            // Should not throw — delete is idempotent.
+            expect(() => svc.delete('missing')).not.toThrow();
         });
     });
 

@@ -44,6 +44,12 @@ describe('ensureDefaultAdminClient', () => {
         expect(printed).toMatch(/Authorization: Bearer/);
     });
 
+    it('grants the seeded admin client the admin scope so it can use admin endpoints', () => {
+        ensureDefaultAdminClient(svc, new Logger('Test'));
+        const admin = svc.findById('admin');
+        expect(admin?.scopes).toContain('admin');
+    });
+
     it('is a no-op on a DB that already has clients', () => {
         svc.create({ id: 'pre-existing', name: 'Existing' });
         const out = ensureDefaultAdminClient(svc, new Logger('Test'));

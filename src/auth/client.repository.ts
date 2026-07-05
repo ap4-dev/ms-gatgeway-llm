@@ -39,6 +39,9 @@ export class ClientRepository {
     private readonly countAllStmt: Database.Statement;
     private readonly touchLastUsedStmt: Database.Statement;
     private readonly revokeStmt: Database.Statement;
+    private readonly updateStmt: Database.Statement;
+    private readonly deleteStmt: Database.Statement;
+    private readonly rotateKeyStmt: Database.Statement;
 
     constructor(private readonly db: Database.Database) {
         this.insertStmt = this.db.prepare(`
@@ -61,6 +64,18 @@ export class ClientRepository {
         this.revokeStmt = this.db.prepare(
             'UPDATE clients SET revoked_at = ? WHERE id = ?',
         );
+        this.updateStmt = this.db.prepare(`
+            UPDATE clients SET
+                name             = ?,
+                scopes           = ?,
+                rate_limit_rpm   = ?,
+                rate_limit_tpm   = ?
+            WHERE id = ?
+        `);
+        this.deleteStmt = this.db.prepare('DELETE FROM clients WHERE id = ?');
+        this.rotateKeyStmt = this.db.prepare(
+            'UPDATE clients SET api_key_hash = ?, api_key_prefix = ? WHERE id = ?',
+        );
     }
 
     insert(input: {
@@ -81,6 +96,38 @@ export class ClientRepository {
             input.rateLimitRpm ?? 60,
             input.rateLimitTpm ?? null,
         );
+    }
+
+    /**
+     * Phase 5.5 partial update. Always overwrites name/scopes/rate_limit_*;
+     * pass `null` for `rateLimitTpm` to clear it.
+     */
+    update(
+        id: string,
+        fields: {
+            name: string;
+            scopes: string[];
+            rateLimitRpm: number;
+            rateLimitTpm: number | null;
+        },
+    ): void {
+        this.updateStmt.run(
+            fields.name,
+            fields.scopes.join(','),
+            fields.rateLimitRpm,
+            fields.rateLimitTpm,
+            id,
+        );
+    }
+
+    /** Hard-deletes the row. Used by DELETE /admin/clients/:id. */
+    delete(id: string): void {
+        this.deleteStmt.run(id);
+    }
+
+    /** Phase 5.5 key rotation — replaces the hash and the prefix. */
+    rotateKey(id: string, apiKeyHash: string, apiKeyPrefix: string): void {
+        this.rotateKeyStmt.run(apiKeyHash, apiKeyPrefix, id);
     }
 
     findById(id: string): Client | undefined {
