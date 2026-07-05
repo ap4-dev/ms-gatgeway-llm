@@ -1,0 +1,44 @@
+{
+  "providers": {
+    "nan": {
+      "apiKeyEnv": "NAN_API_KEY",
+      "baseURL": "https://api.nan.builders/v1",
+      "models": {
+        "qwen3.6": {
+          "real": "qwen3.6"
+        },
+        "qwen3-coder": {
+          "real": "qwen3-coder",
+          "maxTokens": 16384
+        },
+        "deepseek-r1": {
+          "real": "deepseek-r1"
+        }
+      }
+    },
+    "openai": {
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "baseURL": "https://api.openai.com/v1",
+      "models": {
+        "gpt-4o": {
+          "real": "gpt-4o"
+        },
+        "gpt-4o-mini": {
+          "real": "gpt-4o-mini"
+        }
+      }
+    }
+  },
+  "routing": {
+    "fallbackEnabled": true,
+    "strategy": "round-robin",
+    "healthCheckIntervalMs": 30000,
+    "requestTimeoutMs": 120000
+  },
+  "aliases": {
+    "default": "nan/qwen3.6",
+    "fast": "openai/gpt-4o-mini",
+    "strong": "nan/deepseek-r1",
+    "coder": "nan/qwen3-coder"
+  }
+}
