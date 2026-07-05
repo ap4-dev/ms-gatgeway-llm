@@ -11,10 +11,12 @@ function makeDb() {
     require('node:fs').mkdirSync(migrationsDir, { recursive: true });
     // Inline the migration SQL directly so this spec doesn't depend on the
     // repo layout changing under it.
-    const sql = readFileSync(
-        join(process.cwd(), 'migrations/0001_providers.sql'),
-        'utf-8',
-    );
+    const sql = [
+        '0001_providers.sql',
+        '0005_alias_strategy.sql',
+    ]
+        .map((f) => readFileSync(join(process.cwd(), 'migrations', f), 'utf-8'))
+        .join('\n');
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
     db.exec(sql);
@@ -109,11 +111,13 @@ describe('ProviderRegistryRepository', () => {
             const repo = new ProviderRegistryRepository(db);
             const policy = repo.getPolicy();
             expect(policy.fallbackEnabled).toBe(true);
-            expect(policy.strategy).toBe('primary');
             expect(policy.requestTimeoutMs).toBe(120_000);
             expect(policy.cooldownMs).toBe(30_000);
             expect(policy.failureThreshold).toBe(5);
             expect(policy.halfOpenProbes).toBe(1);
+            // Phase 5.5: `strategy` no longer lives on the global policy;
+            // per-alias strategy lives on `alias_policy`.
+            expect((policy as any).strategy).toBeUndefined();
         });
 
         it('findModel scans across providers and returns the first match', () => {
@@ -196,9 +200,8 @@ describe('ProviderRegistryRepository', () => {
 
         it('setPolicy updates the singleton row', () => {
             const repo = new ProviderRegistryRepository(db);
-            repo.setPolicy({ strategy: 'fallback', failureThreshold: 10 });
+            repo.setPolicy({ failureThreshold: 10 });
             const policy = repo.getPolicy();
-            expect(policy.strategy).toBe('fallback');
             expect(policy.failureThreshold).toBe(10);
             // Untouched fields keep their defaults.
             expect(policy.cooldownMs).toBe(30_000);

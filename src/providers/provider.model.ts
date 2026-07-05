@@ -54,9 +54,24 @@ export type Aliases = z.infer<typeof AliasesSchema>;
 
 // --- routing policy ------------------------------------------------------
 
+/**
+ * Per-alias strategy kind. Lives in its own table (`alias_policy`)
+ * since Phase 5.5 — the global `routing_policy` no longer carries one.
+ *
+ * Future extensions (intentionally NOT here yet): `weighted` (need a
+ * sibling `alias_weights` table for the per-entry weights), and
+ * priority-grouping (a `priority` integer on each alias entry).
+ * When added, the SQL CHECK constraint widens via a separate migration.
+ */
+export const RoutingStrategySchema = z.enum([
+    'primary',
+    'round-robin',
+    'fallback',
+]);
+export type RoutingStrategyKind = z.infer<typeof RoutingStrategySchema>;
+
 const RoutingSchema = z.object({
     fallbackEnabled: z.boolean().default(true),
-    strategy: z.enum(['primary', 'round-robin', 'fallback']).default('primary'),
     healthCheckIntervalMs: z.number().int().positive().default(30_000),
     requestTimeoutMs: z.number().int().positive().default(120_000),
     // Phase 3: circuit breaker knobs (apply globally to every provider).

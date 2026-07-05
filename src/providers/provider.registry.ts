@@ -4,6 +4,7 @@ import {
     type ProviderConfig,
     type ProvidersFile,
     type RoutingPolicy,
+    type RoutingStrategyKind,
 } from './provider.model';
 import { ProviderRegistryRepository } from '../database/repositories/provider-registry.repository';
 
@@ -70,6 +71,16 @@ export class ProviderRegistryService {
         | { providerId: string; modelKey: string; config: ProviderConfig }
         | undefined {
         return this.repo.findModel(modelKey);
+    }
+
+    /**
+     * Per-alias routing strategy lookup. Returns `'primary'` when no
+     * `alias_policy` row exists. Phase-after-5.5: the strategy enum
+     * lives here (and in `alias_policy`), not on the global
+     * `routing_policy` row.
+     */
+    getStrategy(aliasKey: string): RoutingStrategyKind {
+        return this.repo.getStrategy(aliasKey);
     }
 
     /** Re-export for tests / admin code that want direct repo access. */

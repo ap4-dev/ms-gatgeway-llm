@@ -15,6 +15,9 @@ function makeServiceWithSeed(seed: object = SEED): {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0001_providers.sql'), 'utf-8'),
     );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0005_alias_strategy.sql'), 'utf-8'),
+    );
     const tmp = require('node:fs').mkdtempSync(
         join(require('node:os').tmpdir(), 'ms-registry-spec-'),
     );
@@ -85,16 +88,19 @@ describe('ProviderRegistryService (DB-backed)', () => {
             expect(service.aliases.coder).toEqual(['nan/coder']);
         });
 
-        it('exposes the routing policy', () => {
-            expect(service.policy.strategy).toBe('fallback');
+        it('exposes the routing policy (no strategy — that lives per-alias now)', () => {
             expect(service.policy.requestTimeoutMs).toBe(120_000);
+            expect((service.policy as any).strategy).toBeUndefined();
         });
 
         it('file synthesises a ProvidersFile snapshot', () => {
             const snap = service.file;
             expect(snap.providers.nan.apiKeyEnv).toBe('NAN_API_KEY');
             expect(snap.aliases.fast[0]).toBe('openai/gpt-4o-mini');
-            expect(snap.routing?.strategy).toBe('fallback');
+            // Phase 5.5: strategy is per-alias now; routing_policy no
+            // longer carries it, so the synthesised `routing` shape
+            // omits strategy.
+            expect((snap.routing as any)?.strategy).toBeUndefined();
         });
 
         it('has() / get() check provider ids against the live DB', () => {

@@ -30,26 +30,23 @@ import { DatabaseService } from '../database/database.service';
     providers: [
         ChatService,
         ProviderService,
-        // Phase 6-ish: RoutingService reads the routing strategy (and
-        // CB knobs) from the registry at boot so a row-level update to
-        // `routing_policy.strategy` takes effect on next process restart.
-        // The RoundRobinCursor is process-local — single counter per
-        // requested-model key.
+        // Phase-after-5.5: RoutingService strategy is per-alias — looked
+        // up via `registry.getStrategy(model)` on every route call.
+        // RoundRobinCursor is process-local (single counter per
+        // requested-model key) so distinct aliases rotate independently.
         {
             provide: RoutingService,
             useFactory: (
                 providers: ProviderService,
                 breaker: CircuitBreakerService,
                 registry: ProviderRegistryService,
-            ) => {
-                const policy = registry.policy;
-                return new RoutingService(
+            ) =>
+                new RoutingService(
                     providers,
                     breaker,
-                    policy,
+                    (aliasKey) => registry.getStrategy(aliasKey),
                     new RoundRobinCursor(),
-                );
-            },
+                ),
             inject: [ProviderService, CircuitBreakerService, ProviderRegistryService],
         },
         {

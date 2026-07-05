@@ -1,7 +1,7 @@
-import type { RoutingPolicy } from '../providers/provider.model';
+import type { RoutingStrategyKind } from '../providers/provider.model';
 
 /**
- * Phase 6-ish: turn the `routing_policy.strategy` enum into a concrete
+ * Phase-after-5.5: turn the per-alias `strategy` into a concrete
  * ordering of chain indices. Pure function — no DB, no shared state.
  * Cursor state lives in `RoundRobinCursor`.
  *
@@ -17,16 +17,13 @@ import type { RoutingPolicy } from '../providers/provider.model';
  * so each alias spreads its own load.
  */
 export function pickOrder(
-    strategy: RoutingPolicy['strategy'],
+    strategy: RoutingStrategyKind,
     chainLength: number,
     cursorNext: () => number,
 ): number[] {
     if (chainLength <= 1) return chainLength === 1 ? [0] : [];
 
     if (strategy === 'round-robin') {
-        // Walk forward from the cursor's pick. The cursor advances once
-        // per *call* (we model this at the caller by invoking
-        // `cursorNext` once), then walk deterministically.
         const start = cursorNext();
         const indices = new Array<number>(chainLength);
         for (let i = 0; i < chainLength; i++) {

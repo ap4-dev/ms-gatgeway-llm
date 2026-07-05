@@ -3,7 +3,7 @@ import type { ChatCompletionCreateParams } from 'openai/resources/chat/completio
 import type { CompletionResult } from '../chat/chat.service';
 import type {
     ResolvedModel,
-    RoutingPolicy,
+    RoutingStrategyKind,
 } from '../providers/provider.model';
 import { ProviderService } from '../providers/provider.service';
 import {
@@ -68,19 +68,24 @@ export class RoutingFailedError extends Error {
  * (via {@link ProviderService.resolveChain}), then walks it under the
  * supervision of {@link CircuitBreakerService}.
  *
- * Phase 3: chain order is the ordering (chain[0] first, chain[1] on failure).
- * Phase 6-ish: when `policy.strategy === 'round-robin'`, the cursor
- * rotates per call (keyed by the requested model string), spreading
- * load across the chain while preserving the original fallback
- * semantics — an entry whose circuit is open is skipped, and any failure
- * still falls through to the next index.
+ * Strategy is PER ALIAS — looked up via `strategyFor(aliasKey)` on every
+ * call. Defaults to `'primary'` (chain order). Phase 3 behaviour when
+ * no row is configured for the alias; `'round-robin'` rotates the
+ * starting chain index per call. Future strategies (`'weighted'`,
+ * priority groups) live in the same enum and dispatch on the same
+ * lookup, so adding them does not require touching this service.
+ *
+ * Cursor (round-robin state) is keyed by the requested model string so
+ * distinct aliases rotate independently. The cursor advances once per
+ * route attempt — failures of the chosen entry still fall through to
+ * the next index in the rotated sequence.
  */
 @Injectable()
 export class RoutingService {
     constructor(
         private readonly providers: ProviderService,
         private readonly breaker: CircuitBreakerService,
-        private readonly policy: RoutingPolicy,
+        private readonly strategyFor: (aliasKey: string) => RoutingStrategyKind = () => 'primary',
         private readonly cursor: RoundRobinCursor = new RoundRobinCursor(),
     ) {}
 
@@ -94,8 +99,9 @@ export class RoutingService {
             throw new RoutingFailedError(model, []);
         }
 
+        const strategy = this.strategyFor(model);
         const order = pickOrder(
-            this.policy.strategy,
+            strategy,
             chain.length,
             // Cursor advances once per route attempt, regardless of
             // strategy (for primary/fallback the cursor isn't read but

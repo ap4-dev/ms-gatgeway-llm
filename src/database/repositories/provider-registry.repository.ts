@@ -3,6 +3,7 @@ import type {
     ModelConfig,
     ProviderConfig,
     RoutingPolicy,
+    RoutingStrategyKind,
 } from '../../providers/provider.model';
 
 /**
@@ -32,6 +33,8 @@ export class ProviderRegistryRepository {
         insertAliasEntry: Database.Statement;
         countProviders: Database.Statement;
         updatePolicy: Database.Statement;
+        getStrategy: Database.Statement;
+        upsertAliasPolicy: Database.Statement;
     };
 
     constructor(private readonly db: Database.Database) {
@@ -46,7 +49,7 @@ export class ProviderRegistryRepository {
                 'SELECT alias_name, position, provider_id, model_key FROM alias_entries ORDER BY alias_name, position',
             ),
             getPolicy: this.db.prepare(
-                'SELECT fallback_enabled, strategy, health_check_interval_ms, request_timeout_ms, failure_threshold, cooldown_ms, half_open_probes FROM routing_policy WHERE id = 1',
+                'SELECT fallback_enabled, health_check_interval_ms, request_timeout_ms, failure_threshold, cooldown_ms, half_open_probes FROM routing_policy WHERE id = 1',
             ),
             findModelByKey: this.db.prepare(
                 'SELECT provider_id, model_key FROM model_configs WHERE model_key = ? ORDER BY provider_id LIMIT 1',
@@ -72,13 +75,20 @@ export class ProviderRegistryRepository {
             updatePolicy: this.db.prepare(`
                 UPDATE routing_policy SET
                     fallback_enabled         = ?,
-                    strategy                 = ?,
                     health_check_interval_ms = ?,
                     request_timeout_ms       = ?,
                     failure_threshold        = ?,
                     cooldown_ms              = ?,
                     half_open_probes         = ?
                 WHERE id = 1
+            `),
+            getStrategy: this.db.prepare(
+                'SELECT strategy FROM alias_policy WHERE alias_key = ?',
+            ),
+            upsertAliasPolicy: this.db.prepare(`
+                INSERT INTO alias_policy (alias_key, strategy)
+                VALUES (?, ?)
+                ON CONFLICT(alias_key) DO UPDATE SET strategy = excluded.strategy
             `),
         };
     }
@@ -150,7 +160,6 @@ export class ProviderRegistryRepository {
         const row = this.queries.getPolicy.get() as
             | {
                   fallback_enabled: number;
-                  strategy: 'primary' | 'round-robin' | 'fallback';
                   health_check_interval_ms: number;
                   request_timeout_ms: number;
                   failure_threshold: number;
@@ -161,7 +170,6 @@ export class ProviderRegistryRepository {
         if (!row) {
             return {
                 fallbackEnabled: true,
-                strategy: 'primary',
                 healthCheckIntervalMs: 30_000,
                 requestTimeoutMs: 120_000,
                 failureThreshold: 5,
@@ -171,13 +179,31 @@ export class ProviderRegistryRepository {
         }
         return {
             fallbackEnabled: row.fallback_enabled === 1,
-            strategy: row.strategy,
             healthCheckIntervalMs: row.health_check_interval_ms,
             requestTimeoutMs: row.request_timeout_ms,
             failureThreshold: row.failure_threshold,
             cooldownMs: row.cooldown_ms,
             halfOpenProbes: row.half_open_probes,
         };
+    }
+
+    /**
+     * Per-alias strategy. Reads from `alias_policy`; defaults to
+     * `'primary'` when no row exists for the alias. Pure lookup — phase
+     * 5.5 has no admin endpoint to mutate this from the API, so updates
+     * happen via SQL / seed.
+     */
+    getStrategy(aliasKey: string): RoutingStrategyKind {
+        const row = this.queries.getStrategy.get(aliasKey) as
+            | { strategy: RoutingStrategyKind }
+            | undefined;
+        return row?.strategy ?? 'primary';
+    }
+
+    /** Phase 5.5: idempotent upsert for the per-alias strategy. Used
+     *  by future admin endpoints / scripts. */
+    upsertAliasPolicy(aliasKey: string, strategy: RoutingStrategyKind): void {
+        this.queries.upsertAliasPolicy.run(aliasKey, strategy);
     }
 
     /** First provider that has a model with the given key. `undefined` if none. */
@@ -264,7 +290,6 @@ export class ProviderRegistryRepository {
         const next: RoutingPolicy = { ...current, ...partial };
         this.queries.updatePolicy.run(
             next.fallbackEnabled ? 1 : 0,
-            next.strategy,
             next.healthCheckIntervalMs,
             next.requestTimeoutMs,
             next.failureThreshold,

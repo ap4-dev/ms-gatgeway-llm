@@ -1,5 +1,5 @@
 import { ProviderService } from '../providers/provider.service';
-import type { ResolvedModel, RoutingPolicy } from '../providers/provider.model';
+import type { ResolvedModel, RoutingStrategyKind } from '../providers/provider.model';
 import {
     CircuitBreakerService,
     CircuitOpenError,
@@ -84,18 +84,14 @@ function makeRegistry() {
 
 function makeService(
     breaker = new CircuitBreakerService(policy),
-    strategy: RoutingPolicy['strategy'] = 'primary',
+    strategyFor: (aliasKey: string) => RoutingStrategyKind = () => 'primary',
     cursor: RoundRobinCursor = new RoundRobinCursor(),
 ) {
     process.env.NAN_API_KEY = 'sk-nan-test';
     process.env.OPENAI_API_KEY = 'sk-openai-test';
     const providers = new ProviderService(makeRegistry(), env as any);
-    const routingPolicy: RoutingPolicy = {
-        ...fixturePolicy,
-        strategy,
-    };
     return {
-        service: new RoutingService(providers, breaker, routingPolicy, cursor),
+        service: new RoutingService(providers, breaker, strategyFor, cursor),
         breaker,
         cursor,
     };
@@ -262,13 +258,11 @@ describe('RoutingService — round-robin strategy', () => {
         const cursor = new RoundRobinCursor();
         const { service } = makeService(
             new CircuitBreakerService(policy),
-            'round-robin',
+            () => 'round-robin',
             cursor,
         );
 
         const seen: string[] = [];
-        // 4 consecutive calls to the same alias — each picks the next
-        // chain entry as the starting point.
         for (let i = 0; i < 4; i++) {
             const result = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
             seen.push(result.providerId);
@@ -280,12 +274,10 @@ describe('RoutingService — round-robin strategy', () => {
         const cursor = new RoundRobinCursor();
         const { service } = makeService(
             new CircuitBreakerService(policy),
-            'round-robin',
+            () => 'round-robin',
             cursor,
         );
 
-        // fast alias round-robins between openai (idx 0) and nan (idx 1).
-        // nanonly alias is single-entry — always nan.
         const a1 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
         const n1 = await service.route('nanonly', { model: 'nanonly' } as any, async () => ({ id: 'ok' }));
         const a2 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
@@ -293,21 +285,19 @@ describe('RoutingService — round-robin strategy', () => {
 
         expect(a1.providerId).toBe('openai');
         expect(n1.providerId).toBe('nan');
-        expect(a2.providerId).toBe('nan');     // fast cursor advanced
-        expect(n2.providerId).toBe('nan');     // nanonly cursor advanced but chain is single-element
+        expect(a2.providerId).toBe('nan');
+        expect(n2.providerId).toBe('nan');
     });
 
     it('round-robin skips an open circuit and continues to the next', async () => {
         const cursor = new RoundRobinCursor();
         const breaker = new CircuitBreakerService(policy);
-        const { service } = makeService(breaker, 'round-robin', cursor);
+        const { service } = makeService(breaker, () => 'round-robin', cursor);
 
-        // Trip openai's circuit (threshold = 2).
         breaker.recordFailure('openai');
         breaker.recordFailure('openai');
 
         const result = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
-        // Cursor landed on openai first → circuit open → fall through to nan.
         expect(result.providerId).toBe('nan');
         expect(result.attempts).toMatchObject([
             { providerId: 'openai', ok: false, circuitOpen: true },
@@ -319,12 +309,50 @@ describe('RoutingService — round-robin strategy', () => {
         const cursor = new RoundRobinCursor();
         const { service } = makeService(
             new CircuitBreakerService(policy),
-            'round-robin',
+            () => 'round-robin',
             cursor,
         );
         for (let i = 0; i < 5; i++) {
             const result = await service.route('nanonly', { model: 'nanonly' } as any, async () => ({ id: 'ok' }));
             expect(result.providerId).toBe('nan');
         }
+    });
+});
+
+describe('RoutingService — per-alias strategy', () => {
+    it('honors the strategy resolution per requested alias', async () => {
+        const cursor = new RoundRobinCursor();
+        // Map each alias to a specific strategy.
+        const strategyFor = (alias: string) => {
+            if (alias === 'fast') return 'round-robin';
+            if (alias === 'nanonly') return 'primary';
+            return 'primary';
+        };
+        const { service } = makeService(
+            new CircuitBreakerService(policy),
+            strategyFor,
+            cursor,
+        );
+
+        // fast uses round-robin → rotates across openai/nan.
+        const a1 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
+        const a2 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
+        expect(a1.providerId).toBe('openai');
+        expect(a2.providerId).toBe('nan');
+
+        // nanonly uses primary → always chain[0] = nan.
+        const n1 = await service.route('nanonly', { model: 'nanonly' } as any, async () => ({ id: 'ok' }));
+        const n2 = await service.route('nanonly', { model: 'nanonly' } as any, async () => ({ id: 'ok' }));
+        expect(n1.providerId).toBe('nan');
+        expect(n2.providerId).toBe('nan');
+    });
+
+    it('defaults to primary when the strategyFor callback returns the default', async () => {
+        const { service } = makeService(); // no override → primary
+        // Two successive calls — chain order is the same both times.
+        const a1 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
+        const a2 = await service.route('fast', { model: 'fast' } as any, async () => ({ id: 'ok' }));
+        expect(a1.providerId).toBe('openai');
+        expect(a2.providerId).toBe('openai');
     });
 });

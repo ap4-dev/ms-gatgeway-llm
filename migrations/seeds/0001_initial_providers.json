@@ -33,7 +33,6 @@
   },
   "routing": {
     "fallbackEnabled": true,
-    "strategy": "primary",
     "healthCheckIntervalMs": 30000,
     "requestTimeoutMs": 120000,
     "failureThreshold": 5,
