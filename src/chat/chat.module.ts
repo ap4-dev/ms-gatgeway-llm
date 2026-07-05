@@ -3,6 +3,7 @@ import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 import { ProviderService } from '../providers/provider.service';
 import { RoutingService } from '../routing/routing.service';
+import { RoundRobinCursor } from '../routing/round-robin-cursor';
 import { CircuitBreakerService } from '../resilience/circuit-breaker.service';
 import { ModelsController } from './models.controller';
 import {
@@ -29,7 +30,32 @@ import { DatabaseService } from '../database/database.service';
     providers: [
         ChatService,
         ProviderService,
-        RoutingService,
+        // Phase 6-ish: RoutingService reads the routing strategy (and
+        // CB knobs) from the registry at boot so a row-level update to
+        // `routing_policy.strategy` takes effect on next process restart.
+        // The RoundRobinCursor is process-local — single counter per
+        // requested-model key.
+        {
+            provide: RoutingService,
+            useFactory: (
+                providers: ProviderService,
+                breaker: CircuitBreakerService,
+                registry: ProviderRegistryService,
+            ) => {
+                const policy = registry.policy;
+                return new RoutingService(
+                    providers,
+                    breaker,
+                    policy,
+                    new RoundRobinCursor(),
+                );
+            },
+            inject: [ProviderService, CircuitBreakerService, ProviderRegistryService],
+        },
+        {
+            provide: RoundRobinCursor,
+            useFactory: () => new RoundRobinCursor(),
+        },
         // One CircuitBreakerService instance per process — keyed by
         // providerId internally. Constructor pulls the policy from the
         // registry so it stays in sync with the routing_policy table.

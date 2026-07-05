@@ -1,12 +1,17 @@
 import { Injectable } from '@nestjs/common';
 import type { ChatCompletionCreateParams } from 'openai/resources/chat/completions';
 import type { CompletionResult } from '../chat/chat.service';
-import type { ResolvedModel } from '../providers/provider.model';
+import type {
+    ResolvedModel,
+    RoutingPolicy,
+} from '../providers/provider.model';
 import { ProviderService } from '../providers/provider.service';
 import {
     CircuitBreakerService,
     CircuitOpenError,
 } from '../resilience/circuit-breaker.service';
+import { RoundRobinCursor } from './round-robin-cursor';
+import { pickOrder } from './strategy';
 
 /**
  * The executor handed to `RoutingService.route`. Receives the resolved
@@ -60,17 +65,23 @@ export class RoutingFailedError extends Error {
 
 /**
  * Resolves a user-supplied model identifier to an ordered fallback chain
- * (via {@link ProviderService.resolveChain}), walks it while consulting the
- * {@link CircuitBreakerService} for each entry, and invokes the caller-supplied
- * `executor` against the first non-open provider. On failure, transparently
- * retries on the next chain entry. Throws {@link RoutingFailedError} when
- * every entry has been exhausted.
+ * (via {@link ProviderService.resolveChain}), then walks it under the
+ * supervision of {@link CircuitBreakerService}.
+ *
+ * Phase 3: chain order is the ordering (chain[0] first, chain[1] on failure).
+ * Phase 6-ish: when `policy.strategy === 'round-robin'`, the cursor
+ * rotates per call (keyed by the requested model string), spreading
+ * load across the chain while preserving the original fallback
+ * semantics — an entry whose circuit is open is skipped, and any failure
+ * still falls through to the next index.
  */
 @Injectable()
 export class RoutingService {
     constructor(
         private readonly providers: ProviderService,
         private readonly breaker: CircuitBreakerService,
+        private readonly policy: RoutingPolicy,
+        private readonly cursor: RoundRobinCursor = new RoundRobinCursor(),
     ) {}
 
     async route(
@@ -79,9 +90,23 @@ export class RoutingService {
         executor: RouteExecutor,
     ): Promise<RouteResult> {
         const chain = this.providers.resolveChain(model);
+        if (chain.length === 0) {
+            throw new RoutingFailedError(model, []);
+        }
+
+        const order = pickOrder(
+            this.policy.strategy,
+            chain.length,
+            // Cursor advances once per route attempt, regardless of
+            // strategy (for primary/fallback the cursor isn't read but
+            // the wiring is cheap).
+            () => this.cursor.next(model, chain.length),
+        );
+
         const attempts: RouteAttempt[] = [];
 
-        for (const resolved of chain) {
+        for (const idx of order) {
+            const resolved = chain[idx];
             const start = Date.now();
 
             if (!this.breaker.canRequest(resolved.providerId)) {
