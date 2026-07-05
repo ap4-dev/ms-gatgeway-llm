@@ -13,6 +13,10 @@ export interface RecordSuccessArgs {
     attempts: number;
     latencyMs: number;
     clientKey?: string | null;
+    promptHash?: string;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
 }
 
 export interface RecordFailureArgs {
@@ -22,6 +26,7 @@ export interface RecordFailureArgs {
     latencyMs: number;
     error?: unknown;
     clientKey?: string | null;
+    promptHash?: string;
 }
 
 /**
@@ -29,13 +34,16 @@ export interface RecordFailureArgs {
  * any DB error with `logger.warn` — observability must never break an
  * actual user request.
  *
- * Wired into `ChatService.completions`; the wider observability story
- * (structured logs, metrics aggregation, OpenTelemetry) lands in Phase 4.
+ * Wired into `ChatService.completions`. Phase 4 added prompt-hash + token
+ * columns to the schema; the wider observability story (metrics
+ * aggregation, structured logging service) is also Phase 4.
  *
  * Caveat for streamed responses: the log row is written the moment the
  * upstream SDK resolves (i.e. when HTTP returned 200). A partial-stream
  * failure during iteration leaves an `ok` row even though the client
- * got truncated bytes. Phase 4 will revisit streaming visibility.
+ * got truncated bytes. Token counts are unavailable for streams unless
+ * the upstream surfaces `usage` on the final chunk, which most
+ * providers do.
  */
 @Injectable()
 export class RequestLogService {
@@ -53,6 +61,10 @@ export class RequestLogService {
             latencyMs: args.latencyMs,
             status: 'ok',
             clientKey: args.clientKey ?? null,
+            promptHash: args.promptHash ?? null,
+            promptTokens: args.promptTokens ?? null,
+            completionTokens: args.completionTokens ?? null,
+            totalTokens: args.totalTokens ?? null,
         };
         this.tryAppend(row);
     }
@@ -75,6 +87,7 @@ export class RequestLogService {
             status,
             error: errorMessage,
             clientKey: args.clientKey ?? null,
+            promptHash: args.promptHash ?? null,
         };
         this.tryAppend(row);
     }

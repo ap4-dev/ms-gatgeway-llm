@@ -9,6 +9,9 @@ function makeDb(): Database.Database {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0002_request_logs.sql'), 'utf-8'),
     );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0003_request_logs_tokens.sql'), 'utf-8'),
+    );
     return db;
 }
 
@@ -83,6 +86,32 @@ describe('RequestLogRepository', () => {
             });
             const row = db.prepare('SELECT error FROM request_logs ORDER BY id DESC LIMIT 1').get() as Record<string, unknown>;
             expect(row.error).toBeNull();
+        });
+
+        it('persists prompt_hash and token counts when provided (Phase 4)', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 5_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 1,
+                latencyMs: 250,
+                status: 'ok',
+                promptHash: 'abc123def4567890',
+                promptTokens: 42,
+                completionTokens: 17,
+                totalTokens: 59,
+            });
+            const row = db
+                .prepare(
+                    'SELECT prompt_hash, prompt_tokens, completion_tokens, total_tokens FROM request_logs ORDER BY id DESC LIMIT 1',
+                )
+                .get() as Record<string, unknown>;
+            expect(row.prompt_hash).toBe('abc123def4567890');
+            expect(row.prompt_tokens).toBe(42);
+            expect(row.completion_tokens).toBe(17);
+            expect(row.total_tokens).toBe(59);
         });
     });
 

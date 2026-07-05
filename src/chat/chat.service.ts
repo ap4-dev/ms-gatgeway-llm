@@ -11,6 +11,11 @@ import { ProviderService } from '../providers/provider.service';
 import type { ResolvedModel } from '../providers/provider.model';
 import { RoutingFailedError, RoutingService } from '../routing/routing.service';
 import { RequestLogService } from '../observability/request-log.service';
+import {
+    LlmLoggingService,
+    type RequestLogEvent,
+} from '../observability/llm-logging.service';
+import { hashPrompt } from '../observability/prompt-hash.util';
 
 export type ChatMessage = {
     role: string;
@@ -29,11 +34,11 @@ export type CompletionResult =
  * model alias into a fallback chain and walks it under the supervision of
  * the circuit breaker.
  *
- * Phase 3: this service no longer touches `ProviderService.resolve` directly.
- * It composes the body and offers an `executor` closure to the router. The
- * router picks the provider (one that isn't open in the breaker), hands us
- * back the resolved model plus an `AbortSignal` derived from the provider's
- * timeout, and we drive the official OpenAI SDK with that signal plumbed in.
+ * Phase 4: every call records a structured log entry (LlmLoggingService)
+ * and a row in `request_logs` with prompt hash and, when present,
+ * upstream token counts. Streaming responses skip the token capture
+ * (upstream usage lands in a final chunk most clients ignore — we'd need
+ * to buffer to extract it; deferred).
  */
 @Injectable()
 export class ChatService {
@@ -42,6 +47,7 @@ export class ChatService {
         private readonly providers: ProviderService,
         private readonly router: RoutingService,
         private readonly requestLog: RequestLogService,
+        private readonly structuredLog: LlmLoggingService,
     ) {}
 
     /**
@@ -51,28 +57,51 @@ export class ChatService {
      * async iterable of chunks) untouched so the controller can stream them
      * straight back to the client.
      *
-     * Phase 3.5: every call (success or failure) lands one row in
-     * `request_logs` via {@link RequestLogService}.
+     * Phase 4: every call lands one row in `request_logs` (DB) and one
+     * structured log entry on stdout (JSON). Token counts only land for
+     * non-streaming requests where the upstream surfaces `usage`.
      */
     async completions(
         body: ChatCompletionCreateParams,
     ): Promise<CompletionResult> {
         const requestedAt = Math.floor(Date.now() / 1000);
+        const promptHash = hashPrompt(
+            (body.messages ?? []) as any,
+            body.model,
+        );
         try {
             const r = await this.router.route(body.model, body, (resolved, signal) =>
                 this.callUpstream(resolved, body, signal),
             );
+            const resolvedModel = r.attempts.at(-1)?.upstreamModel ?? 'unknown';
+            const tokens = extractTokens(r.result);
             this.requestLog.recordSuccess({
                 requestedAt,
                 requestedModel: body.model,
                 resolvedProvider: r.providerId,
-                resolvedModel: r.attempts.at(-1)?.upstreamModel ?? 'unknown',
+                resolvedModel,
                 attempts: r.attempts.length,
                 latencyMs: nowSeconds() - requestedAt,
+                promptHash,
+                ...tokens,
             });
+            this.structuredLog.logRequest(
+                buildEvent({
+                    requestedAt,
+                    body,
+                    resolvedProvider: r.providerId,
+                    resolvedModel,
+                    attempts: r.attempts.length,
+                    latencyMs: nowSeconds() - requestedAt,
+                    promptHash,
+                    status: 'ok',
+                    tokens,
+                    clientKey: null,
+                }),
+            );
             return r.result;
         } catch (err) {
-            this.recordFailure(err, body, requestedAt);
+            this.recordFailure(err, body, requestedAt, promptHash);
             throw err;
         }
     }
@@ -81,24 +110,54 @@ export class ChatService {
         err: unknown,
         body: ChatCompletionCreateParams,
         requestedAt: number,
+        promptHash: string,
     ): void {
+        const argsBase = {
+            requestedAt,
+            latencyMs: nowSeconds() - requestedAt,
+            promptHash,
+            clientKey: null as string | null,
+        };
         if (err instanceof RoutingFailedError) {
             this.requestLog.recordFailure({
-                requestedAt,
+                ...argsBase,
                 requestedModel: err.requestedModel,
                 attempts: err.attempts,
-                latencyMs: nowSeconds() - requestedAt,
                 error: err,
             });
+            this.structuredLog.logRequest(
+                buildEvent({
+                    ...argsBase,
+                    body: { model: err.requestedModel } as any,
+                    resolvedProvider: null,
+                    resolvedModel: null,
+                    attempts: err.attempts.length,
+                    status: chooseStatusForFailure(err),
+                    tokens: undefined,
+                    errorMessage: err.message,
+                }),
+            );
             return;
         }
         this.requestLog.recordFailure({
-            requestedAt,
+            ...argsBase,
             requestedModel: body.model,
             attempts: [],
-            latencyMs: nowSeconds() - requestedAt,
             error: err,
         });
+        this.structuredLog.logRequest(
+            buildEvent({
+                ...argsBase,
+                body,
+                resolvedProvider: null,
+                resolvedModel: null,
+                attempts: 0,
+                status: 'error',
+                tokens: undefined,
+                errorMessage:
+                    err instanceof Error ? err.message : String(err),
+            }),
+        );
     }
 
     /**
@@ -183,6 +242,72 @@ export class ChatService {
 
 function nowSeconds(): number {
     return Math.floor(Date.now() / 1000);
+}
+
+/** Pull `usage` off a non-streaming `ChatCompletion`. Returns undefined
+ *  for streams — the SDK surfaces usage on a final chunk which we would
+ *  have to buffer to extract. Phase 4 v1 logs `ok` rows for streams
+ *  without token counts. */
+function extractTokens(result: CompletionResult):
+    | { promptTokens: number; completionTokens: number; totalTokens: number }
+    | undefined {
+    if (!result || typeof (result as any).then === 'function') return undefined;
+    // AsyncIterable<string> has Symbol.asyncIterator, ChatCompletion does not.
+    if ((result as any)[Symbol.asyncIterator]) return undefined;
+    const usage = (result as ChatCompletion).usage;
+    if (!usage) return undefined;
+    return {
+        promptTokens: usage.prompt_tokens,
+        completionTokens: usage.completion_tokens,
+        totalTokens: usage.total_tokens,
+    };
+}
+
+function chooseStatusForFailure(err: RoutingFailedError): 'error' | 'circuit_open' {
+    if (err.attempts.length === 0) return 'circuit_open';
+    if (err.attempts.every((a) => a.ok === false && a.circuitOpen === true)) {
+        return 'circuit_open';
+    }
+    return 'error';
+}
+
+interface BuildEventArgs {
+    requestedAt: number;
+    body: { model: string };
+    resolvedProvider: string | null;
+    resolvedModel: string | null;
+    attempts: number;
+    latencyMs: number;
+    promptHash: string;
+    status: 'ok' | 'error' | 'circuit_open';
+    tokens:
+        | { promptTokens: number; completionTokens: number; totalTokens: number }
+        | undefined;
+    errorMessage?: string;
+    clientKey: string | null;
+}
+
+function buildEvent(a: BuildEventArgs): RequestLogEvent {
+    return {
+        event: 'chat.request',
+        ts: a.requestedAt,
+        model: a.body.model,
+        resolvedProvider: a.resolvedProvider,
+        resolvedModel: a.resolvedModel,
+        promptHash: a.promptHash,
+        latencyMs: a.latencyMs,
+        attempts: a.attempts,
+        status: a.status,
+        ...(a.tokens
+            ? {
+                  promptTokens: a.tokens.promptTokens,
+                  completionTokens: a.tokens.completionTokens,
+                  totalTokens: a.tokens.totalTokens,
+              }
+            : {}),
+        ...(a.errorMessage ? { error: a.errorMessage } : {}),
+        ...(a.clientKey ? { clientKey: a.clientKey } : {}),
+    };
 }
 
 export function extractText(content: any): string {

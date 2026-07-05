@@ -13,6 +13,7 @@ import type { Env } from '../config/env.schema';
 import type { ResolvedModel } from '../providers/provider.model';
 import type { RouteExecutor, RouteResult, RoutingService } from '../routing/routing.service';
 import { RequestLogService } from '../observability/request-log.service';
+import { LlmLoggingService } from '../observability/llm-logging.service';
 import { RoutingFailedError } from '../routing/routing.service';
 
 const OpenAICtor = OpenAI as unknown as jest.Mock;
@@ -64,6 +65,13 @@ function makeFakeLog(): RequestLogService {
         recordSuccess: jest.fn(),
         recordFailure: jest.fn(),
     } as unknown as RequestLogService;
+}
+
+/** Same idea for the structured-logging service. */
+function makeFakeStructuredLog(): LlmLoggingService {
+    return {
+        logRequest: jest.fn(),
+    } as unknown as LlmLoggingService;
 }
 
 /** A fake RoutingService: invokes the supplied executor and packages the
@@ -120,7 +128,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider('gpt-test', 'gpt-real');
         const router = makeFakeRouter(fake.resolved);
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router.router, log);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, log, makeFakeStructuredLog());
 
         fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
         const result = await service.completions(buildSampleBody() as any);
@@ -139,18 +147,83 @@ describe('ChatService.completions', () => {
 
         expect(result).toEqual({ id: 'cmpl-1' });
         expect((log.recordSuccess as jest.Mock)).toHaveBeenCalledTimes(1);
-        expect((log.recordSuccess as jest.Mock).mock.calls[0][0]).toMatchObject({
+        const successArgs = (log.recordSuccess as jest.Mock).mock.calls[0][0];
+        expect(successArgs).toMatchObject({
             requestedModel: 'gpt-test',
             resolvedProvider: 'test',
             resolvedModel: 'gpt-real',
             attempts: 1,
         });
+        // Prompt hash must be a stable 16-char hex.
+        expect(successArgs.promptHash).toMatch(/^[0-9a-f]{16}$/);
+    });
+
+    it('captures upstream token counts from the ChatCompletion.usage payload', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const log = makeFakeLog();
+        const structuredLog = makeFakeStructuredLog();
+        const service = new ChatService(
+            fakeEnv,
+            fake.provider,
+            router.router,
+            log,
+            structuredLog,
+        );
+
+        fake.create.mockResolvedValueOnce({
+            id: 'cmpl-1',
+            usage: {
+                prompt_tokens: 42,
+                completion_tokens: 17,
+                total_tokens: 59,
+            },
+        });
+        await service.completions(buildSampleBody() as any);
+
+        const successArgs = (log.recordSuccess as jest.Mock).mock.calls[0][0];
+        expect(successArgs.promptTokens).toBe(42);
+        expect(successArgs.completionTokens).toBe(17);
+        expect(successArgs.totalTokens).toBe(59);
+
+        // Structured log carries the same numbers.
+        const event = (structuredLog.logRequest as jest.Mock).mock.calls[0][0];
+        expect(event).toMatchObject({
+            status: 'ok',
+            promptTokens: 42,
+            completionTokens: 17,
+            totalTokens: 59,
+            promptHash: expect.any(String),
+        });
+    });
+
+    it('emits a structured chat.request event on success with status=ok', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const structuredLog = makeFakeStructuredLog();
+        const service = new ChatService(
+            fakeEnv,
+            fake.provider,
+            router.router,
+            makeFakeLog(),
+            structuredLog,
+        );
+        fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
+        await service.completions(buildSampleBody() as any);
+        const event = (structuredLog.logRequest as jest.Mock).mock.calls[0][0];
+        expect(event.event).toBe('chat.request');
+        expect(event.status).toBe('ok');
+        expect(event.model).toBe('gpt-test');
+        expect(event.resolvedProvider).toBe('test');
+        expect(event.resolvedModel).toBe('gpt-test');
+        expect(event.attempts).toBe(1);
+        expect(event.promptHash).toMatch(/^[0-9a-f]{16}$/);
     });
 
     it('returns the SDK stream untouched when stream=true', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
 
         async function* fakeStream() {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
@@ -175,7 +248,7 @@ describe('ChatService.completions', () => {
     it('normalizes the body before calling the upstream (merges system messages)', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions({
@@ -203,7 +276,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody() as any);
@@ -216,7 +289,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody({ max_tokens: 99 }) as any);
@@ -231,7 +304,7 @@ describe('ChatService.completions', () => {
             route: jest.fn().mockRejectedValue(new Error('Unknown model "nope"')),
         } as unknown as RoutingService;
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router, log);
+        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog());
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(
             /Unknown model/,
@@ -255,7 +328,7 @@ describe('ChatService.completions', () => {
             }),
         } as unknown as RoutingService;
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router, log);
+        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog());
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toBeInstanceOf(
             RoutingFailedError,
@@ -268,7 +341,7 @@ describe('ChatService.completions', () => {
     it('propagates upstream errors from the OpenAI client', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
         fake.create.mockRejectedValueOnce(new Error('upstream boom'));
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(

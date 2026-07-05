@@ -16,12 +16,20 @@ export interface RequestLogRow {
     status: RequestLogStatus;
     error?: string | null;
     clientKey?: string | null;
+    /** Phase 4 observability additions — all optional, see 0003 migration. */
+    promptHash?: string | null;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    totalTokens?: number | null;
 }
 
 /**
  * Phase 3.5 request-log persistence. Wired into `RequestLogService` which
- * `ChatService.completions` calls on success and failure. The wider
- * observability work (metrics, OpenTelemetry) is Phase 4.
+ * `ChatService.completions` calls on success and failure. Phase 4 added
+ * prompt-hash + token-count columns (0003 migration); the wider
+ * observability story (metrics aggregation, structured logging,
+ * OpenTelemetry) is what Phase 4 is about — this repository is the data
+ * source for the dashboard endpoint.
  */
 export class RequestLogRepository {
     private readonly appendStmt: Database.Statement;
@@ -31,11 +39,12 @@ export class RequestLogRepository {
         this.appendStmt = this.db.prepare(`
             INSERT INTO request_logs (
                 requested_at, model_requested, resolved_provider, resolved_model,
-                attempts, latency_ms, status, error, client_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                attempts, latency_ms, status, error, client_key,
+                prompt_hash, prompt_tokens, completion_tokens, total_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.recentStmt = this.db.prepare(
-            'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
+            'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
         );
     }
 
@@ -50,6 +59,10 @@ export class RequestLogRepository {
             row.status,
             row.error ?? null,
             row.clientKey ?? null,
+            row.promptHash ?? null,
+            row.promptTokens ?? null,
+            row.completionTokens ?? null,
+            row.totalTokens ?? null,
         );
         return Number(info.lastInsertRowid);
     }
@@ -66,6 +79,10 @@ export class RequestLogRepository {
             status: RequestLogStatus;
             error: string | null;
             client_key: string | null;
+            prompt_hash: string | null;
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
         }>;
         return rows.map((r) => ({
             requestedAt: r.requested_at,
@@ -77,6 +94,10 @@ export class RequestLogRepository {
             status: r.status,
             error: r.error,
             clientKey: r.client_key,
+            promptHash: r.prompt_hash,
+            promptTokens: r.prompt_tokens,
+            completionTokens: r.completion_tokens,
+            totalTokens: r.total_tokens,
         }));
     }
 }

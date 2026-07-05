@@ -10,6 +10,7 @@ import {
 } from '../providers/provider.registry.provider';
 import { ProviderRegistryService } from '../providers/provider.registry';
 import { RequestLogService } from '../observability/request-log.service';
+import { LlmLoggingService } from '../observability/llm-logging.service';
 import { RequestLogRepository } from '../database/repositories/request-log.repository';
 import { DatabaseService } from '../database/database.service';
 
@@ -54,12 +55,14 @@ import { DatabaseService } from '../database/database.service';
             inject: [DatabaseService],
         },
         RequestLogService,
+        LlmLoggingService,
         ProviderRegistryProvider,
     ],
     exports: [
         ChatService,
         CircuitBreakerService,
         RequestLogService,
+        LlmLoggingService,
         RequestLogRepository,
     ],
 })
