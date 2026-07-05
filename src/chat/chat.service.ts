@@ -60,9 +60,12 @@ export class ChatService {
      * Phase 4: every call lands one row in `request_logs` (DB) and one
      * structured log entry on stdout (JSON). Token counts only land for
      * non-streaming requests where the upstream surfaces `usage`.
+     * Phase 5: `clientId` (verified by ApiKeyAuthGuard) is persisted on
+     * the log row and the structured event.
      */
     async completions(
         body: ChatCompletionCreateParams,
+        clientId: string | null = null,
     ): Promise<CompletionResult> {
         const requestedAt = Math.floor(Date.now() / 1000);
         const promptHash = hashPrompt(
@@ -83,6 +86,7 @@ export class ChatService {
                 attempts: r.attempts.length,
                 latencyMs: nowSeconds() - requestedAt,
                 promptHash,
+                clientKey: clientId,
                 ...tokens,
             });
             this.structuredLog.logRequest(
@@ -96,12 +100,12 @@ export class ChatService {
                     promptHash,
                     status: 'ok',
                     tokens,
-                    clientKey: null,
+                    clientKey: clientId,
                 }),
             );
             return r.result;
         } catch (err) {
-            this.recordFailure(err, body, requestedAt, promptHash);
+            this.recordFailure(err, body, requestedAt, promptHash, clientId);
             throw err;
         }
     }
@@ -111,12 +115,13 @@ export class ChatService {
         body: ChatCompletionCreateParams,
         requestedAt: number,
         promptHash: string,
+        clientId: string | null,
     ): void {
         const argsBase = {
             requestedAt,
             latencyMs: nowSeconds() - requestedAt,
             promptHash,
-            clientKey: null as string | null,
+            clientKey: clientId,
         };
         if (err instanceof RoutingFailedError) {
             this.requestLog.recordFailure({

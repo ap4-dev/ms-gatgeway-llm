@@ -1,4 +1,4 @@
-import { Global, Module } from '@nestjs/common';
+import { Global, Logger, Module } from '@nestjs/common';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseService } from './database.service';
@@ -7,6 +7,9 @@ import { ENV_CONFIG } from '../config/env.token';
 import type { Env } from '../config/env.schema';
 import { MigrationRunner } from './migrations/migration-runner';
 import { seedProvidersFromFile } from './seed/seed-on-first-boot';
+import { ClientRepository } from '../auth/client.repository';
+import { ClientService } from '../auth/client.service';
+import { ensureDefaultAdminClient } from '../auth/seed-default-client';
 
 /**
  * Default project-relative paths. Resolved against `process.cwd()` when
@@ -62,6 +65,22 @@ const DEFAULT_SEED_FILE = join(DEFAULT_SEEDS_DIR, '0001_initial_providers.json')
                 return service;
             },
             inject: [DATABASE_PATH],
+        },
+        // Phase 5 first-boot admin seed. Runs once on the very first
+        // boot when the `clients` table is empty. Subsequent boots
+        // short-circuit. The ClientService instance shares the
+        // DatabaseService's underlying connection.
+        {
+            provide: 'FIRST_BOOT_PROVISIONING',
+            useFactory: (db: DatabaseService) => {
+                const logger = new Logger('FirstBoot');
+                const clientService = new ClientService(
+                    new ClientRepository(db.db),
+                );
+                ensureDefaultAdminClient(clientService, logger);
+                return true;
+            },
+            inject: [DatabaseService],
         },
     ],
     exports: [DatabaseService, DATABASE_PATH],

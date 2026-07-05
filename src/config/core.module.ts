@@ -6,21 +6,26 @@ import {
     ProviderRegistryProvider,
 } from '../providers/provider.registry.provider';
 import { DatabaseModule } from '../database/database.module';
+import { AuthModule } from '../auth/auth.module';
+import { RateLimitModule } from '../ratelimit/ratelimit.module';
 
 /**
  * Global module that exposes the validated `Env` snapshot under the
  * `ENV_CONFIG` injection token, the loaded registry under both the
- * `PROVIDER_REGISTRY` symbol and the `ProviderRegistryService` class, and
- * the SQLite-backed repository stack via `DatabaseModule`.
+ * `PROVIDER_REGISTRY` symbol and the `ProviderRegistryService` class, the
+ * SQLite-backed repository stack via `DatabaseModule`, the auth services
+ * via `AuthModule`, and the rate-limit guard + limiter via
+ * `RateLimitModule`.
  *
  * Marked `@Global()` so feature modules (ChatModule, HealthModule, …)
  * don't need to import it explicitly — once AppModule has imported
  * CoreModule, any provider can `@Inject(...)` or constructor-inject
- * DatabaseService / ProviderRegistryService / etc. without ceremony.
+ * DatabaseService / ProviderRegistryService / ClientService /
+ * RedisRateLimiterService / etc. without ceremony.
  */
 @Global()
 @Module({
-    imports: [DatabaseModule],
+    imports: [DatabaseModule, AuthModule, RateLimitModule],
     providers: [
         envProvider,
         ProviderRegistryProvider,

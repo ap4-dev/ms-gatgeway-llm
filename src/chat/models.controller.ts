@@ -1,5 +1,7 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, UseGuards } from '@nestjs/common';
 import { ProviderRegistryService } from '../providers/provider.registry';
+import { ApiKeyAuthGuard } from '../auth/api-key.guard';
+import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 
 interface ModelListEntry {
     id: string;
@@ -26,6 +28,7 @@ interface ModelsListResponse {
  * too would yield `/v1/v1/models`.
  */
 @Controller('models')
+@UseGuards(ApiKeyAuthGuard, RateLimitGuard)
 export class ModelsController {
     // Stable timestamp per process boot — OpenAI clients only compare this
     // string against the same value on subsequent calls, so we don't need
