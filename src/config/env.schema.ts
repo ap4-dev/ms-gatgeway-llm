@@ -34,12 +34,15 @@ const envSchema = z.object({
         .default('development'),
     PORT: z.coerce.number().int().positive().default(3000),
 
-    // Provider (Phase 1: single provider; Phase 2: router over providers.json)
-    LLM_PROVIDER_API_KEY: z.string().min(1, 'LLM_PROVIDER_API_KEY is required'),
+    // Phase 1: held the single OpenAI client config. Phase 2 moves this into
+    // config/providers.json + per-provider env vars (NAN_API_KEY, etc.).
+    // Both legacy keys are now optional; ProviderService will surface a
+    // clear error if a required provider has no key.
+    LLM_PROVIDER_API_KEY: z.string().optional(),
     LLM_PROVIDER_BASE_URL: z
         .string()
         .url('LLM_PROVIDER_BASE_URL must be a valid URL')
-        .default('https://api.nan.builders/v1'),
+        .optional(),
 
     // CORS allowlist (comma-separated origins or "*")
     CORS_ORIGINS: z.string().optional(),

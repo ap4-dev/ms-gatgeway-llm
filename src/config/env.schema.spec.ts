@@ -56,9 +56,12 @@ describe('env schema', () => {
         expect(() => getEnv()).toThrow(/NODE_ENV/);
     });
 
-    it('requires LLM_PROVIDER_API_KEY', () => {
+    it('treats LLM_PROVIDER_API_KEY as optional in Phase 2', () => {
+        // Phase 2: keys are now sourced per provider from config/providers.json
+        // (e.g. NAN_API_KEY, OPENAI_API_KEY). The env schema no longer
+        // requires this legacy key.
         delete process.env.LLM_PROVIDER_API_KEY;
-        expect(() => getEnv()).toThrow(/LLM_PROVIDER_API_KEY/);
+        expect(() => getEnv()).not.toThrow();
     });
 
     it('parses PORT as a positive integer with default', () => {

@@ -3,6 +3,7 @@
     "nan": {
       "apiKeyEnv": "NAN_API_KEY",
       "baseURL": "https://api.nan.builders/v1",
+      "timeoutMs": 180000,
       "models": {
         "qwen3.6": {
           "real": "qwen3.6"
@@ -19,6 +20,7 @@
     "openai": {
       "apiKeyEnv": "OPENAI_API_KEY",
       "baseURL": "https://api.openai.com/v1",
+      "timeoutMs": 60000,
       "models": {
         "gpt-4o": {
           "real": "gpt-4o"
@@ -31,14 +33,17 @@
   },
   "routing": {
     "fallbackEnabled": true,
-    "strategy": "round-robin",
+    "strategy": "primary",
     "healthCheckIntervalMs": 30000,
-    "requestTimeoutMs": 120000
+    "requestTimeoutMs": 120000,
+    "failureThreshold": 5,
+    "cooldownMs": 30000,
+    "halfOpenProbes": 1
   },
   "aliases": {
-    "default": "nan/qwen3.6",
-    "fast": "openai/gpt-4o-mini",
-    "strong": "nan/deepseek-r1",
-    "coder": "nan/qwen3-coder"
+    "default": ["nan/qwen3.6", "openai/gpt-4o-mini"],
+    "fast": ["openai/gpt-4o-mini", "nan/qwen3.6"],
+    "strong": ["nan/deepseek-r1"],
+    "coder": ["nan/qwen3-coder", "openai/gpt-4o"]
   }
 }

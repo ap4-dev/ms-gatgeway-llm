@@ -20,17 +20,31 @@ import { mergeSystemMessages } from '../src/chat/chat.service';
  *     - same validation pipe
  *     - same SSE framing (`data: ...\n\n` + `data: [DONE]\n\n`)
  *     - same error envelope shape (400 / 500)
+ *     - same ProviderService resolution path (alias → upstreamModel + overrides)
  *
  *   The HTTP contract a real client sees is exercised end-to-end; only the
  *   Nest DI container is bypassed. To upgrade later: replace this with a full
  *   Nest TestingModule + FastifyAdapter once the upstream issue is fixed.
  */
+type ResolvedLike = {
+    upstreamModel: string;
+    overrides: { maxTokens?: number };
+};
+
 describe('POST /chat/completions (contract)', () => {
     let app: FastifyInstance;
     let completionsMock: jest.Mock;
+    let resolverMock: jest.Mock;
 
     beforeEach(async () => {
         completionsMock = jest.fn();
+        // Pass-through resolver: just echoes the model name as the upstream
+        // name with no overrides. Individual tests override this for the
+        // Phase 2 alias / override assertions.
+        resolverMock = jest.fn((model: string): ResolvedLike => ({
+            upstreamModel: model,
+            overrides: {},
+        }));
         app = Fastify({ logger: false });
 
         // Same JSON parser as Nest's FastifyAdapter produces by default.
@@ -72,6 +86,20 @@ describe('POST /chat/completions (contract)', () => {
             body.messages = mergeSystemMessages(
                 body.messages as unknown as Parameters<typeof mergeSystemMessages>[0],
             ) as unknown as typeof body.messages;
+
+            // Mirror ProviderService.resolve + ChatService.applyResolved:
+            // resolve an alias/path into an upstream model + per-model overrides,
+            // and overwrite the body accordingly.
+            const resolved = resolverMock(body.model);
+            if (!resolved) {
+                return reply.code(502).send({
+                    error: { message: 'Could not resolve model' },
+                });
+            }
+            body.model = resolved.upstreamModel;
+            if (resolved.overrides.maxTokens && !('max_tokens' in (body as object))) {
+                (body as any).max_tokens = resolved.overrides.maxTokens;
+            }
 
             if (body.stream) {
                 reply.raw.setHeader('Content-Type', 'text/event-stream');
@@ -233,5 +261,74 @@ describe('POST /chat/completions (contract)', () => {
 
         expect(res.statusCode).toBe(500);
         expect(res.json().error.message).toBe('upstream boom');
+    });
+
+    // --- Phase 2: registry-driven behavior --------------------------------
+
+    it('translates an alias to its upstream model and forwards it', async () => {
+        // Simulate "fast" → "openai/gpt-4o-mini" resolution.
+        resolverMock.mockImplementationOnce((_requested: string) => ({
+            upstreamModel: 'gpt-4o-mini',
+            overrides: {},
+        }));
+
+        completionsMock.mockResolvedValueOnce({
+            id: 'cmpl-alias',
+            choices: [{ message: { content: 'pong' } }],
+        });
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/chat/completions',
+            payload: {
+                model: 'fast',
+                messages: [{ role: 'user', content: 'ping' }],
+            },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(resolverMock).toHaveBeenCalledWith('fast');
+        expect(completionsMock.mock.calls[0][0].model).toBe('gpt-4o-mini');
+    });
+
+    it('applies maxTokens override from the resolved model when caller omitted it', async () => {
+        // Simulate qwen3-coder: upstream model + maxTokens override.
+        resolverMock.mockImplementationOnce(() => ({
+            upstreamModel: 'qwen3-coder',
+            overrides: { maxTokens: 16384 },
+        }));
+        completionsMock.mockResolvedValueOnce({
+            id: 'cmpl-coder',
+            choices: [{ message: { content: 'pong' } }],
+        });
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/chat/completions',
+            payload: {
+                model: 'coder',
+                messages: [{ role: 'user', content: 'ping' }],
+            },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(completionsMock.mock.calls[0][0].max_tokens).toBe(16384);
+    });
+
+    it('returns 502 when the model cannot be resolved', async () => {
+        resolverMock.mockImplementationOnce(() => null);
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/chat/completions',
+            payload: {
+                model: 'not-a-real-thing',
+                messages: [{ role: 'user', content: 'ping' }],
+            },
+        });
+
+        expect(res.statusCode).toBe(502);
+        expect(res.json().error.message).toBe('Could not resolve model');
+        expect(completionsMock).not.toHaveBeenCalled();
     });
 });

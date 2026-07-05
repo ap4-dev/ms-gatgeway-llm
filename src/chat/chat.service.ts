@@ -1,5 +1,4 @@
 import { Inject, Injectable } from '@nestjs/common';
-import OpenAI from 'openai';
 import type {
     ChatCompletion,
     ChatCompletionChunk,
@@ -8,6 +7,9 @@ import type {
 } from 'openai/resources/chat/completions';
 import { ENV_CONFIG } from '../config/env.token';
 import type { Env } from '../config/env.schema';
+import { ProviderService } from '../providers/provider.service';
+import type { ResolvedModel } from '../providers/provider.model';
+import { RoutingService } from '../routing/routing.service';
 
 export type ChatMessage = {
     role: string;
@@ -21,29 +23,65 @@ export type CompletionResult =
     | AsyncIterable<ChatCompletionChunk>;
 
 /**
- * ChatService normalizes the inbound OpenAI-compatible payload and forwards
- * it to the upstream provider via the official OpenAI SDK.
+ * ChatService normalizes the inbound OpenAI-compatible payload and hands the
+ * actual upstream call off to {@link RoutingService}, which expands the
+ * model alias into a fallback chain and walks it under the supervision of
+ * the circuit breaker.
  *
- * Today it talks to a single provider (resolved from LLM_PROVIDER_* env vars).
- * Phase 2 will introduce a ProviderService that selects among the entries in
- * config/providers.json.
+ * Phase 3: this service no longer touches `ProviderService.resolve` directly.
+ * It composes the body and offers an `executor` closure to the router. The
+ * router picks the provider (one that isn't open in the breaker), hands us
+ * back the resolved model plus an `AbortSignal` derived from the provider's
+ * timeout, and we drive the official OpenAI SDK with that signal plumbed in.
  */
 @Injectable()
 export class ChatService {
-    private readonly client: OpenAI;
+    constructor(
+        @Inject(ENV_CONFIG) private readonly env: Env,
+        private readonly providers: ProviderService,
+        private readonly router: RoutingService,
+    ) {}
 
-    constructor(@Inject(ENV_CONFIG) env: Env) {
-        this.client = new OpenAI({
-            apiKey: env.LLM_PROVIDER_API_KEY,
-            baseURL: env.LLM_PROVIDER_BASE_URL,
-        });
+    /**
+     * Resolve the model through the router (which walks the fallback chain
+     * under the breaker), send the request on the first usable provider.
+     * Returns the SDK result (a `ChatCompletion` or, for `stream=true`, an
+     * async iterable of chunks) untouched so the controller can stream them
+     * straight back to the client.
+     */
+    async completions(
+        body: ChatCompletionCreateParams,
+    ): Promise<CompletionResult> {
+        return this.router.route(body.model, body, (resolved, signal) =>
+            this.callUpstream(resolved, body, signal),
+        ).then((r) => r.result);
     }
 
     /**
-     * Merge consecutive `system`-role messages at the start of the list into a
-     * single system message. Other roles keep their order.
-     *
-     * Exposed for testing — kept as a free function below for unit tests.
+     * Build the outbound body (normalize, apply per-model overrides) and call
+     * the OpenAI SDK. Exposed via the `executor` closure handed to
+     * {@link RoutingService}.
+     */
+    private async callUpstream(
+        resolved: ResolvedModel,
+        body: ChatCompletionCreateParams,
+        signal: AbortSignal,
+    ): Promise<CompletionResult> {
+        const client = this.providers.clientFor(resolved);
+        const outbound = this.applyResolved(
+            this.normalizeBody(body),
+            resolved,
+        );
+        // Cast to any because the OpenAI SDK types don't currently reflect
+        // the optional `signal` field on `chat.completions.create`. The SDK
+        // forwards it to the underlying fetch when present.
+        return (client.chat.completions as any).create(outbound, { signal }) as Promise<CompletionResult>;
+    }
+
+    /**
+     * Merge all `system`-role messages into a single one at the front of the
+     * list. Other roles keep their order. Free function — duplicated below
+     * as `mergeSystemMessages` for direct unit testing.
      */
     private normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
         if (!Array.isArray(messages) || messages.length === 0) return messages;
@@ -79,11 +117,18 @@ export class ChatService {
         };
     }
 
-    async completions(
+    private applyResolved(
         body: ChatCompletionCreateParams,
-    ): Promise<CompletionResult> {
-        const normalized = this.normalizeBody(body);
-        return this.client.chat.completions.create(normalized);
+        resolved: ResolvedModel,
+    ): ChatCompletionCreateParams {
+        const result: ChatCompletionCreateParams = {
+            ...body,
+            model: resolved.upstreamModel,
+        };
+        if (resolved.overrides.maxTokens && !('max_tokens' in body)) {
+            (result as any).max_tokens = resolved.overrides.maxTokens;
+        }
+        return result;
     }
 }
 

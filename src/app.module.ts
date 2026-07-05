@@ -10,12 +10,13 @@ import { SentryGlobalFilter } from '@sentry/nestjs/setup';
 import { AppJsonLogger } from './app.logger.js';
 import { RedisService } from './redis.service';
 import { ChatModule } from './chat/chat.module';
+import { HealthModule } from './health/health.module';
 import { CoreModule } from './config/core.module';
 
 @Module({
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
-        SentryModule.forRoot(), CoreModule, ChatModule,
+        SentryModule.forRoot(), CoreModule, ChatModule, HealthModule,
     ],
     controllers: [AppController],
     providers: [
