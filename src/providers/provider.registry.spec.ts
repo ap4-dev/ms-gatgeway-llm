@@ -18,6 +18,15 @@ function makeServiceWithSeed(seed: object = SEED): {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0005_alias_strategy.sql'), 'utf-8'),
     );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0006_alias_weights.sql'), 'utf-8'),
+    );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0007_alias_priority.sql'), 'utf-8'),
+    );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0008_alias_strategy_enum_widen.sql'), 'utf-8'),
+    );
     const tmp = require('node:fs').mkdtempSync(
         join(require('node:os').tmpdir(), 'ms-registry-spec-'),
     );

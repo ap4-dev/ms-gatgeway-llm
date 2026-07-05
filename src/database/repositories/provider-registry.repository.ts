@@ -24,6 +24,7 @@ export class ProviderRegistryRepository {
         listProviders: Database.Statement;
         listModels: Database.Statement;
         listAliases: Database.Statement;
+        listAliasEntriesByAlias: Database.Statement;
         getPolicy: Database.Statement;
         findModelByKey: Database.Statement;
         deleteProviderCascade: Database.Statement;
@@ -35,6 +36,9 @@ export class ProviderRegistryRepository {
         updatePolicy: Database.Statement;
         getStrategy: Database.Statement;
         upsertAliasPolicy: Database.Statement;
+        getWeights: Database.Statement;
+        deleteWeightsForAlias: Database.Statement;
+        insertWeight: Database.Statement;
     };
 
     constructor(private readonly db: Database.Database) {
@@ -47,6 +51,9 @@ export class ProviderRegistryRepository {
             ),
             listAliases: this.db.prepare(
                 'SELECT alias_name, position, provider_id, model_key FROM alias_entries ORDER BY alias_name, position',
+            ),
+            listAliasEntriesByAlias: this.db.prepare(
+                'SELECT alias_name, position, provider_id, model_key, priority FROM alias_entries WHERE alias_name = ? ORDER BY position',
             ),
             getPolicy: this.db.prepare(
                 'SELECT fallback_enabled, health_check_interval_ms, request_timeout_ms, failure_threshold, cooldown_ms, half_open_probes FROM routing_policy WHERE id = 1',
@@ -90,6 +97,15 @@ export class ProviderRegistryRepository {
                 VALUES (?, ?)
                 ON CONFLICT(alias_key) DO UPDATE SET strategy = excluded.strategy
             `),
+            getWeights: this.db.prepare(
+                'SELECT position, weight FROM alias_weights WHERE alias_key = ? ORDER BY position',
+            ),
+            deleteWeightsForAlias: this.db.prepare(
+                'DELETE FROM alias_weights WHERE alias_key = ?',
+            ),
+            insertWeight: this.db.prepare(
+                'INSERT INTO alias_weights (alias_key, position, weight) VALUES (?, ?, ?) ON CONFLICT(alias_key, position) DO UPDATE SET weight = excluded.weight',
+            ),
         };
     }
 
@@ -204,6 +220,63 @@ export class ProviderRegistryRepository {
      *  by future admin endpoints / scripts. */
     upsertAliasPolicy(aliasKey: string, strategy: RoutingStrategyKind): void {
         this.queries.upsertAliasPolicy.run(aliasKey, strategy);
+    }
+
+    /**
+     * Per-alias weights (used by `'weighted'` routing strategy).
+     * Returns one row per (alias_key, position) — keyed by position so
+     * callers can index by chain position. Empty array means no
+     * explicit configuration (treat every entry as weight=1).
+     */
+    getWeights(aliasKey: string): Array<{ position: number; weight: number }> {
+        return this.queries.getWeights.all(aliasKey) as Array<{
+            position: number;
+            weight: number;
+        }>;
+    }
+
+    /**
+     * Idempotent replace. Empty array → deletes all existing rows for
+     * the alias. Throws when any weight is `<= 0` (DB CHECK would
+     * throw anyway, but validating in JS gives a clearer error).
+     */
+    upsertWeights(aliasKey: string, weights: number[]): void {
+        for (const w of weights) {
+            if (!Number.isInteger(w) || w <= 0) {
+                throw new Error(
+                    `weights must be positive integers; got ${w}`,
+                );
+            }
+        }
+        const txn = this.db.transaction(() => {
+            this.queries.deleteWeightsForAlias.run(aliasKey);
+            weights.forEach((weight, position) => {
+                this.queries.insertWeight.run(aliasKey, position, weight);
+            });
+        });
+        txn();
+    }
+
+    /**
+     * Phase-after-5.5: returns the alias entries with their priorities
+     * in `position`-order. Used by `'priority-grouped'` strategy to
+     * group entries by priority. Snake_case columns internally;
+     * callers translate.
+     */
+    getAliasEntries(
+        aliasKey: string,
+    ): Array<{
+        provider_id: string;
+        model_key: string;
+        position: number;
+        priority: number;
+    }> {
+        return this.queries.listAliasEntriesByAlias.all(aliasKey) as Array<{
+            provider_id: string;
+            model_key: string;
+            position: number;
+            priority: number;
+        }>;
     }
 
     /** First provider that has a model with the given key. `undefined` if none. */

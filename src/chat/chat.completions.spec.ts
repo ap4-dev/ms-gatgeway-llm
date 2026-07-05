@@ -48,6 +48,7 @@ function makeFakeProvider(model = 'gpt-test', upstream = 'gpt-test'): {
         overrides: {},
         supportsStream: true,
         timeoutMs: 30_000,
+        priority: 0,
     };
     const create = jest.fn();
     const clientFor = jest.fn().mockReturnValue({ chat: { completions: { create } } });

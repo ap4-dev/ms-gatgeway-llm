@@ -36,6 +36,16 @@ export class ProviderService {
     ) {}
 
     /**
+     * Phase-after-5.5: expose the registry so siblings (`RoutingService`,
+     * future admin layers) can read per-alias strategy / weights /
+     * priorities without round-tripping through DI for a second copy of
+     * the same `ProviderRegistryService` instance.
+     */
+    get registryRef(): ProviderRegistryService {
+        return this.registry;
+    }
+
+    /**
      * Resolve a user-supplied model identifier to a fully populated
      * `ResolvedModel` representing the primary of its chain.
      */
@@ -47,21 +57,34 @@ export class ProviderService {
      * Resolve a user-supplied model identifier to the full ordered chain of
      * `ResolvedModel`s that should be tried in order (primary first,
      * fallbacks after). Throws if nothing matches.
+     *
+     * Phase-after-5.5: threads per-entry priorities from `alias_entries`
+     * into each `ResolvedModel.priority` so the `'priority-grouped'`
+     * routing strategy can group entries by priority.
      */
     resolveChain(model: string): ResolvedModel[] {
         if (!model || typeof model !== 'string') {
             throw new Error('Model name is required');
         }
 
+        // Helper that returns a chain with priorities injected. For
+        // non-alias paths the priority defaults to 0.
+        const chainFor = (paths: string[]): ResolvedModel[] => {
+            const priorities = this.aliasPrioritiesByPosition(model);
+            return paths.map((path, position) =>
+                this.resolvePath(path, model, priorities.get(position) ?? 0),
+            );
+        };
+
         // 1) alias lookup
         const aliasTarget = this.registry.aliases[model];
         if (aliasTarget) {
-            return aliasTarget.map((entry) => this.resolvePath(entry, model));
+            return chainFor(aliasTarget);
         }
 
         // 2) explicit "provider/model" path → single-element chain
         if (model.includes('/')) {
-            return [this.resolvePath(model, model)];
+            return [this.resolvePath(model, model, 0)];
         }
 
         // 3) model-key scan across providers → single-element chain
@@ -74,6 +97,7 @@ export class ProviderService {
                     found.providerId,
                     found.modelKey,
                     found.config,
+                    0,
                 ),
             ];
         }
@@ -81,7 +105,7 @@ export class ProviderService {
         // 4) fallback to the "default" alias chain
         const defaultChain = this.registry.aliases.default;
         if (defaultChain) {
-            return defaultChain.map((entry) => this.resolvePath(entry, model));
+            return chainFor(defaultChain);
         }
 
         // 5) nothing matched
@@ -112,7 +136,7 @@ export class ProviderService {
 
     // --- internals -------------------------------------------------------
 
-    private resolvePath(path: string, requestedAs: string): ResolvedModel {
+    private resolvePath(path: string, requestedAs: string, priority: number): ResolvedModel {
         const [providerId, modelKey] = path.split('/');
         if (!providerId || !modelKey) {
             throw new Error(
@@ -133,7 +157,22 @@ export class ProviderService {
             );
         }
 
-        return this.buildResolved(requestedAs, modelKey, providerId, modelKey, provider);
+        return this.buildResolved(requestedAs, modelKey, providerId, modelKey, provider, priority);
+    }
+
+    /**
+     * Read per-position priorities for the given alias from the
+     * repository. Returns an empty Map when the alias doesn't exist or
+     * the registry doesn't expose per-entry priorities (older shapes).
+     */
+    private aliasPrioritiesByPosition(aliasKey: string): Map<number, number> {
+        const entries = (this.registry as any).getAliasEntries?.(aliasKey) as
+            | Array<{ position: number; priority: number }>
+            | undefined;
+        if (!entries) return new Map();
+        const out = new Map<number, number>();
+        for (const e of entries) out.set(e.position, e.priority);
+        return out;
     }
 
     private buildResolved(
@@ -147,6 +186,7 @@ export class ProviderService {
             timeoutMs?: number;
             models: Record<string, any>;
         },
+        priority: number,
     ): ResolvedModel {
         const apiKey = process.env[provider.apiKeyEnv];
         if (!apiKey) {
@@ -174,6 +214,7 @@ export class ProviderService {
             },
             supportsStream: modelCfg.supportsStream ?? true,
             timeoutMs,
+            priority,
         };
     }
 }

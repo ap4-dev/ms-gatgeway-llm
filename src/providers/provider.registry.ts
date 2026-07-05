@@ -83,6 +83,43 @@ export class ProviderRegistryService {
         return this.repo.getStrategy(aliasKey);
     }
 
+    /**
+     * Per-alias weights (used by `'weighted'` strategy). Empty array
+     * means no configuration; entries are treated as weight=1.
+     */
+    getWeights(aliasKey: string): Array<{ position: number; weight: number }> {
+        return this.repo.getWeights(aliasKey);
+    }
+
+    /** Phase-after-5.5: persist a per-alias strategy choice. */
+    upsertAliasPolicy(aliasKey: string, strategy: RoutingStrategyKind): void {
+        this.repo.upsertAliasPolicy(aliasKey, strategy);
+    }
+
+    /** Phase-after-5.5: idempotent weight replacement for an alias. */
+    upsertWeights(aliasKey: string, weights: number[]): void {
+        this.repo.upsertWeights(aliasKey, weights);
+    }
+
+    /**
+     * Per-alias chain entries with priorities (used by
+     * `'priority-grouped'` strategy).
+     */
+    getAliasEntries(aliasKey: string): Array<{
+        providerId: string;
+        modelKey: string;
+        position: number;
+        priority: number;
+    }> {
+        const rows = this.repo.getAliasEntries(aliasKey);
+        return rows.map((r) => ({
+            providerId: r.provider_id,
+            modelKey: r.model_key,
+            position: r.position,
+            priority: r.priority,
+        }));
+    }
+
     /** Re-export for tests / admin code that want direct repo access. */
     get repository(): ProviderRegistryRepository {
         return this.repo;

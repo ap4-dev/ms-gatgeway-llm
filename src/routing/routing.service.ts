@@ -69,16 +69,16 @@ export class RoutingFailedError extends Error {
  * supervision of {@link CircuitBreakerService}.
  *
  * Strategy is PER ALIAS — looked up via `strategyFor(aliasKey)` on every
- * call. Defaults to `'primary'` (chain order). Phase 3 behaviour when
- * no row is configured for the alias; `'round-robin'` rotates the
- * starting chain index per call. Future strategies (`'weighted'`,
- * priority groups) live in the same enum and dispatch on the same
- * lookup, so adding them does not require touching this service.
+ * call. Each strategy produces an index sequence via `pickOrder`:
+ *   - 'primary' / 'fallback' : chain order.
+ *   - 'round-robin'          : cursor-rotated starting index, walks forward.
+ *   - 'weighted'             : per-call weighted random pick, walks forward
+ *                              (no cursor involvement).
+ *   - 'priority-grouped'     : sorted by (priority asc, position asc).
  *
- * Cursor (round-robin state) is keyed by the requested model string so
- * distinct aliases rotate independently. The cursor advances once per
- * route attempt — failures of the chosen entry still fall through to
- * the next index in the rotated sequence.
+ * Cursor state is keyed by the requested model string so distinct aliases
+ * rotate independently for round-robin. Weighted sampling is independent
+ * per call (no state).
  */
 @Injectable()
 export class RoutingService {
@@ -102,11 +102,15 @@ export class RoutingService {
         const strategy = this.strategyFor(model);
         const order = pickOrder(
             strategy,
-            chain.length,
-            // Cursor advances once per route attempt, regardless of
-            // strategy (for primary/fallback the cursor isn't read but
-            // the wiring is cheap).
+            chain,
+            // Cursor advances once per route attempt. For strategies that
+            // don't read it (`'primary'`, `'fallback'`, `'weighted'`,
+            // `'priority-grouped'`) the wiring is cheap; only
+            // `'round-robin'` consumes this closure.
             () => this.cursor.next(model, chain.length),
+            // For `'weighted'` we read the per-alias weights from the
+            // registry. For other strategies this is ignored.
+            this.aliasWeightsFor(model, chain.length),
         );
 
         const attempts: RouteAttempt[] = [];
@@ -158,5 +162,25 @@ export class RoutingService {
         }
 
         throw new RoutingFailedError(model, attempts);
+    }
+
+    /**
+     * Read per-position weights for the alias. Returns a parallel array
+     * of length `chainLength`, defaulting missing positions to 1
+     * (uniform mix). Returns `undefined` when the alias doesn't exist
+     * (e.g. a bare `provider/model` path); in that case `pickOrder`
+     * falls back to uniform sampling.
+     */
+    private aliasWeightsFor(model: string, chainLength: number): number[] | undefined {
+        const registry = this.providers.registryRef;
+        const rows = registry.getWeights?.(model);
+        if (!rows || rows.length === 0) return undefined;
+        const out = new Array<number>(chainLength).fill(1);
+        for (const r of rows) {
+            if (r.position >= 0 && r.position < chainLength) {
+                out[r.position] = r.weight;
+            }
+        }
+        return out;
     }
 }

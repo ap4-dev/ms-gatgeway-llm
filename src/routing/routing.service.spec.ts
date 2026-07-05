@@ -108,6 +108,7 @@ function fakeResolved(overrides: Partial<ResolvedModel> = {}): ResolvedModel {
         overrides: {},
         supportsStream: true,
         timeoutMs: 5_000,
+        priority: 0,
         ...overrides,
     };
 }
@@ -356,3 +357,69 @@ describe('RoutingService — per-alias strategy', () => {
         expect(a2.providerId).toBe('openai');
     });
 });
+
+describe('RoutingService — weighted strategy', () => {
+    it('weights decide the probability of the chosen entry', async () => {
+        process.env.NAN_API_KEY = 'sk-nan-test';
+        process.env.OPENAI_API_KEY = 'sk-openai-test';
+
+        // Build a ProviderService whose `registry.getWeights` returns
+        // [1, 99]. Every other registry method comes from the standard
+        // fixture, so the chain resolves normally.
+        const fixture = makeRegistry() as any;
+        const fakeRegistry = {
+            ...fixture,
+            getWeights: jest.fn().mockReturnValue([
+                { position: 0, weight: 1 },
+                { position: 1, weight: 99 },
+            ]),
+        };
+        const providers = new ProviderService(fakeRegistry, env as any);
+
+        const service = new RoutingService(
+            providers,
+            new CircuitBreakerService(policy),
+            () => 'weighted',
+            new RoundRobinCursor(),
+        );
+
+        let nanHits = 0;
+        for (let i = 0; i < 1000; i++) {
+            const r = await service.route(
+                'fast',
+                { model: 'fast' } as any,
+                async () => ({ id: 'ok' }),
+            );
+            if (r.providerId === 'nan') nanHits += 1;
+        }
+        // ~98% expected (weight 99 over total 100) — slack keeps the
+        // test honest without being flaky.
+        expect(nanHits).toBeGreaterThan(900);
+    });
+
+    it('with no weights configured, falls back to uniform sampling', async () => {
+        const fixture = makeRegistry() as any;
+        // No getWeights on the fixture — picking should still work.
+        const providers = new ProviderService(fixture, env as any);
+
+        const service = new RoutingService(
+            providers,
+            new CircuitBreakerService(policy),
+            () => 'weighted',
+            new RoundRobinCursor(),
+        );
+
+        const result = await service.route(
+            'fast',
+            { model: 'fast' } as any,
+            async () => ({ id: 'ok' }),
+        );
+        expect(['openai', 'nan']).toContain(result.providerId);
+    });
+});
+
+// Note: `'priority-grouped'` integration is covered indirectly by the
+// `pickOrder` unit tests above (sort by priority asc, position asc
+// within group). End-to-end coverage for it lives in the
+// `admin/aliases` controller spec, which sets priorities via SQL and
+// drives the router through the new admin pipeline.

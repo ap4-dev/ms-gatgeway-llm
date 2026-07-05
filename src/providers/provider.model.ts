@@ -58,15 +58,17 @@ export type Aliases = z.infer<typeof AliasesSchema>;
  * Per-alias strategy kind. Lives in its own table (`alias_policy`)
  * since Phase 5.5 — the global `routing_policy` no longer carries one.
  *
- * Future extensions (intentionally NOT here yet): `weighted` (need a
- * sibling `alias_weights` table for the per-entry weights), and
- * priority-grouping (a `priority` integer on each alias entry).
- * When added, the SQL CHECK constraint widens via a separate migration.
+ * The SQL CHECK constraint is widened in 0008 to include the values
+ * added in Phase-after-5.5: `weighted`, `priority-grouped`. The Zod
+ * schema below is the canonical source of truth — the SQL and the
+ * TypeScript types must agree (any divergence fails spec).
  */
 export const RoutingStrategySchema = z.enum([
     'primary',
     'round-robin',
     'fallback',
+    'weighted',
+    'priority-grouped',
 ]);
 export type RoutingStrategyKind = z.infer<typeof RoutingStrategySchema>;
 
@@ -131,4 +133,11 @@ export interface ResolvedModel {
      * upstream attempt.
      */
     timeoutMs: number;
+    /**
+     * Phase-after-5.5 priority-grouping. Lower number = higher
+     * priority. Defaults to 0 (the highest group; entries without an
+     * explicit `priority` live in this group). Used only by the
+     * `'priority-grouped'` strategy — other strategies ignore it.
+     */
+    priority: number;
 }
