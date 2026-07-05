@@ -1,21 +1,25 @@
 import { Provider } from '@nestjs/common';
-import {
-    DEFAULT_PROVIDERS_FILE,
-    PROVIDER_REGISTRY,
-    ProviderRegistryService,
-} from './provider.registry';
+import { DatabaseService } from '../database/database.service';
+import { ProviderRegistryService } from './provider.registry';
+import { ProviderRegistryRepository } from '../database/repositories/provider-registry.repository';
+import { PROVIDER_REGISTRY } from './provider.registry';
 
 /**
- * Provider factory for `ProviderRegistryService`. Reads the file path from
- * a constant (default), never from the DI container, so the constructor
- * receives a real string rather than being interpreted as a `String` token.
+ * Provider factory for `ProviderRegistryService`. Resolves the singleton
+ * `DatabaseService` (provided by DatabaseModule) and wraps it in a
+ * `ProviderRegistryRepository`. No string parameters — Nest used to
+ * interpret those as `String` DI tokens and threw.
  */
 export const ProviderRegistryProvider: Provider = {
     provide: ProviderRegistryService,
-    useFactory: () => new ProviderRegistryService(DEFAULT_PROVIDERS_FILE),
+    useFactory: (db: DatabaseService) => {
+        const repo = new ProviderRegistryRepository(db.db);
+        return new ProviderRegistryService(repo);
+    },
+    inject: [DatabaseService],
 };
 
-/** Re-exports the registry under a stringly-keyed token for `@Inject`. */
+/** Re-exports the registry under a symbol-keyed token for `@Inject`. */
 export const ProviderRegistryAlias: Provider = {
     provide: PROVIDER_REGISTRY,
     useExisting: ProviderRegistryService,

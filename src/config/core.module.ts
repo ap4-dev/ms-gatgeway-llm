@@ -5,18 +5,22 @@ import {
     ProviderRegistryAlias,
     ProviderRegistryProvider,
 } from '../providers/provider.registry.provider';
+import { DatabaseModule } from '../database/database.module';
 
 /**
  * Global module that exposes the validated `Env` snapshot under the
  * `ENV_CONFIG` injection token, the loaded registry under both the
- * `PROVIDER_REGISTRY` symbol and the `ProviderRegistryService` class.
- * Marked `@Global()` so feature modules (ChatModule, …) don't need to
- * import it explicitly — once AppModule has imported CoreModule, any
- * provider can `@Inject(...)` or constructor-inject the class without
- * ceremony.
+ * `PROVIDER_REGISTRY` symbol and the `ProviderRegistryService` class, and
+ * the SQLite-backed repository stack via `DatabaseModule`.
+ *
+ * Marked `@Global()` so feature modules (ChatModule, HealthModule, …)
+ * don't need to import it explicitly — once AppModule has imported
+ * CoreModule, any provider can `@Inject(...)` or constructor-inject
+ * DatabaseService / ProviderRegistryService / etc. without ceremony.
  */
 @Global()
 @Module({
+    imports: [DatabaseModule],
     providers: [
         envProvider,
         ProviderRegistryProvider,

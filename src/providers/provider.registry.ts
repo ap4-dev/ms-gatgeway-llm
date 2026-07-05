@@ -1,126 +1,79 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { Injectable, Logger } from '@nestjs/common';
-import { ZodError } from 'zod';
+import { Injectable } from '@nestjs/common';
 import {
-    ProviderConfig,
-    ProvidersFile,
-    ProvidersFileSchema,
+    type ModelConfig,
+    type ProviderConfig,
+    type ProvidersFile,
+    type RoutingPolicy,
 } from './provider.model';
+import { ProviderRegistryRepository } from '../database/repositories/provider-registry.repository';
 
-/**
- * Default location of the providers registry. Resolved against process.cwd()
- * which is the project root both in dev (`pnpm start:dev`) and prod
- * (`node dist/main`).
- */
-export const DEFAULT_PROVIDERS_FILE = 'config/providers.json';
-
-/** Token used to inject the loaded registry into other providers. */
+/** Injection token for the loaded registry. Re-exported here for callers
+ *  that don't import from the alias file. Kept symbol-stable for Phase 3
+ *  compatibility. */
 export const PROVIDER_REGISTRY = Symbol('PROVIDER_REGISTRY');
 
 /**
- * Read + validate a providers.json file. Pure function for testability.
+ * NestJS provider for the multi-provider registry. Reads every value on
+ * demand from {@link ProviderRegistryRepository} (better-sqlite3) so any
+ * upstream write to providers / model_configs / alias_entries /
+ * routing_policy is visible the moment the next getter is called — no
+ * in-memory cache.
  *
- * Throws a descriptive error when the file is unreadable or invalid so that
- * misconfiguration fails fast at startup (instead of mid-request).
- */
-export function loadProvidersFile(
-    filePath: string = DEFAULT_PROVIDERS_FILE,
-): ProvidersFile {
-    const absolute = resolve(process.cwd(), filePath);
-
-    let raw: string;
-    try {
-        raw = readFileSync(absolute, 'utf-8');
-    } catch (err: any) {
-        throw new Error(
-            `Cannot read providers registry at ${absolute}: ${err?.message ?? err}`,
-        );
-    }
-
-    let parsedJson: unknown;
-    try {
-        parsedJson = JSON.parse(raw);
-    } catch (err: any) {
-        throw new Error(
-            `Invalid JSON in providers registry at ${absolute}: ${err?.message ?? err}`,
-        );
-    }
-
-    try {
-        return ProvidersFileSchema.parse(parsedJson);
-    } catch (err) {
-        const zerr = err as ZodError;
-        const details = zerr.issues
-            .map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`)
-            .join('\n');
-        throw new Error(
-            `Providers registry at ${absolute} does not match schema:\n${details}`,
-        );
-    }
-}
-
-/**
- * Nest provider that owns the loaded registry and exposes typed views
- * (lookup-by-id, list models, list aliases). Wired into CoreModule so the
- * file is read once at startup.
+ * Public surface (preserved from the Phase 2 file-backed version):
+ *  - `file`: synthesised ProvidersFile snapshot.
+ *  - `providers` / `aliases` / `policy`.
+ *  - `has(id)` / `get(id)` / `findModel(modelKey)`.
+ *
+ * Downstream callers (`ProviderService`, `CircuitBreakerService` factory,
+ * `ModelsController`, `RoutingService`) need no changes — the shape is
+ * exactly the same, only the source moves.
  */
 @Injectable()
 export class ProviderRegistryService {
-    private readonly logger = new Logger(ProviderRegistryService.name);
-    private readonly _file: ProvidersFile;
+    constructor(private readonly repo: ProviderRegistryRepository) {}
 
     /**
-     * @internal Use the `ProviderRegistryProvider` factory from `CoreModule`
-     * so the `filePath` is supplied from outside the DI container (this
-     * constructor must NOT take a stringly-typed parameter — otherwise Nest
-     * interprets it as a DI token for a `String` provider and throws
-     * `UnknownDependenciesException`).
+     * Synthesised top-level view. Kept for callers that previously
+     * consumed `file`. The repository's underlying tables are the only
+     * authoritative source; this object is fresh per call.
      */
-    constructor(filePath: string) {
-        this._file = loadProvidersFile(filePath);
-        this.logger.log(
-            `Loaded ${Object.keys(this._file.providers).length} provider(s) from ${filePath}`,
-        );
-    }
-
-    /** Raw, parsed file contents. */
     get file(): ProvidersFile {
-        return this._file;
+        const routing = this.policy;
+        return {
+            providers: this.providers,
+            aliases: this.aliases,
+            routing,
+        };
     }
 
     get providers(): Record<string, ProviderConfig> {
-        return this._file.providers;
+        return this.repo.listProviders();
     }
 
     get aliases(): Record<string, string[]> {
-        return this._file.aliases ?? {};
+        return this.repo.listAliases();
     }
 
-    /** Resolved routing policy (always defined; Zod applies defaults). */
-    get policy(): NonNullable<ProvidersFile['routing']> {
-        return this._file.routing!;
+    get policy(): RoutingPolicy {
+        return this.repo.getPolicy();
     }
 
     has(providerId: string): boolean {
-        return providerId in this._file.providers;
+        return this.repo.getProvider(providerId) !== undefined;
     }
 
     get(providerId: string): ProviderConfig | undefined {
-        return this._file.providers[providerId];
+        return this.repo.getProvider(providerId);
     }
 
-    /** Best-effort model lookup across all providers. Returns the first match. */
-    findModel(
-        upstreamModel: string,
-    ): { providerId: string; modelKey: string; config: ProviderConfig } | undefined {
-        for (const [providerId, provider] of Object.entries(this._file.providers)) {
-            for (const modelKey of Object.keys(provider.models)) {
-                if (modelKey === upstreamModel) {
-                    return { providerId, modelKey, config: provider };
-                }
-            }
-        }
-        return undefined;
+    findModel(modelKey: string):
+        | { providerId: string; modelKey: string; config: ProviderConfig }
+        | undefined {
+        return this.repo.findModel(modelKey);
+    }
+
+    /** Re-export for tests / admin code that want direct repo access. */
+    get repository(): ProviderRegistryRepository {
+        return this.repo;
     }
 }

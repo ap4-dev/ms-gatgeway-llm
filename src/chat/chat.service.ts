@@ -9,7 +9,8 @@ import { ENV_CONFIG } from '../config/env.token';
 import type { Env } from '../config/env.schema';
 import { ProviderService } from '../providers/provider.service';
 import type { ResolvedModel } from '../providers/provider.model';
-import { RoutingService } from '../routing/routing.service';
+import { RoutingFailedError, RoutingService } from '../routing/routing.service';
+import { RequestLogService } from '../observability/request-log.service';
 
 export type ChatMessage = {
     role: string;
@@ -40,6 +41,7 @@ export class ChatService {
         @Inject(ENV_CONFIG) private readonly env: Env,
         private readonly providers: ProviderService,
         private readonly router: RoutingService,
+        private readonly requestLog: RequestLogService,
     ) {}
 
     /**
@@ -48,13 +50,55 @@ export class ChatService {
      * Returns the SDK result (a `ChatCompletion` or, for `stream=true`, an
      * async iterable of chunks) untouched so the controller can stream them
      * straight back to the client.
+     *
+     * Phase 3.5: every call (success or failure) lands one row in
+     * `request_logs` via {@link RequestLogService}.
      */
     async completions(
         body: ChatCompletionCreateParams,
     ): Promise<CompletionResult> {
-        return this.router.route(body.model, body, (resolved, signal) =>
-            this.callUpstream(resolved, body, signal),
-        ).then((r) => r.result);
+        const requestedAt = Math.floor(Date.now() / 1000);
+        try {
+            const r = await this.router.route(body.model, body, (resolved, signal) =>
+                this.callUpstream(resolved, body, signal),
+            );
+            this.requestLog.recordSuccess({
+                requestedAt,
+                requestedModel: body.model,
+                resolvedProvider: r.providerId,
+                resolvedModel: r.attempts.at(-1)?.upstreamModel ?? 'unknown',
+                attempts: r.attempts.length,
+                latencyMs: nowSeconds() - requestedAt,
+            });
+            return r.result;
+        } catch (err) {
+            this.recordFailure(err, body, requestedAt);
+            throw err;
+        }
+    }
+
+    private recordFailure(
+        err: unknown,
+        body: ChatCompletionCreateParams,
+        requestedAt: number,
+    ): void {
+        if (err instanceof RoutingFailedError) {
+            this.requestLog.recordFailure({
+                requestedAt,
+                requestedModel: err.requestedModel,
+                attempts: err.attempts,
+                latencyMs: nowSeconds() - requestedAt,
+                error: err,
+            });
+            return;
+        }
+        this.requestLog.recordFailure({
+            requestedAt,
+            requestedModel: body.model,
+            attempts: [],
+            latencyMs: nowSeconds() - requestedAt,
+            error: err,
+        });
     }
 
     /**
@@ -136,6 +180,10 @@ export class ChatService {
 // Pure helpers — exported separately so unit tests can exercise them
 // without spinning up Nest DI.
 // ---------------------------------------------------------------------------
+
+function nowSeconds(): number {
+    return Math.floor(Date.now() / 1000);
+}
 
 export function extractText(content: any): string {
     if (typeof content === 'string') return content;

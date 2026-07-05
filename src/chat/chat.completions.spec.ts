@@ -12,6 +12,8 @@ import { ProviderService } from '../providers/provider.service';
 import type { Env } from '../config/env.schema';
 import type { ResolvedModel } from '../providers/provider.model';
 import type { RouteExecutor, RouteResult, RoutingService } from '../routing/routing.service';
+import { RequestLogService } from '../observability/request-log.service';
+import { RoutingFailedError } from '../routing/routing.service';
 
 const OpenAICtor = OpenAI as unknown as jest.Mock;
 
@@ -27,8 +29,7 @@ const fakeEnv: Env = {
 
 /**
  * Build a fake ProviderService for tests. Resolves to a deterministic
- * ResolvedModel and exposes a mocked OpenAI client. The wiring layer that
- * ultimately drives the SDK now lives in the executor passed to the router.
+ * ResolvedModel and exposes a mocked OpenAI client.
  */
 function makeFakeProvider(model = 'gpt-test', upstream = 'gpt-test'): {
     provider: ProviderService;
@@ -55,37 +56,50 @@ function makeFakeProvider(model = 'gpt-test', upstream = 'gpt-test'): {
     return { provider, resolved, clientFor, create };
 }
 
-/**
- * Build a fake RoutingService. The fake's `route()` just invokes the
- * executor on the first available resolved model with a fresh AbortSignal.
- * Tests that need fallback / circuit behavior cover that at the
- * RoutingService spec level.
- */
-function makeFakeRouter(resolved: ResolvedModel): {
+/** A fake RequestLogService — methods are no-ops so ChatService's logging
+ *  call doesn't crash in unit tests. Real behavior is covered in the
+ *  RequestLogService spec. */
+function makeFakeLog(): RequestLogService {
+    return {
+        recordSuccess: jest.fn(),
+        recordFailure: jest.fn(),
+    } as unknown as RequestLogService;
+}
+
+/** A fake RoutingService: invokes the supplied executor and packages the
+ *  result. Use `failWith` to simulate a router-level rejection. */
+function makeFakeRouter(
+    resolved: ResolvedModel,
+    opts: { failWith?: Error } = {},
+): {
     router: RoutingService;
     route: jest.Mock;
-    receivedBody: () => any;
-    receivedExecutor: () => RouteExecutor | undefined;
 } {
     const route = jest.fn();
-    let captured: { body: any; executor: RouteExecutor } | undefined;
-    route.mockImplementation(async (model: string, body: any, executor: RouteExecutor) => {
-        captured = { body, executor };
-        const result = await executor(resolved, new AbortController().signal);
-        const out: RouteResult = {
-            result,
-            providerId: resolved.providerId,
-            attempts: [],
-        };
-        return out;
-    });
+    if (opts.failWith) {
+        route.mockRejectedValue(opts.failWith);
+    } else {
+        route.mockImplementation(
+            async (_model: string, _body: any, executor: RouteExecutor) => {
+                const result = await executor(resolved, new AbortController().signal);
+                const out: RouteResult = {
+                    result,
+                    providerId: resolved.providerId,
+                    attempts: [
+                        {
+                            providerId: resolved.providerId,
+                            upstreamModel: resolved.upstreamModel,
+                            ok: true,
+                            durationMs: 1,
+                        },
+                    ],
+                };
+                return out;
+            },
+        );
+    }
     const router = { route } as unknown as RoutingService;
-    return {
-        router,
-        route,
-        receivedBody: () => captured?.body,
-        receivedExecutor: () => captured?.executor,
-    };
+    return { router, route };
 }
 
 function buildSampleBody(overrides: Record<string, unknown> = {}) {
@@ -105,7 +119,8 @@ describe('ChatService.completions', () => {
     it('delegates to RoutingService.route and forwards its result', async () => {
         const fake = makeFakeProvider('gpt-test', 'gpt-real');
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const log = makeFakeLog();
+        const service = new ChatService(fakeEnv, fake.provider, router.router, log);
 
         fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
         const result = await service.completions(buildSampleBody() as any);
@@ -120,17 +135,22 @@ describe('ChatService.completions', () => {
         const [bodyPass, optsPass] = fake.create.mock.calls[0];
         expect(bodyPass.model).toBe('gpt-real');
         expect(bodyPass.messages).toEqual([{ role: 'user', content: 'hi' }]);
-        // Signal option plumbed through the executor.
-        expect(optsPass).toBeDefined();
-        expect(optsPass.signal).toBeInstanceOf(AbortSignal);
+        expect(optsPass?.signal).toBeInstanceOf(AbortSignal);
 
         expect(result).toEqual({ id: 'cmpl-1' });
+        expect((log.recordSuccess as jest.Mock)).toHaveBeenCalledTimes(1);
+        expect((log.recordSuccess as jest.Mock).mock.calls[0][0]).toMatchObject({
+            requestedModel: 'gpt-test',
+            resolvedProvider: 'test',
+            resolvedModel: 'gpt-real',
+            attempts: 1,
+        });
     });
 
     it('returns the SDK stream untouched when stream=true', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
 
         async function* fakeStream() {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
@@ -155,7 +175,7 @@ describe('ChatService.completions', () => {
     it('normalizes the body before calling the upstream (merges system messages)', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions({
@@ -183,7 +203,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody() as any);
@@ -196,7 +216,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody({ max_tokens: 99 }) as any);
@@ -205,26 +225,54 @@ describe('ChatService.completions', () => {
         expect(arg.max_tokens).toBe(99);
     });
 
-    it('propagates errors from resolveChain (rejected upstream of the executor)', async () => {
+    it('propagates errors from the router and records a failure log', async () => {
         const fake = makeFakeProvider();
         const router = {
-            route: jest
-                .fn()
-                .mockRejectedValue(new Error('Unknown model "nope"')),
+            route: jest.fn().mockRejectedValue(new Error('Unknown model "nope"')),
         } as unknown as RoutingService;
-        const service = new ChatService(fakeEnv, fake.provider, router);
+        const log = makeFakeLog();
+        const service = new ChatService(fakeEnv, fake.provider, router, log);
 
-        await expect(service.completions(buildSampleBody() as any))
-            .rejects.toThrow(/Unknown model/);
+        await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(
+            /Unknown model/,
+        );
+        expect((log.recordFailure as jest.Mock)).toHaveBeenCalledTimes(1);
+    });
+
+    it('records RoutingFailedError with the attempts it carries', async () => {
+        const fake = makeFakeProvider();
+        const router = {
+            route: jest.fn().mockImplementation(() => {
+                throw new RoutingFailedError('fast', [
+                    {
+                        providerId: 'openai',
+                        upstreamModel: 'gpt-4o-mini',
+                        ok: false,
+                        circuitOpen: true,
+                        durationMs: 0,
+                    },
+                ]);
+            }),
+        } as unknown as RoutingService;
+        const log = makeFakeLog();
+        const service = new ChatService(fakeEnv, fake.provider, router, log);
+
+        await expect(service.completions(buildSampleBody() as any)).rejects.toBeInstanceOf(
+            RoutingFailedError,
+        );
+        const args = (log.recordFailure as jest.Mock).mock.calls[0][0];
+        expect(args.requestedModel).toBe('fast');
+        expect(args.attempts).toHaveLength(1);
     });
 
     it('propagates upstream errors from the OpenAI client', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog());
         fake.create.mockRejectedValueOnce(new Error('upstream boom'));
 
-        await expect(service.completions(buildSampleBody() as any))
-            .rejects.toThrow('upstream boom');
+        await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(
+            'upstream boom',
+        );
     });
 });

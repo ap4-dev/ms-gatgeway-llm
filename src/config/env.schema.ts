@@ -47,6 +47,10 @@ const envSchema = z.object({
     // CORS allowlist (comma-separated origins or "*")
     CORS_ORIGINS: z.string().optional(),
 
+    // Phase 3.5: SQLite path. Resolved relative to process.cwd(). The first
+    // boot creates the file (and the parent directory) automatically.
+    DATABASE_PATH: z.string().default('./data/ms-gateway.db'),
+
     // Doppler
     START_TOKEN: z.string().optional(),
     MS: z.string().default('ms-proxy'),
