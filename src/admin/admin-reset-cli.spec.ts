@@ -4,6 +4,7 @@ import {
     buildResetSql,
     buildCreateSql,
     formatOutput,
+    buildOutput,
     type AdminResetOutput,
 } from './admin-reset-cli';
 import { randomBytes } from 'node:crypto';
@@ -45,6 +46,19 @@ describe('parseArgs', () => {
 
     it('returns an empty `_: []` for bare invocation', () => {
         expect(parseArgs([])).toEqual({ _: [] });
+    });
+
+    it('captures --plain <key>', () => {
+        expect(parseArgs(['--plain', 'sk-mykey123'])).toEqual({
+            _: [],
+            plain: 'sk-mykey123',
+        });
+    });
+
+    it('captures --plain alongside --reset', () => {
+        const out = parseArgs(['--reset', 'admin', '--plain', 'sk-existingkey']);
+        expect(out.reset).toBe('admin');
+        expect(out.plain).toBe('sk-existingkey');
     });
 });
 
@@ -189,6 +203,41 @@ describe('integration: parseArgs → generateCredentials → SQL', () => {
         expect(out.kind).toBe('RESET');
         expect(out.prefix).toBe('sk-testp');
         expect(out.sql).toMatch(/^UPDATE clients SET api_key_hash = 'scrypt\$/);
+    });
+});
+
+describe('buildOutput with --plain', () => {
+    it('uses the provided plain key instead of generating a random one', () => {
+        const args = parseArgs(['--reset', 'admin', '--plain', 'sk-customkey1234567890abcdef']);
+        const out = buildOutput(args);
+        expect(out).not.toBeNull();
+        if (out) {
+            expect(out.kind).toBe('RESET');
+            expect(out.clientId).toBe('admin');
+            expect(out.plain).toBe('sk-customkey1234567890abcdef');
+            // Prefix is the first 8 chars of the plaintext, matching
+            // generateCredentials (slice(0, 8)) and the convention used by
+            // the other tests in this spec.
+            expect(out.prefix).toBe('sk-custo');
+            expect(out.sql).toMatch(/api_key_prefix = 'sk-custo'/);
+        }
+    });
+
+    it('uses the provided plain key with --create', () => {
+        const args = parseArgs([
+            '--create',
+            '--id', 'tenant-test',
+            '--plain', 'sk-customkey1234567890abcdef',
+        ]);
+        const out = buildOutput(args);
+        expect(out).not.toBeNull();
+        if (out) {
+            expect(out.kind).toBe('CREATE');
+            expect(out.clientId).toBe('tenant-test');
+            expect(out.plain).toBe('sk-customkey1234567890abcdef');
+            expect(out.prefix).toBe('sk-custo');
+            expect(out.sql).toMatch(/'sk-custo'/);
+        }
     });
 });
 
