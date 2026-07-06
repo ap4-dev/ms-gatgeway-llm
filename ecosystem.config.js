@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: "ms-core-one",
+    name: "ms-gateway-llm",
     script: "./dist/main.js",
 
     // 🔧 Escala fija pero con múltiples workers

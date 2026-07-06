@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { Logger } from '@nestjs/common';
 import { ClientRepository } from './client.repository';
 import { ClientService } from './client.service';
+import { ClientAuthCache } from './client-auth-cache';
 import { ensureDefaultAdminClient } from './seed-default-client';
+
+const PEPPER = 'unit-test-pepper-' + 'a'.repeat(32);
 
 function makeDbWithSchema(): Database.Database {
     const db = new Database(':memory:');
@@ -15,6 +18,22 @@ function makeDbWithSchema(): Database.Database {
     return db;
 }
 
+/**
+ * Stub RedisService: `ensureDefaultAdminClient` only invokes
+ * `create()`, which writes to SQLite — no cache reads happen on the
+ * boot path. Return a no-op object with the methods ClientAuthCache
+ * calls, in case future seeds touch the cache.
+ */
+function stubRedis(): any {
+    return {
+        get: async () => null,
+        set: async () => undefined,
+        getJson: async () => null,
+        setJson: async () => undefined,
+        del: async () => undefined,
+    };
+}
+
 describe('ensureDefaultAdminClient', () => {
     let db: Database.Database;
     let svc: ClientService;
@@ -22,7 +41,7 @@ describe('ensureDefaultAdminClient', () => {
 
     beforeEach(() => {
         db = makeDbWithSchema();
-        svc = new ClientService(new ClientRepository(db));
+        svc = new ClientService(new ClientRepository(db), new ClientAuthCache(stubRedis()), PEPPER);
         logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     });
 

@@ -18,14 +18,26 @@ interface ModelsListResponse {
 /**
  * GET /v1/models — OpenAI-compatible model listing.
  *
- * Clients (Kilo, OpenCode, Claude Code, …) call this to discover available
- * models. The gateway returns every model registered in providers.json
- * (one entry per model, not per alias). Providers whose `apiKeyEnv` is not
- * configured are filtered out so the list never shows unreachable models.
+ * Clients (Kilo, OpenCode, Claude Code, …) call this to discover what
+ * models they can call. The gateway exposes **only the aliases**
+ * configured in the registry — never the upstream real-model ids. This
+ * mirrors the alias-only behavior of `GET /admin/logs`: the gateway
+ * is a façade over its providers, and provider/model identity is
+ * operational detail that should not leak through the public API.
  *
- * NOTE: the path is `@Controller('models')` and the global prefix `/v1` is
- * applied by `main.ts` via `app.setGlobalPrefix('v1')`. Putting `v1` here
- * too would yield `/v1/v1/models`.
+ * Each alias is configured as an ordered fallback chain
+ * (e.g. `['nan/qwen3.6', 'nan/deepseek-v4-flash']`). The alias is
+ * advertised if and only if:
+ *   - its primary (chain[0]) has a configured provider whose
+ *     `apiKeyEnv` is set in env, AND
+ *   - the upstream model key exists on that provider.
+ *
+ * Aliases that point to unreachable primaries are silently skipped —
+ * the client never sees a model it cannot resolve.
+ *
+ * NOTE: the path is `@Controller('models')` and the global prefix `/v1`
+ * is applied by `main.ts` via `app.setGlobalPrefix('v1')`. Putting
+ * `v1` here too would yield `/v1/v1/models`.
  */
 @Controller('models')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -39,15 +51,8 @@ export class ModelsController {
 
     @Get()
     list(): ModelsListResponse {
-        // Use a map keyed by `id` so that when an alias points to a model
-        // key with the same name, we don't emit duplicates.
         const byId = new Map<string, ModelListEntry>();
 
-        // Aliases first. The `id` a client should send is the alias name
-        // (e.g. "fast", "coder"), not the upstream model id. Each alias is
-        // now an ordered fallback chain; we advertise the alias under its
-        // primary (chain[0]) and silently skip the alias if its primary is
-        // unavailable (no api key or unknown model).
         for (const [aliasKey, aliasChain] of Object.entries(this.registry.aliases)) {
             const [primary] = aliasChain;
             if (!primary) continue;
@@ -64,26 +69,12 @@ export class ModelsController {
             });
         }
 
-        // Direct model keys (deduped against aliases).
-        for (const [providerId, provider] of Object.entries(
-            this.registry.providers,
-        )) {
-            // Skip a provider entirely when its API key env var is unset —
-            // the gateway can't proxy calls to it, so don't advertise it.
-            if (!process.env[provider.apiKeyEnv]) continue;
-
-            for (const modelKey of Object.keys(provider.models)) {
-                if (byId.has(modelKey)) continue;
-                byId.set(modelKey, {
-                    id: modelKey,
-                    object: 'model',
-                    created: this.createdAt,
-                    owned_by: providerId,
-                });
-            }
-        }
-
         // Sort by id for a deterministic, stable response.
-        return { object: 'list', data: Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id)) };
+        return {
+            object: 'list',
+            data: Array.from(byId.values()).sort((a, b) =>
+                a.id.localeCompare(b.id),
+            ),
+        };
     }
 }

@@ -65,7 +65,7 @@ describe('ModelsController', () => {
         jest.restoreAllMocks();
     });
 
-    it('lists aliases AND model keys (deduped) for every configured provider', () => {
+    it('lists ONLY aliases — never the underlying real model keys', () => {
         setUpKeys({ nan: true, openai: true });
         const controller = new ModelsController(makeRegistry());
 
@@ -73,16 +73,20 @@ describe('ModelsController', () => {
 
         expect(res.object).toBe('list');
         const ids = res.data.map((d) => d.id).sort();
-        // aliases: coder, default, fast
-        // model keys: qwen3.6, qwen3-coder (deduped against alias "coder"), gpt-4o-mini
-        expect(ids).toEqual([
-            'coder',
-            'default',
-            'fast',
-            'gpt-4o-mini',
-            'qwen3-coder',
-            'qwen3.6',
-        ]);
+        // Only the alias entries — none of the upstream real-model ids.
+        expect(ids).toEqual(['coder', 'default', 'fast']);
+    });
+
+    it('does NOT leak any real model key (qwen3.6 / qwen3-coder / gpt-4o-mini)', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(makeRegistry());
+
+        const res = controller.list();
+        const payload = JSON.stringify(res);
+        // Provider-side model ids must never appear in the response.
+        expect(payload).not.toContain('qwen3.6');
+        expect(payload).not.toContain('qwen3-coder');
+        expect(payload).not.toContain('gpt-4o-mini');
     });
 
     it('uses the alias key as the model id (never the upstream `real` name)', () => {
@@ -102,34 +106,29 @@ describe('ModelsController', () => {
 
         expect(aliased).toBeDefined();
         expect(aliased!.owned_by).toBe('nan');
-        // The upstream name "qwen3-coder" must NOT leak under either id
-        // for the alias entry — it's only the model-key entry.
-        expect(res.data.filter((d) => d.id === 'qwen3-coder')).toHaveLength(1);
+        // The real upstream model key must NOT appear at all in the public
+        // listing — neither as a dedupe target nor as a top-level entry.
+        expect(res.data.some((d) => d.id === 'qwen3-coder')).toBe(false);
         expect(res.data.filter((d) => d.id === 'awesome')).toHaveLength(1);
     });
 
-    it('dedupes when an alias name matches a model key', () => {
+    it('keeps the alias even when its name matches an upstream model key', () => {
         setUpKeys({ nan: true });
         const controller = new ModelsController(
             makeRegistry({
                 aliases: {
-                    // alias key == model key on the same provider
+                    // alias key == model key on the same provider — should
+                    // still appear under its alias name, never as a raw
+                    // model key entry.
                     'qwen3-coder': ['nan/qwen3-coder'],
                 },
             }),
         );
 
         const res = controller.list();
+        expect(res.data.find((d) => d.id === 'qwen3-coder')).toBeDefined();
+        // Only the alias is exposed, not the model-key entry separately.
         expect(res.data.filter((d) => d.id === 'qwen3-coder')).toHaveLength(1);
-    });
-
-    it('skips providers whose API key env is missing', () => {
-        setUpKeys({ nan: true, openai: false });
-        const controller = new ModelsController(makeRegistry());
-
-        const res = controller.list();
-        const ids = res.data.map((d) => d.id);
-        expect(ids).toEqual(['coder', 'default', 'qwen3-coder', 'qwen3.6']);
     });
 
     it('skips aliases that point to providers without their API key set', () => {
@@ -137,6 +136,10 @@ describe('ModelsController', () => {
         const controller = new ModelsController(makeRegistry());
 
         const res = controller.list();
+        // All three default aliases are nan-routed, so they all show.
+        // (`fast` points to openai/gpt-4o-mini — api key missing — skipped.)
+        const ids = res.data.map((d) => d.id).sort();
+        expect(ids).toEqual(['coder', 'default']);
         expect(res.data.find((d) => d.id === 'fast')).toBeUndefined();
     });
 

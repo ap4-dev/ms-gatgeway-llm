@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AdminClientsController } from './admin-clients.controller';
 import { AdminAliasesController } from './admin-aliases.controller';
+import { AdminLogsController } from './admin-logs.controller';
 import { ChatModule } from '../chat/chat.module';
 
 /**
@@ -13,6 +14,10 @@ import { ChatModule } from '../chat/chat.module';
  */
 @Module({
     imports: [ChatModule],
-    controllers: [AdminClientsController, AdminAliasesController],
+    controllers: [
+        AdminClientsController,
+        AdminAliasesController,
+        AdminLogsController,
+    ],
 })
 export class AdminModule {}

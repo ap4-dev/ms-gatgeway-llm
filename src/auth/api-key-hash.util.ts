@@ -1,53 +1,68 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 export const PREFIX_LENGTH = 8;
 
 /**
  * Format produced by `hashApiKey`:
  *
- *     scrypt$<saltHex>$<hashHex>
+ *     hmac$<hex of HMAC-SHA256(pepper, plaintext)>
  *
- * Pre-scrypt is meant to be honest about the algorithm so we can rotate
- * it later without colliding with old hashes. Salt is 16 bytes; hash is
- * 32 bytes (per scryptSync defaults).
+ * Why HMAC instead of scrypt:
+ *   - Keys are 256-bit random (`sk-` + 64 hex), so scrypt's slow KDF buys
+ *     no brute-force resistance beyond what the entropy already provides.
+ *   - HMAC-SHA256 takes ~1 µs. scrypt at default params (~10 ms) blocked
+ *     the event loop on every authenticated request.
+ *   - The pepper is a server-side secret loaded from env. It is NOT in
+ *     the database — so a leaked DB alone is not enough to forge a
+ *     verification.
  *
- * scrypt parameters: N=16384, r=8, p=1 (the scryptSync defaults; ~10ms per
- * hash on a modern CPU — fine for a single verify-per-request).
+ * Legacy `scrypt$…` rows are rejected outright (returns false). Operators
+ * must re-hash existing keys via the CLI: `pnpm admin:reset -- --plain …`.
  */
 
-const SCRYPT_PARAMS = { keylen: 32 };
-const SCRYPT_PREFIX = 'scrypt';
+const HMAC_PREFIX = 'hmac';
 
-export function hashApiKey(plaintext: string): string {
+function assertPepper(pepper: string): void {
+    if (!pepper || pepper.length < 32) {
+        throw new Error('api-key hash: pepper must be non-empty (>=32 chars)');
+    }
+}
+
+export function hashApiKey(plaintext: string, pepper: string): string {
     if (!plaintext || plaintext.length === 0) {
         throw new Error('api-key hash: plaintext must be non-empty');
     }
-    const salt = randomBytes(16);
-    const derived = scryptSync(plaintext, salt, SCRYPT_PARAMS.keylen);
-    return [
-        SCRYPT_PREFIX,
-        salt.toString('hex'),
-        derived.toString('hex'),
-    ].join('$');
+    assertPepper(pepper);
+    const digest = createHmac('sha256', pepper)
+        .update(plaintext)
+        .digest();
+    return [HMAC_PREFIX, digest.toString('hex')].join('$');
 }
 
-export function verifyApiKey(plaintext: string, stored: string | null | undefined): boolean {
+export function verifyApiKey(
+    plaintext: string,
+    stored: string | null | undefined,
+    pepper: string,
+): boolean {
     if (!plaintext || !stored) return false;
+    if (typeof pepper !== 'string' || pepper.length < 32) {
+        // Defensive: refuse to run with no/short pepper rather than
+        // silently falling through to a comparison against nothing.
+        return false;
+    }
     const parts = stored.split('$');
-    if (parts.length !== 3) return false;
-    const [algo, saltHex, hashHex] = parts;
-    if (algo !== SCRYPT_PREFIX) return false;
-    if (!saltHex || !hashHex) return false;
-    let salt: Buffer;
+    if (parts.length !== 2) return false;
+    const [algo, hashHex] = parts;
+    if (algo !== HMAC_PREFIX) return false; // Rejects legacy `scrypt$…` rows.
+    if (!hashHex) return false;
     let expected: Buffer;
     try {
-        salt = Buffer.from(saltHex, 'hex');
         expected = Buffer.from(hashHex, 'hex');
     } catch {
         return false;
     }
     if (expected.length === 0) return false;
-    const derived = scryptSync(plaintext, salt, expected.length);
+    const derived = createHmac('sha256', pepper).update(plaintext).digest();
     if (derived.length !== expected.length) return false;
     return timingSafeEqual(derived, expected);
 }

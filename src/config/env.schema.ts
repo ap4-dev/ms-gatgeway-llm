@@ -54,6 +54,14 @@ const envSchema = z.object({
     // Doppler
     START_TOKEN: z.string().optional(),
     MS: z.string().default('ms-proxy'),
+
+    // Required server-side secret (pepper) for hashing API keys with
+    // HMAC-SHA256. Min 32 chars to keep the search space large enough
+    // to resist offline brute force on a leaked DB. Generate with
+    //   openssl rand -hex 32
+    // Stored in Doppler (loaded via main.ts); the operator CLI
+    // (scripts/admin-reset.js) reads it from process.env.
+    API_KEY_PEPPER: z.string().min(32, 'API_KEY_PEPPER must be at least 32 chars'),
 });
 
 export type Env = z.infer<typeof envSchema>;

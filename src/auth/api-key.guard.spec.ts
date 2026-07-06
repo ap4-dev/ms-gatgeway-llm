@@ -11,7 +11,7 @@ function makeMockClient(overrides: Partial<Client> = {}): Client {
     return {
         id: 'admin',
         name: 'Admin',
-        apiKeyHash: 'scrypt$xx$yy',
+        apiKeyHash: 'hmac$xx',
         apiKeyPrefix: 'sk-abcde',
         scopes: ['chat.read', 'chat.write'],
         rateLimitRpm: 60,
@@ -24,27 +24,27 @@ function makeMockClient(overrides: Partial<Client> = {}): Client {
 }
 
 function makeGuard(client: Client | undefined) {
-    const svc = { verifyApiKey: jest.fn().mockReturnValue(client) } as unknown as ClientService;
+    const svc = { verifyApiKey: jest.fn().mockResolvedValue(client) } as unknown as ClientService;
     return { guard: new ApiKeyAuthGuard(svc), svc };
 }
 
 describe('ApiKeyAuthGuard', () => {
-    it('allows a request with a valid Authorization: Bearer <key>', () => {
+    it('allows a request with a valid Authorization: Bearer <key>', async () => {
         const client = makeMockClient();
         const { guard } = makeGuard(client);
         const req = makeMockReq({ authorization: 'Bearer sk-abcdefghijk' });
-        const can = guard.canActivate({
+        const can = await guard.canActivate({
             switchToHttp: () => ({ getRequest: () => req }),
         } as any);
         expect(can).toBe(true);
         expect(req.client).toBe(client);
     });
 
-    it('falls back to X-API-Key header when Authorization is missing', () => {
+    it('falls back to X-API-Key header when Authorization is missing', async () => {
         const client = makeMockClient();
         const { guard, svc } = makeGuard(client);
         const req = makeMockReq({ 'x-api-key': 'sk-abcdefghijk' });
-        const can = guard.canActivate({
+        const can = await guard.canActivate({
             switchToHttp: () => ({ getRequest: () => req }),
         } as any);
         expect(can).toBe(true);
@@ -52,34 +52,51 @@ describe('ApiKeyAuthGuard', () => {
         expect(svc.verifyApiKey).toHaveBeenCalledWith('sk-abcdefghijk');
     });
 
-    it('throws UnauthorizedException when no header is present', () => {
+    it('throws UnauthorizedException when no header is present', async () => {
         const { guard } = makeGuard(undefined);
-        expect(() =>
+        await expect(
             guard.canActivate({
                 switchToHttp: () => ({ getRequest: () => makeMockReq() }),
             } as any),
-        ).toThrow(UnauthorizedException);
+        ).rejects.toBeInstanceOf(UnauthorizedException);
     });
 
-    it('throws UnauthorizedException when Authorization is malformed (not Bearer …)', () => {
+    it('throws UnauthorizedException when Authorization is malformed (not Bearer …)', async () => {
         const { guard } = makeGuard(undefined);
-        expect(() =>
+        await expect(
             guard.canActivate({
                 switchToHttp: () => ({
                     getRequest: () => makeMockReq({ authorization: 'Basic abc' }),
                 }),
             } as any),
-        ).toThrow(UnauthorizedException);
+        ).rejects.toBeInstanceOf(UnauthorizedException);
     });
 
-    it('throws UnauthorizedException when the key does not verify', () => {
+    it('throws UnauthorizedException when the key does not verify', async () => {
         const { guard, svc } = makeGuard(undefined);
         const req = makeMockReq({ authorization: 'Bearer sk-bogus' });
-        expect(() =>
+        await expect(
             guard.canActivate({
                 switchToHttp: () => ({ getRequest: () => req }),
             } as any),
-        ).toThrow(UnauthorizedException);
+        ).rejects.toBeInstanceOf(UnauthorizedException);
         expect(svc.verifyApiKey).toHaveBeenCalledWith('sk-bogus');
+    });
+
+    it('awaits the async verifyApiKey path', async () => {
+        const client = makeMockClient();
+        const svc = {
+            verifyApiKey: jest.fn(async (_p: string) => {
+                await new Promise((r) => setImmediate(r)); // simulate async hop
+                return client;
+            }),
+        } as unknown as ClientService;
+        const guard = new ApiKeyAuthGuard(svc);
+        const req = makeMockReq({ authorization: 'Bearer sk-abc' });
+        const can = await guard.canActivate({
+            switchToHttp: () => ({ getRequest: () => req }),
+        } as any);
+        expect(can).toBe(true);
+        expect(req.client).toBe(client);
     });
 });

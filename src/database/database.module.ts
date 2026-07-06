@@ -9,7 +9,9 @@ import { MigrationRunner } from './migrations/migration-runner';
 import { seedProvidersFromFile } from './seed/seed-on-first-boot';
 import { ClientRepository } from '../auth/client.repository';
 import { ClientService } from '../auth/client.service';
+import { ClientAuthCache } from '../auth/client-auth-cache';
 import { ensureDefaultAdminClient } from '../auth/seed-default-client';
+import { RedisService } from '../redis.service';
 
 /**
  * Default project-relative paths. Resolved against `process.cwd()` when
@@ -69,18 +71,21 @@ const DEFAULT_SEED_FILE = join(DEFAULT_SEEDS_DIR, '0001_initial_providers.json')
         // Phase 5 first-boot admin seed. Runs once on the very first
         // boot when the `clients` table is empty. Subsequent boots
         // short-circuit. The ClientService instance shares the
-        // DatabaseService's underlying connection.
+        // DatabaseService's underlying connection and the global
+        // RedisService (now exposed via the @Global RedisModule).
         {
             provide: 'FIRST_BOOT_PROVISIONING',
-            useFactory: (db: DatabaseService) => {
+            useFactory: (db: DatabaseService, redis: RedisService, env: Env) => {
                 const logger = new Logger('FirstBoot');
                 const clientService = new ClientService(
                     new ClientRepository(db.db),
+                    new ClientAuthCache(redis),
+                    env.API_KEY_PEPPER,
                 );
                 ensureDefaultAdminClient(clientService, logger);
                 return true;
             },
-            inject: [DatabaseService],
+            inject: [DatabaseService, RedisService, ENV_CONFIG],
         },
     ],
     exports: [DatabaseService, DATABASE_PATH],

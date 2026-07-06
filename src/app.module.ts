@@ -8,7 +8,7 @@ import { SentryModule } from '@sentry/nestjs/setup';
 import { SentryGlobalFilter } from '@sentry/nestjs/setup';
 
 import { AppJsonLogger } from './app.logger.js';
-import { RedisService } from './redis.service';
+import { RedisModule } from './redis.module';
 import { ChatModule } from './chat/chat.module';
 import { HealthModule } from './health/health.module';
 import { AdminModule } from './admin/admin.module';
@@ -17,7 +17,8 @@ import { CoreModule } from './config/core.module';
 @Module({
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
-        SentryModule.forRoot(), CoreModule, ChatModule, HealthModule, AdminModule,
+        SentryModule.forRoot(), CoreModule, RedisModule,
+        ChatModule, HealthModule, AdminModule,
     ],
     controllers: [AppController],
     providers: [
@@ -25,7 +26,7 @@ import { CoreModule } from './config/core.module';
             provide: APP_FILTER,
             useClass: SentryGlobalFilter,
         },
-        AppJsonLogger, RedisService
+        AppJsonLogger,
     ],
 })
 export class AppModule { }

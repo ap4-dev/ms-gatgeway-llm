@@ -5,9 +5,12 @@ import {
     buildCreateSql,
     formatOutput,
     buildOutput,
+    readPepper,
+    CliError,
     type AdminResetOutput,
 } from './admin-reset-cli';
-import { randomBytes } from 'node:crypto';
+
+const PEPPER = 'unit-test-pepper-' + 'a'.repeat(32);
 
 describe('parseArgs', () => {
     it('returns help=true with --help', () => {
@@ -63,38 +66,71 @@ describe('parseArgs', () => {
 });
 
 describe('generateCredentials', () => {
-    it('produces a `sk-...` plaintext, 8-char prefix, and `scrypt$<saltHex>$<hashHex>` stored value', () => {
+    it('produces a `sk-...` plaintext, 8-char prefix, and `hmac$<64-hex>` stored value', () => {
         const fixedPlain = 'sk-aaaaabbbcccddddeeeffgghhiijjkkllmmnnooppqqrrss';
-        // Provide a plain override → fully deterministic.
-        const out = generateCredentials({ plain: fixedPlain });
+        const out = generateCredentials({ plain: fixedPlain, pepper: PEPPER });
         expect(out.plain).toBe(fixedPlain);
         expect(out.prefix).toBe('sk-aaaaa');
-        expect(out.stored).toMatch(/^scrypt\$[0-9a-f]{32}\$[0-9a-f]{64}$/);
+        expect(out.stored).toMatch(/^hmac\$[0-9a-f]{64}$/);
     });
 
-    it('uses scrypt — the same plaintext with two different salts yields different stored hashes', () => {
+    it('is deterministic — same plaintext + pepper always produces the same hash', () => {
         const plain = 'sk-sameplainxxxxxxxxxxxxxxxxxxxxxxxxxx';
-        const salt1 = Buffer.from('a'.repeat(32), 'hex');
-        const salt2 = Buffer.from('b'.repeat(32), 'hex');
-        const a = generateCredentials({ plain, salt: salt1 });
-        const b = generateCredentials({ plain, salt: salt2 });
-        expect(a.stored).not.toBe(b.stored);
-        // But same plaintext → same prefix.
+        const a = generateCredentials({ plain, pepper: PEPPER });
+        const b = generateCredentials({ plain, pepper: PEPPER });
+        expect(a.stored).toBe(b.stored);
         expect(a.prefix).toBe(b.prefix);
     });
 
+    it('differs for the same plaintext under a different pepper', () => {
+        const plain = 'sk-sameplainxxxxxxxxxxxxxxxxxxxxxxxxxx';
+        const a = generateCredentials({ plain, pepper: PEPPER });
+        const b = generateCredentials({
+            plain,
+            pepper: 'different-pepper-' + 'b'.repeat(32),
+        });
+        expect(a.stored).not.toBe(b.stored);
+    });
+
+    it('generates a fresh random key when --plain is omitted', () => {
+        const a = generateCredentials({ pepper: PEPPER });
+        const b = generateCredentials({ pepper: PEPPER });
+        expect(a.plain).not.toBe(b.plain);
+        expect(a.plain.startsWith('sk-')).toBe(true);
+    });
+
+    it('throws on a missing or too-short pepper', () => {
+        expect(() => generateCredentials({ pepper: '' })).toThrow(CliError);
+        expect(() => generateCredentials({ pepper: 'short' })).toThrow(CliError);
+    });
+
     it('matches what `src/auth/api-key-hash.util` produces for the same input', () => {
-        // Cross-check the implementation against the canonical helper —
-        // any drift between cli and auth hash util would lock operators out
-        // of their own gateway.
         const plain = 'sk-crosstestxxxxxxxxxxxxxxxxxxxxxxxxx';
-        const saltHex = 'aa'.repeat(16);
-        const salt = Buffer.from(saltHex, 'hex');
-        const out = generateCredentials({ plain, salt });
-        // scrypt$<32 hex>$<64 hex> = scrypt$aa..aa$<sha256 with scrypt>
-        expect(out.stored).toMatch(
-            new RegExp(`^scrypt\\$${saltHex}\\$[0-9a-f]{64}$`),
-        );
+        const a = generateCredentials({ plain, pepper: PEPPER });
+        // Hash util uses the same algorithm; the stored value must match
+        // the canonical helper, otherwise operators would lock themselves out.
+        const { hashApiKey } = require('../auth/api-key-hash.util');
+        expect(a.stored).toBe(hashApiKey(plain, PEPPER));
+    });
+});
+
+describe('readPepper', () => {
+    it('returns the pepper from a populated env', () => {
+        expect(readPepper({ API_KEY_PEPPER: PEPPER })).toBe(PEPPER);
+    });
+
+    it('throws CliError(2) when the env is missing the variable', () => {
+        expect(() => readPepper({})).toThrow(CliError);
+        try {
+            readPepper({});
+        } catch (err) {
+            expect((err as CliError).code).toBe(2);
+            expect(err.message).toMatch(/API_KEY_PEPPER/);
+        }
+    });
+
+    it('throws CliError(2) when the env value is too short', () => {
+        expect(() => readPepper({ API_KEY_PEPPER: 'short' })).toThrow(CliError);
     });
 });
 
@@ -102,18 +138,18 @@ describe('buildResetSql', () => {
     it('produces a single-line UPDATE targeting the named client', () => {
         const sql = buildResetSql({
             clientId: 'admin',
-            stored: 'scrypt$xx$yy',
+            stored: 'hmac$abcd',
             prefix: 'sk-abcde',
         });
         expect(sql).toBe(
-            "UPDATE clients SET api_key_hash = 'scrypt$xx$yy', api_key_prefix = 'sk-abcde', last_used_at = NULL WHERE id = 'admin'",
+            "UPDATE clients SET api_key_hash = 'hmac$abcd', api_key_prefix = 'sk-abcde', last_used_at = NULL WHERE id = 'admin'",
         );
     });
 
     it('escapes single quotes in the client id', () => {
         const sql = buildResetSql({
             clientId: "weird'name",
-            stored: 'scrypt$x',
+            stored: 'hmac$x',
             prefix: 'sk-abc',
         });
         expect(sql).toContain("WHERE id = 'weird''name'");
@@ -127,11 +163,11 @@ describe('buildCreateSql', () => {
             name: 'Acme Co.',
             scopes: 'chat.read,chat.write',
             rpm: 300,
-            stored: 'scrypt$xx$yy',
+            stored: 'hmac$xx',
             prefix: 'sk-abcde',
         });
         expect(sql).toBe(
-            "INSERT INTO clients (id, name, api_key_hash, api_key_prefix, scopes, rate_limit_rpm) VALUES ('tenant-acme', 'Acme Co.', 'scrypt$xx$yy', 'sk-abcde', 'chat.read,chat.write', 300)",
+            "INSERT INTO clients (id, name, api_key_hash, api_key_prefix, scopes, rate_limit_rpm) VALUES ('tenant-acme', 'Acme Co.', 'hmac$xx', 'sk-abcde', 'chat.read,chat.write', 300)",
         );
     });
 
@@ -154,7 +190,7 @@ describe('formatOutput', () => {
         kind: 'RESET',
         clientId: 'admin',
         plain: 'sk-abc12345xxxx',
-        stored: 'scrypt$h$s',
+        stored: 'hmac$h',
         prefix: 'sk-abcde',
         sql: "UPDATE clients SET api_key_hash='h' WHERE id='admin'",
     };
@@ -177,13 +213,11 @@ describe('formatOutput', () => {
 
 describe('integration: parseArgs → generateCredentials → SQL', () => {
     it('produces a complete admin-reset payload from `--reset admin`', () => {
-        // Provide a known plain + salt so output is deterministic.
-        const saltHex = 'aa'.repeat(16);
         const out = ((): AdminResetOutput => {
             const args = parseArgs(['--reset', 'admin']);
             const c = generateCredentials({
                 plain: 'sk-testplainxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-                salt: Buffer.from(saltHex, 'hex'),
+                pepper: PEPPER,
             });
             const sql = buildResetSql({
                 clientId: args.reset!,
@@ -202,14 +236,14 @@ describe('integration: parseArgs → generateCredentials → SQL', () => {
         expect(out.clientId).toBe('admin');
         expect(out.kind).toBe('RESET');
         expect(out.prefix).toBe('sk-testp');
-        expect(out.sql).toMatch(/^UPDATE clients SET api_key_hash = 'scrypt\$/);
+        expect(out.sql).toMatch(/^UPDATE clients SET api_key_hash = 'hmac\$/);
     });
 });
 
 describe('buildOutput with --plain', () => {
     it('uses the provided plain key instead of generating a random one', () => {
         const args = parseArgs(['--reset', 'admin', '--plain', 'sk-customkey1234567890abcdef']);
-        const out = buildOutput(args);
+        const out = buildOutput(args, PEPPER);
         expect(out).not.toBeNull();
         if (out) {
             expect(out.kind).toBe('RESET');
@@ -229,7 +263,7 @@ describe('buildOutput with --plain', () => {
             '--id', 'tenant-test',
             '--plain', 'sk-customkey1234567890abcdef',
         ]);
-        const out = buildOutput(args);
+        const out = buildOutput(args, PEPPER);
         expect(out).not.toBeNull();
         if (out) {
             expect(out.kind).toBe('CREATE');
@@ -239,9 +273,21 @@ describe('buildOutput with --plain', () => {
             expect(out.sql).toMatch(/'sk-custo'/);
         }
     });
-});
 
-// Reference the import so it isn't flagged as unused.
-// (randomBytes is used inside generateCredentials via Node — this is
-//  just to make sure the spec still compiles cleanly after edits.)
-void randomBytes;
+    it('rejects --plain "" (CLIError 2)', () => {
+        const args = parseArgs(['--reset', 'admin', '--plain', '']);
+        expect(() => buildOutput(args, PEPPER)).toThrow(/non-empty/);
+    });
+
+    it('reflects the pepper: same plain + different pepper → different stored', () => {
+        const args = parseArgs([
+            '--reset', 'admin',
+            '--plain', 'sk-sameplainxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        ]);
+        const a = buildOutput(args, PEPPER) as AdminResetOutput;
+        const b = buildOutput(args, 'different-pepper-' + 'b'.repeat(32)) as AdminResetOutput;
+        expect(a.stored).not.toBe(b.stored);
+        // Same prefix because that comes from the plaintext.
+        expect(a.prefix).toBe(b.prefix);
+    });
+});
