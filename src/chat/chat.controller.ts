@@ -3,6 +3,7 @@ import {
     Controller,
     Post,
     Req,
+    Res,
     UseGuards,
 } from '@nestjs/common';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -26,7 +27,7 @@ export class ChatController {
         @Body(new ZodValidationPipe(ChatCompletionBodySchema))
         body: ChatCompletionBody,
         @Req() req: FastifyRequest & { client?: Client },
-        @Req() reply: FastifyReply,
+        @Res() reply: FastifyReply,
     ) {
         const clientId = req.client?.id ?? null;
         if (body?.stream) {
