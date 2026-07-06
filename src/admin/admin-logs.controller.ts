@@ -25,17 +25,17 @@ const StatusSchema = z.enum(['ok', 'error', 'circuit_open']);
  * Query schema for `GET /admin/logs`. All filters optional; combined
  * with AND. ISO timestamps converted to unix-seconds before SQL.
  *
- * `model` is the *alias* the client requested, e.g. `coder`.
- * The underlying provider/model the gateway actually routed to
- * is **NOT** exposed in this endpoint — it would leak vendor
- * relationships. The repository still has the data for internal use;
- * we just don't return it. Because of that we don't expose a
- * `?provider=` filter either (would be inert).
+ * `model` filters on the alias the client requested (`coder`).
+ * `provider` and `resolved_model` filter on the upstream identity —
+ * these are admin-only operators and they need to see which upstream
+ * actually served each request to debug incidents / verify routing.
  */
 const ListLogsQuerySchema = z
     .object({
         client_id: z.string().min(1).max(64).optional(),
         model: z.string().min(1).max(120).optional(),
+        provider: z.string().min(1).max(64).optional(),
+        resolved_model: z.string().min(1).max(120).optional(),
         status: StatusSchema.optional(),
         from: z.string().datetime({ offset: true }).optional(),
         to: z.string().datetime({ offset: true }).optional(),
@@ -47,8 +47,12 @@ type ListLogsQuery = z.infer<typeof ListLogsQuerySchema>;
 
 interface LogItemView {
     requestedAt: number;
-    /** The alias the client sent (e.g. `coder`). Real upstream model NOT exposed. */
+    /** The alias the client sent (e.g. `code`, `coder`). */
     modelRequested: string;
+    /** The upstream provider that handled the request (admin-only). */
+    resolvedProvider: string | null;
+    /** The upstream model id that handled the request (admin-only). */
+    resolvedModel: string | null;
     attempts: number;
     latencyMs: number;
     status: RequestLogStatus;
@@ -84,12 +88,10 @@ interface ListLogsResponse {
  * cursor parameter is the next step if production volume makes this
  * endpoint visibly slow to scroll through.
  *
- * The response intentionally OMITS `resolvedProvider` and
- * `resolvedModel`. Operators with admin scope see the alias the
- * client used (`modelRequested`) and metadata — never which upstream
- * provider/model handled the request. Real-model visibility stays
- * inside the gateway (the structured `LlmLoggingService` log emits it
- * to the server stdout, which isn't externally accessible).
+ * The response DOES expose `resolvedProvider` and `resolvedModel` —
+ * admin endpoints are privileged (require `admin` scope), so operators
+ * can see which upstream actually served each request. The public
+ * surface (`/v1/models`, `/v1/metrics/summary`) stays alias-only.
  *
  * Auth: `admin` scope required. Rate-limit per `RateLimitGuard`,
  * which already enforces per-client RPM.
@@ -131,6 +133,7 @@ export class AdminLogsController {
         const page = this.repo.list({
             clientKey: q.client_id,
             modelRequested: q.model,
+            resolvedProvider: q.provider,
             status: q.status,
             fromTs,
             toTs,
@@ -150,7 +153,8 @@ function toView(r: RequestLogRow): LogItemView {
     return {
         requestedAt: r.requestedAt,
         modelRequested: r.modelRequested,
-        // resolvedProvider / resolvedModel deliberately omitted.
+        resolvedProvider: r.resolvedProvider ?? null,
+        resolvedModel: r.resolvedModel ?? null,
         attempts: r.attempts,
         latencyMs: r.latencyMs,
         status: r.status,

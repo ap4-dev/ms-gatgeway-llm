@@ -16,17 +16,16 @@ export interface LatencyStats {
     max: number;
 }
 
+/**
+ * Per-alias aggregation. The `model` field carries the alias the client
+ * requested (e.g. `code`). The upstream provider/model that actually
+ * served the request is **deliberately not** surfaced here — same
+ * posture as `GET /v1/models` and `GET /admin/logs`. Operators that
+ * need provider-level insight pull it from the structured logs
+ * (`LlmLoggingService`) or directly from `request_logs` via SQL.
+ */
 export interface ModelSummary {
     model: string;
-    provider: string | null;
-    requests: number;
-    errors: number;
-    error_rate: number;
-    latency_ms: LatencyStats;
-}
-
-export interface ProviderSummary {
-    id: string;
     requests: number;
     errors: number;
     error_rate: number;
@@ -45,9 +44,13 @@ export interface MetricsSummary {
         error_rate: number;
     };
     models: ModelSummary[];
-    providers: ProviderSummary[];
 }
 
+/**
+ * Internal row we read from `request_logs`. Carries `resolved_provider`
+ * / `resolved_model` because that's what the table has, but we **never**
+ * expose them through the public metric shape.
+ */
 interface RawRow {
     requested_at: number;
     model_requested: string;
@@ -67,6 +70,11 @@ interface RawRow {
  * outweigh the savings. The data is small enough that pulling it once
  * per call is fine; the `getMetricsSummary` endpoint is hit by humans,
  * not at request-time.
+ *
+ * The aggregated response is **alias-only** — one row per alias, never
+ * per (alias, provider). The provider dimension was removed because
+ * `/v1/metrics/summary` has no auth and would otherwise leak the
+ * upstream provider identity to anyone with the URL.
  *
  * If traffic grows, the move is: cache the summary in `metrics_snapshots`
  * (a table refreshed every N seconds by a Nest task) rather than
@@ -95,17 +103,11 @@ export class MetricsService {
             .all(since, until) as RawRow[];
 
         const totals = computeTotals(rows);
-        const models = groupBy(rows, (r) => r.model_requested, (model, group) => ({
-            model,
-            provider: pickProviderForModel(group),
-            ...aggregate(group),
-        })) as ModelSummary[];
-
-        const providers = groupBy(
-            rows.filter((r) => r.resolved_provider),
-            (r) => r.resolved_provider as string,
-            (id, group) => ({ id, ...aggregate(group) }),
-        ) as ProviderSummary[];
+        const models = groupBy(
+            rows,
+            (r) => r.model_requested,
+            (model, group) => ({ model, ...aggregate(group) }),
+        ) as ModelSummary[];
 
         return {
             window,
@@ -113,7 +115,6 @@ export class MetricsService {
             until,
             totals,
             models: orderByName(models),
-            providers: orderByName(providers),
         };
     }
 }
@@ -132,9 +133,7 @@ function computeTotals(rows: RawRow[]): MetricsSummary['totals'] {
     };
 }
 
-function aggregate(
-    rows: RawRow[],
-): Omit<ModelSummary, 'model' | 'provider'> {
+function aggregate(rows: RawRow[]): Omit<ModelSummary, 'model'> {
     const latencies = rows.map((r) => r.latency_ms).sort((a, b) => a - b);
     const requests = rows.length;
     const errors = rows.filter((r) => isErrorStatus(r.status)).length;
@@ -160,26 +159,6 @@ function computeLatencyStats(sortedAsc: number[]): LatencyStats {
     };
 }
 
-function pickProviderForModel(group: RawRow[]): string | null {
-    // The same alias can land on different upstreams depending on fallback;
-    // we surface the provider that served the majority of rows, or the
-    // first one we saw when tied.
-    const counts = new Map<string, number>();
-    for (const r of group) {
-        if (!r.resolved_provider) continue;
-        counts.set(r.resolved_provider, (counts.get(r.resolved_provider) ?? 0) + 1);
-    }
-    let best: string | null = null;
-    let bestCount = -1;
-    for (const [id, count] of counts) {
-        if (count > bestCount) {
-            best = id;
-            bestCount = count;
-        }
-    }
-    return best;
-}
-
 function groupBy<T, K extends string, V>(
     rows: T[],
     keyFn: (r: T) => K,
@@ -194,6 +173,6 @@ function groupBy<T, K extends string, V>(
     return Array.from(groups.entries()).map(([k, g]) => reduce(k, g));
 }
 
-function orderByName<T extends { model?: string; id?: string }>(arr: T[]): T[] {
-    return [...arr].sort((a, b) => (a.model ?? a.id ?? '').localeCompare(b.model ?? b.id ?? ''));
+function orderByName<T extends { model?: string }>(arr: T[]): T[] {
+    return [...arr].sort((a, b) => (a.model ?? '').localeCompare(b.model ?? ''));
 }

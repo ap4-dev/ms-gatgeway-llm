@@ -5,7 +5,7 @@ Production endpoint reference. The gateway exposes two surfaces:
 - **Public surface** (`/v1/...`) — used by LLM clients (Kilo, OpenCode, Claude Code, custom integrations). Every endpoint requires a valid API key. Model identity is hidden behind aliases.
 - **Admin surface** (`/admin/...`) — operator tooling for client CRUD, alias routing policy, and request-log inspection. Requires `admin` scope in addition to a valid API key.
 
-> **Defense-in-depth**: the public surface only ever exposes alias names. The real upstream provider/model identity is stored in `request_logs` and exposed to admins in `admin/logs` only as aggregated metadata (not per-row). Internal logs (stdout / NewRelic) still see the real identity — that's intended.
+> **Defense-in-depth**: the public surface (`/v1/models`, `/v1/metrics/summary`) only ever exposes alias names. Admin endpoints (`/admin/logs`) DO surface `resolvedProvider` / `resolvedModel` because operators need it for incident triage — gated behind the `admin` scope. Internal logs (stdout / NewRelic) still see all of it.
 
 ---
 
@@ -181,16 +181,6 @@ Response:
   "models": [
     {
       "model": "coder",
-      "provider": "nan",
-      "requests": 184,
-      "errors": 3,
-      "error_rate": 0.016,
-      "latency_ms": {"p50": 4200, "p95": 12000, "p99": 18000, "min": 350, "max": 22000}
-    }
-  ],
-  "providers": [
-    {
-      "id": "nan",
       "requests": 184,
       "errors": 3,
       "error_rate": 0.016,
@@ -200,7 +190,7 @@ Response:
 }
 ```
 
-> **Note**: `provider` and `resolved_provider` are exposed here in aggregated form (one row per alias / provider pair). This is a different surface from the per-row `admin/logs` view — the rationale is that operators monitoring Grafana-style dashboards need it for incident triage. If you want this endpoint to also alias-only, the change is in `src/observability/metrics.service.ts` (drop the `provider` column from `ModelSummary` / `ProviderSummary`).
+Aggregation is by alias only (`model_requested`). When a single alias routes to multiple upstream providers via its fallback chain, those rows are merged into a single entry — the response carries no per-provider dimension. Real provider / model identity stays inside the gateway (server stdout via `LlmLoggingService`, plus direct SQL against `request_logs`).
 
 ---
 
@@ -395,14 +385,15 @@ Sparse per-position priority map. Positions not listed keep their current value.
 
 ### `GET /admin/logs`
 
-Recent request_logs with filters. **Alias-only response** — never exposes `resolvedProvider` / `resolvedModel`.
+Recent request_logs with filters. **Admin-privileged** — unlike the public surface, this endpoint exposes `resolvedProvider` and `resolvedModel` so operators can see which upstream actually served each request.
 
 Query parameters (all optional, AND-combined):
 
 | Param | Type | Notes |
 |---|---|---|
 | `client_id` | string 1–64 | Matches `client_key` |
-| `model` | string 1–120 | **Alias**, e.g. `coder`. Not the upstream model id. |
+| `model` | string 1–120 | **Alias**, e.g. `code`. |
+| `provider` | string 1–64 | Filters on `resolved_provider` (admin sees it). |
 | `status` | `ok` \| `error` \| `circuit_open` | |
 | `from` | ISO-8601 datetime | Inclusive lower bound on `requested_at` |
 | `to` | ISO-8601 datetime | Inclusive upper bound on `requested_at` |
@@ -417,7 +408,9 @@ Query parameters (all optional, AND-combined):
   "items": [
     {
       "requestedAt": 1783353000,
-      "modelRequested": "coder",
+      "modelRequested": "code",
+      "resolvedProvider": "nan",
+      "resolvedModel": "qwen3-coder",
       "attempts": 1,
       "latencyMs": 4200,
       "status": "ok",
@@ -437,7 +430,8 @@ Query parameters (all optional, AND-combined):
 
 - Newest first, ordered by `(requestedAt DESC, id DESC)`.
 - `hasMore: true` means at least one row matched beyond `items`.
-- Indexes used: `(client_key, requested_at DESC, id DESC)` and `(status, requested_at DESC, id DESC)`. `?model=` is a `requested_at` scan, fine while volume stays ≤ ~5M rows.
+- Indexes used: `(client_key, requested_at DESC, id DESC)` and `(status, requested_at DESC, id DESC)`. `?model=` and `?provider=` are `requested_at` scans, fine while volume stays ≤ ~5M rows.
+- `resolvedProvider` / `resolvedModel` are exposed here **on purpose** — admin scope is the privilege boundary. The public surface (`/v1/models`, `/v1/metrics/summary`) still hides them.
 
 ---
 
@@ -481,6 +475,6 @@ See `docs/API-KEYS.md` for the longer walkthrough.
 ## What's NOT exposed
 
 - **`api_key_hash`** — never returned. Hashes live in the DB; the API only ever returns `apiKeyPrefix`.
-- **Upstream model ids** (`qwen3.6`, `deepseek-v4-flash`, etc.) — never returned by `/v1/models` or `/admin/logs`. (See caveat on `/v1/metrics/summary` if you want full redaction there too.)
+- **Upstream model ids** (`qwen3.6`, `deepseek-v4-flash`, etc.) — never returned by `/v1/models` or `/v1/metrics/summary`. Aggregation in `/v1/metrics/summary` is per-alias only; per-provider totals are not exposed. **Admin endpoints** (`/admin/logs`) DO include them, behind the `admin` scope.
 - **Pepper / secret material** — never returned, never logged.
 - **Cache contents** — internal only; no admin endpoint exposes Redis state.

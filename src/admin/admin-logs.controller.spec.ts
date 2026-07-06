@@ -90,36 +90,44 @@ describe('AdminLogsController', () => {
         });
     });
 
-    describe('alias-only exposure (no real-model leak)', () => {
-        it('omits resolvedProvider and resolvedModel from every returned item', () => {
+    describe('admin-only resolution (resolved fields present)', () => {
+        it('exposes resolvedProvider and resolvedModel on every returned item', () => {
             const out = controller.list({});
             for (const item of out.items) {
-                expect(item).not.toHaveProperty('resolvedProvider');
-                expect(item).not.toHaveProperty('resolvedModel');
+                expect(item).toHaveProperty('resolvedProvider');
+                expect(item).toHaveProperty('resolvedModel');
             }
         });
 
-        it('exposes only the alias the client requested', () => {
+        it('returns the actual upstream provider / model that served each request', () => {
             const out = controller.list({});
-            // Confirm the alias IS visible (otherwise we just hid it, not replaced it).
-            expect(out.items[0].modelRequested).toBe('mystery');
+            // Walk the rows newest-first (seed order is reversed for ts desc).
+            // ts=1_700_003_000 ('mystery'): no upstream → nulls.
+            // ts=1_700_002_000 ('fast' / tenant-acme): openai / gpt-4o-mini.
+            // ts=1_700_001_000 ('slow'): anthropic / claude-3.
+            // ts=1_700_000_000 ('fast' / admin): openai / gpt-4o-mini.
+            expect(out.items[0]).toMatchObject({ modelRequested: 'mystery', resolvedProvider: null, resolvedModel: null });
+            expect(out.items[1]).toMatchObject({ modelRequested: 'fast', resolvedProvider: 'openai', resolvedModel: 'gpt-4o-mini' });
+            expect(out.items[2]).toMatchObject({ modelRequested: 'slow', resolvedProvider: 'anthropic', resolvedModel: 'claude-3' });
+            expect(out.items[3]).toMatchObject({ modelRequested: 'fast', resolvedProvider: 'openai', resolvedModel: 'gpt-4o-mini' });
+        });
+
+        it('still exposes the alias the client requested', () => {
+            const out = controller.list({});
             expect(out.items.map((r) => r.modelRequested).sort()).toEqual([
                 'fast', 'fast', 'mystery', 'slow',
             ]);
         });
 
-        it('does not accept a `provider` query parameter (would be inert)', () => {
-            expect(() => controller.list({ provider: 'openai' })).toThrow(BadRequestException);
-        });
-
-        it('never leaks the real upstream provider in the JSON payload', () => {
+        it('real upstream identity IS present in the JSON payload (this is admin-only)', () => {
             const out = controller.list({});
             const payload = JSON.stringify(out);
-            // Real providers used in the seed data — make sure none leaked.
-            expect(payload).not.toContain('openai');
-            expect(payload).not.toContain('anthropic');
-            expect(payload).not.toContain('claude-3');
-            expect(payload).not.toContain('gpt-4o-mini');
+            // Operators rely on these for incident triage; the endpoint
+            // is privilege-gated (admin scope) so the exposure is by design.
+            expect(payload).toContain('openai');
+            expect(payload).toContain('anthropic');
+            expect(payload).toContain('claude-3');
+            expect(payload).toContain('gpt-4o-mini');
         });
     });
 
@@ -157,9 +165,15 @@ describe('AdminLogsController', () => {
             expect(out.items.map((r) => r.clientKey)).toEqual(['tenant-acme', 'tenant-acme']);
         });
 
-        it('filters by model (alias, not real model)', () => {
+        it('filters by model (alias)', () => {
             const out = controller.list({ model: 'fast' });
             expect(out.items.every((r) => r.modelRequested === 'fast')).toBe(true);
+            expect(out.count).toBe(2);
+        });
+
+        it('filters by provider (resolved_provider)', () => {
+            const out = controller.list({ provider: 'openai' });
+            expect(out.items.every((r) => r.resolvedProvider === 'openai')).toBe(true);
             expect(out.count).toBe(2);
         });
 

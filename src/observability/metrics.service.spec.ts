@@ -58,13 +58,14 @@ describe('MetricsService', () => {
         db.close();
     });
 
-    it('returns zeroed totals and empty lists when no rows exist', () => {
+    it('returns zeroed totals and empty models when no rows exist', () => {
         const out = svc.summary('1h', 1000);
         expect(out.totals.requests).toBe(0);
         expect(out.totals.errors).toBe(0);
         expect(out.totals.error_rate).toBe(0);
         expect(out.models).toEqual([]);
-        expect(out.providers).toEqual([]);
+        // No provider dimension in the public API anymore.
+        expect((out as any).providers).toBeUndefined();
     });
 
     it('filters rows older than the window cutoff', () => {
@@ -113,29 +114,49 @@ describe('MetricsService', () => {
         expect(fast.latency_ms.max).toBe(300);
     });
 
-    it('groups per-model and per-provider independently', () => {
-        seedRow(db, { requested_at: 9_000, model_requested: 'fast', resolved_provider: 'openai', resolved_model: 'gpt-4o-mini', latency_ms: 100, status: 'ok' });
-        seedRow(db, { requested_at: 9_001, model_requested: 'fast', resolved_provider: 'openai', resolved_model: 'gpt-4o-mini', latency_ms: 200, status: 'ok' });
-        seedRow(db, { requested_at: 9_002, model_requested: 'coder', resolved_provider: 'nan', resolved_model: 'qwen3-coder', latency_ms: 500, status: 'ok' });
+    it('groups per-alias regardless of which upstream provider served', () => {
+        // Two requests for alias "fast": one landed on openai, one on nan.
+        seedRow(db, {
+            requested_at: 9_000, model_requested: 'fast',
+            resolved_provider: 'openai', resolved_model: 'gpt-4o-mini',
+            latency_ms: 100, status: 'ok',
+        });
+        seedRow(db, {
+            requested_at: 9_001, model_requested: 'fast',
+            resolved_provider: 'nan', resolved_model: 'qwen3.6',
+            latency_ms: 300, status: 'ok',
+        });
+        const out = svc.summary('1h', 10_000);
+        const fast = out.models.find((m) => m.model === 'fast');
+        // Aggregated into ONE row even though the underlying provider differed.
+        expect(fast?.requests).toBe(2);
+        expect((out as any).providers).toBeUndefined();
+    });
+
+    it('separates different aliases with their own counts', () => {
+        seedRow(db, {
+            requested_at: 9_000, model_requested: 'fast',
+            resolved_provider: 'openai', resolved_model: 'gpt-4o-mini',
+            latency_ms: 100, status: 'ok',
+        });
+        seedRow(db, {
+            requested_at: 9_001, model_requested: 'fast',
+            resolved_provider: 'openai', resolved_model: 'gpt-4o-mini',
+            latency_ms: 200, status: 'ok',
+        });
+        seedRow(db, {
+            requested_at: 9_002, model_requested: 'coder',
+            resolved_provider: 'nan', resolved_model: 'qwen3-coder',
+            latency_ms: 500, status: 'ok',
+        });
 
         const out = svc.summary('1h', 10_000);
         expect(out.models.find((m) => m.model === 'fast')?.requests).toBe(2);
         expect(out.models.find((m) => m.model === 'coder')?.requests).toBe(1);
-        const providers = Object.fromEntries(out.providers.map((p) => [p.id, p.requests]));
-        expect(providers).toEqual({ openai: 2, nan: 1 });
-    });
-
-    it('groups by the same model_requested regardless of resolvedProvider', () => {
-        // Two requests for "fast": one landed on openai, one on nan.
-        seedRow(db, { requested_at: 9_000, model_requested: 'fast', resolved_provider: 'openai', latency_ms: 100, status: 'ok' });
-        seedRow(db, { requested_at: 9_001, model_requested: 'fast', resolved_provider: 'nan', latency_ms: 300, status: 'ok' });
-        const out = svc.summary('1h', 10_000);
-        expect(out.models.find((m) => m.model === 'fast')?.requests).toBe(2);
-        expect(out.providers).toHaveLength(2);
     });
 
     it('window parameter selects the right cutoff for 24h and 7d', () => {
-        // Now = 1_000_000. 23h ago → 1_000_000 - 82_800 = 917_200 (in 1h/24h cutoff? 24h yes, 1h no).
+        // Now = 1_000_000. 23h ago → 917_200 (in 1h/24h cutoff? 24h yes, 1h no).
         seedRow(db, { requested_at: 917_200, model_requested: 'fast', latency_ms: 200, status: 'ok' });
         // 25h ago → out of 24h window but in 7d window.
         seedRow(db, { requested_at: 900_000, model_requested: 'fast', latency_ms: 200, status: 'ok' });
@@ -151,5 +172,39 @@ describe('MetricsService', () => {
         expect(() => svc.summary('bogus' as MetricsWindow, 0)).toThrow(
             /Unsupported metrics window/,
         );
+    });
+
+    describe('alias-only (no real-model leak)', () => {
+        it('does not carry a `provider` field on ModelSummary', () => {
+            seedRow(db, {
+                requested_at: 9_000, model_requested: 'fast',
+                resolved_provider: 'nan', latency_ms: 100, status: 'ok',
+            });
+            const out = svc.summary('1h', 10_000);
+            for (const m of out.models) {
+                expect(m).not.toHaveProperty('provider');
+            }
+        });
+
+        it('serialized payload does not include upstream provider / model names', () => {
+            seedRow(db, {
+                requested_at: 9_000, model_requested: 'fast',
+                resolved_provider: 'anthropic', resolved_model: 'claude-3',
+                latency_ms: 100, status: 'ok',
+            });
+            seedRow(db, {
+                requested_at: 9_001, model_requested: 'fast',
+                resolved_provider: 'nan', resolved_model: 'qwen3-coder',
+                latency_ms: 200, status: 'ok',
+            });
+            const out = svc.summary('1h', 10_000);
+            const payload = JSON.stringify(out);
+            // Every seed row's real provider/model must be absent.
+            expect(payload).not.toContain('anthropic');
+            expect(payload).not.toContain('claude-3');
+            expect(payload).not.toContain('qwen3-coder');
+            // Provider dimension array shouldn't exist.
+            expect(payload).not.toContain('"providers"');
+        });
     });
 });
