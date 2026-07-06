@@ -77,37 +77,114 @@ export class ChatService {
                 this.callUpstream(resolved, body, signal),
             );
             const resolvedModel = r.attempts.at(-1)?.upstreamModel ?? 'unknown';
-            const tokens = extractTokens(r.result);
-            this.requestLog.recordSuccess({
-                requestedAt,
-                requestedModel: body.model,
-                resolvedProvider: r.providerId,
-                resolvedModel,
-                attempts: r.attempts.length,
-                latencyMs: nowSeconds() - requestedAt,
-                promptHash,
-                clientKey: clientId,
-                ...tokens,
-            });
-            this.structuredLog.logRequest(
-                buildEvent({
+
+            // Non-streaming: SDK already returned the full ChatCompletion
+            // synchronously. Pull `usage` and log right now — latency is
+            // measured from requestedAt to "upstream returned", which is the
+            // wall-clock cost the client paid.
+            if (!isAsyncIterable(r.result)) {
+                const tokens = extractTokens(r.result);
+                this.recordSuccess(
                     requestedAt,
-                    body,
-                    resolvedProvider: r.providerId,
+                    body.model,
+                    r.providerId,
                     resolvedModel,
-                    attempts: r.attempts.length,
-                    latencyMs: nowSeconds() - requestedAt,
+                    r.attempts.length,
                     promptHash,
-                    status: 'ok',
+                    clientId,
                     tokens,
-                    clientKey: clientId,
-                }),
-            );
-            return r.result;
+                );
+                return r.result;
+            }
+
+            // Streaming: tee the SDK iterable so the controller sees each
+            // chunk live (TTFT preserved) while we accumulate a copy for
+            // post-iteration logging. `stream` is forwarded untouched;
+            // `logged` resolves with the token capture once the controller
+            // finishes iterating. Latency is measured end-to-end — from
+            // requestedAt to the last byte the client received.
+            const messagesForEstimation = (body.messages ?? []) as unknown[];
+            const { stream, logged } = teeStream(r.result);
+            logged
+                .then((chunks) => {
+                    const tokens = extractStreamTokens(
+                        chunks,
+                        messagesForEstimation,
+                    );
+                    this.recordSuccess(
+                        requestedAt,
+                        body.model,
+                        r.providerId,
+                        resolvedModel,
+                        r.attempts.length,
+                        promptHash,
+                        clientId,
+                        tokens,
+                    );
+                })
+                .catch(() => {
+                    // Stream aborted mid-flight or threw before completing.
+                    // Log a best-effort partial row — `extractStreamTokens`
+                    // will fall back to the local estimator on whatever the
+                    // tap captured.
+                    this.recordSuccess(
+                        requestedAt,
+                        body.model,
+                        r.providerId,
+                        resolvedModel,
+                        r.attempts.length,
+                        promptHash,
+                        clientId,
+                        undefined,
+                    );
+                });
+            return stream;
         } catch (err) {
             this.recordFailure(err, body, requestedAt, promptHash, clientId);
             throw err;
         }
+    }
+
+    /** Build the success-log row + structured event from captured token
+     *  data. Shared between the sync (non-streaming) and async (streaming)
+     *  paths so the columns and the JSON shape stay aligned. */
+    private recordSuccess(
+        requestedAt: number,
+        requestedModel: string,
+        providerId: string,
+        resolvedModel: string,
+        attempts: number,
+        promptHash: string,
+        clientId: string | null,
+        tokens: ReturnType<typeof extractTokens>,
+    ): void {
+        const latencyMs = nowSeconds() - requestedAt;
+        const body = { model: requestedModel } as ChatCompletionCreateParams;
+        this.requestLog.recordSuccess({
+            requestedAt,
+            requestedModel,
+            resolvedProvider: providerId,
+            resolvedModel,
+            attempts,
+            latencyMs,
+            promptHash,
+            clientKey: clientId,
+            ...(tokens ?? {}),
+        });
+        this.structuredLog.logRequest(
+            buildEvent({
+                requestedAt,
+                body,
+                resolvedProvider: providerId,
+                resolvedModel,
+                attempts,
+                latencyMs,
+                promptHash,
+                status: 'ok',
+                tokens,
+                clientKey: clientId,
+            }),
+        );
     }
 
     private recordFailure(
@@ -236,6 +313,14 @@ export class ChatService {
         if (resolved.overrides.maxTokens && !('max_tokens' in body)) {
             (result as any).max_tokens = resolved.overrides.maxTokens;
         }
+        // For streamed requests, ask the upstream to surface a final
+        // `usage` chunk so the gateway can persist token counts alongside
+        // the response (Phase 4 v1 logged NULLs for streams). Caller-supplied
+        // `stream_options` wins — operators who want to disable it can pass
+        // `{ include_usage: false }` and we'll forward that as-is.
+        if (body.stream && !('stream_options' in body)) {
+            (result as any).stream_options = { include_usage: true };
+        }
         return result;
     }
 }
@@ -250,9 +335,8 @@ function nowSeconds(): number {
 }
 
 /** Pull `usage` off a non-streaming `ChatCompletion`. Returns undefined
- *  for streams — the SDK surfaces usage on a final chunk which we would
- *  have to buffer to extract. Phase 4 v1 logs `ok` rows for streams
- *  without token counts. */
+ *  for streams — the SDK surfaces usage on a final chunk which the caller
+ *  has to drain and inspect via `extractStreamTokens`. */
 function extractTokens(result: CompletionResult):
     | { promptTokens: number; completionTokens: number; totalTokens: number }
     | undefined {
@@ -266,6 +350,153 @@ function extractTokens(result: CompletionResult):
         completionTokens: usage.completion_tokens,
         totalTokens: usage.total_tokens,
     };
+}
+
+/** True for anything that quacks like `AsyncIterable<T>` — used by
+ *  `completions` to decide whether to tee the upstream response. */
+function isAsyncIterable(
+    x: unknown,
+): x is AsyncIterable<ChatCompletionChunk> {
+    return (
+        x != null &&
+        typeof (x as { [Symbol.asyncIterator]?: unknown })[
+            Symbol.asyncIterator
+        ] === 'function'
+    );
+}
+
+/**
+ * Wrap an upstream `AsyncIterable<ChatCompletionChunk>` so that:
+ *  - the caller iterates a `stream` that forwards chunks **live** (TTFT
+ *    unchanged — the controller writes the first SSE byte as soon as the
+ *    upstream yields it, no front-buffer in the gateway);
+ *  - a side `logged` promise resolves once iteration ends (normally or
+ *    via throw), carrying the accumulated chunk buffer for token capture.
+ *
+ * Implementation: the wrapped iterator pulls from the source's iterator
+ * and pushes each value into a tap buffer. The buffer is closed exactly
+ * once — first `done` wins, errors reject so callers can distinguish
+ * "stream finished cleanly" from "aborted before completing".
+ */
+function teeStream(
+    source: AsyncIterable<ChatCompletionChunk>,
+): {
+    stream: AsyncIterable<ChatCompletionChunk>;
+    logged: Promise<ChatCompletionChunk[]>;
+} {
+    const chunks: ChatCompletionChunk[] = [];
+    let resolveDone!: (buf: ChatCompletionChunk[]) => void;
+    let rejectDone!: (err: unknown) => void;
+    const logged = new Promise<ChatCompletionChunk[]>((resolve, reject) => {
+        resolveDone = resolve;
+        rejectDone = reject;
+    });
+
+    const stream: AsyncIterable<ChatCompletionChunk> = {
+        [Symbol.asyncIterator]() {
+            const inner = source[Symbol.asyncIterator]();
+            let closed = false;
+            const close = (err?: unknown): void => {
+                if (closed) return;
+                closed = true;
+                if (err !== undefined) rejectDone(err);
+                else resolveDone(chunks);
+            };
+            return {
+                async next(): Promise<IteratorResult<ChatCompletionChunk>> {
+                    try {
+                        const r = await inner.next();
+                        if (r.done) {
+                            close();
+                            return r;
+                        }
+                        chunks.push(r.value);
+                        return r;
+                    } catch (err) {
+                        close(err);
+                        throw err;
+                    }
+                },
+                async return(
+                    value?: ChatCompletionChunk,
+                ): Promise<IteratorResult<ChatCompletionChunk>> {
+                    // Mirror `AsyncIterator` cleanup so early `break;` in the
+                    // controller's for-await still flushes the tap.
+                    close();
+                    return inner.return
+                        ? inner.return(value)
+                        : { value: undefined as unknown as ChatCompletionChunk, done: true };
+                },
+            };
+        },
+    };
+    return { stream, logged };
+}
+
+/** Estimate token counts from a chunk buffer when the upstream didn't
+ *  surface a `usage` chunk. Used as a fallback so we always log *some*
+ *  number — accuracy is secondary to having data for cost dashboards.
+ *
+ *  Heuristic: 1 token ≈ 4 characters of English/code text. Real tokenizer
+ *  ratios vary (1.5–5 depending on language + symbol density); 4 is a
+ *  conservative midpoint that errs slightly high. */
+function estimateTokens(
+    chunks: ReadonlyArray<ChatCompletionChunk>,
+    promptBody: ReadonlyArray<unknown>,
+): { promptTokens: number; completionTokens: number; totalTokens: number } {
+    const completionChars = chunks.reduce((acc, c) => {
+        const deltas = c.choices ?? [];
+        for (const d of deltas) {
+            const content = (d.delta as { content?: string | null } | undefined)?.content;
+            if (typeof content === 'string') acc += content.length;
+        }
+        return acc;
+    }, 0);
+    // Prompt estimation: JSON.stringify the message array — close enough
+    // for proportional reporting; tiktoken would be overkill at POC scale.
+    const promptChars = JSON.stringify(promptBody ?? []).length;
+    const completionTokens = Math.max(1, Math.ceil(completionChars / 4));
+    const promptTokens = Math.max(1, Math.ceil(promptChars / 4));
+    return {
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+    };
+}
+
+/** Try to recover real `usage` from a drained stream. OpenAI-compatible
+ *  upstreams surface `usage` on a final chunk only when the request set
+ *  `stream_options.include_usage: true` (see `ChatService.applyResolved`).
+ *  When no `usage` chunk arrived, fall back to the local estimator — that
+ *  way we never write a row with NULL tokens when the response had *any*
+ *  bytes in it. */
+function extractStreamTokens(
+    chunks: ReadonlyArray<ChatCompletionChunk>,
+    promptBody: ReadonlyArray<unknown>,
+):
+    | {
+          promptTokens: number;
+          completionTokens: number;
+          totalTokens: number;
+      }
+    | undefined {
+    let found:
+        | {
+              promptTokens: number;
+              completionTokens: number;
+              totalTokens: number;
+          }
+        | undefined;
+    for (const chunk of chunks) {
+        const usage = chunk.usage;
+        if (!usage) continue;
+        found = {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+        };
+    }
+    return found ?? estimateTokens(chunks, promptBody);
 }
 
 function chooseStatusForFailure(err: RoutingFailedError): 'error' | 'circuit_open' {

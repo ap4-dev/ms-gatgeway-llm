@@ -221,7 +221,7 @@ describe('ChatService.completions', () => {
         expect(event.promptHash).toMatch(/^[0-9a-f]{16}$/);
     });
 
-    it('returns the SDK stream untouched when stream=true', async () => {
+    it('forwards the upstream stream live (TTFT preserved) and logs after iteration when stream=true', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
         const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
@@ -230,20 +230,202 @@ describe('ChatService.completions', () => {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
             yield { id: 'c2', choices: [{ delta: { content: 'b' } }] };
         }
-        const stream = fakeStream();
-        fake.create.mockResolvedValueOnce(stream);
+        fake.create.mockResolvedValueOnce(fakeStream());
 
         const result = await service.completions(
             buildSampleBody({ stream: true }) as any,
         );
 
-        expect(result).toBe(stream);
+        // Tee wraps the source — caller iterates a *different* object that
+        // pulls from the upstream iterable on demand. No front-buffer.
+        expect(result).toBeDefined();
+        expect(typeof result[Symbol.asyncIterator]).toBe('function');
 
         const chunks: any[] = [];
         for await (const chunk of result as any) {
             chunks.push(chunk);
         }
         expect(chunks).toHaveLength(2);
+        expect(chunks[0].id).toBe('c1');
+        expect(chunks[1].id).toBe('c2');
+    });
+
+    it('captures token counts from the final usage chunk after streaming completes', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const log = makeFakeLog();
+        const structuredLog = makeFakeStructuredLog();
+        const service = new ChatService(
+            fakeEnv,
+            fake.provider,
+            router.router,
+            log,
+            structuredLog,
+        );
+
+        async function* fakeStream() {
+            yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
+            yield {
+                id: 'c2',
+                choices: [{ delta: {}, finish_reason: 'stop' }],
+                usage: {
+                    prompt_tokens: 42,
+                    completion_tokens: 17,
+                    total_tokens: 59,
+                },
+            };
+        }
+        fake.create.mockResolvedValueOnce(fakeStream());
+
+        const stream = (await service.completions(
+            buildSampleBody({ stream: true }) as any,
+        )) as AsyncIterable<any>;
+
+        // Logging is async — it fires after the controller finishes iterating.
+        expect((log.recordSuccess as jest.Mock)).not.toHaveBeenCalled();
+        for await (const _chunk of stream) {
+            /* drain */
+        }
+        // Allow the post-iteration microtask (logged.then(...)) to flush.
+        await new Promise((r) => setImmediate(r));
+
+        const successArgs = (log.recordSuccess as jest.Mock).mock.calls[0][0];
+        expect(successArgs.promptTokens).toBe(42);
+        expect(successArgs.completionTokens).toBe(17);
+        expect(successArgs.totalTokens).toBe(59);
+
+        const event = (structuredLog.logRequest as jest.Mock).mock.calls[0][0];
+        expect(event).toMatchObject({
+            status: 'ok',
+            promptTokens: 42,
+            completionTokens: 17,
+            totalTokens: 59,
+        });
+    });
+
+    it('estimates token counts when the upstream never surfaces usage in the stream', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const log = makeFakeLog();
+        const service = new ChatService(
+            fakeEnv,
+            fake.provider,
+            router.router,
+            log,
+            makeFakeStructuredLog(),
+        );
+
+        // 40 chars of completion → ceil(40/4) = 10 completion tokens.
+        // Prompt body is JSON.stringified by the estimator, so we only
+        // assert > 0 + consistency (total = prompt + completion) instead
+        // of pinning the prompt number (which depends on field ordering).
+        async function* fakeStream() {
+            yield {
+                id: 'c1',
+                choices: [{ delta: { content: 'a'.repeat(40) } }],
+            };
+        }
+        fake.create.mockResolvedValueOnce(fakeStream());
+
+        const stream = (await service.completions(
+            buildSampleBody({ stream: true }) as any,
+        )) as AsyncIterable<any>;
+        for await (const _chunk of stream) {
+            /* drain */
+        }
+        await new Promise((r) => setImmediate(r));
+
+        const successArgs = (log.recordSuccess as jest.Mock).mock.calls[0][0];
+        expect(successArgs.promptTokens).toBeGreaterThan(0);
+        expect(successArgs.completionTokens).toBe(10);
+        expect(successArgs.totalTokens).toBe(
+            successArgs.promptTokens + successArgs.completionTokens,
+        );
+    });
+
+    it('does not block the caller on token logging when streaming', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const service = new ChatService(
+            fakeEnv,
+            fake.provider,
+            router.router,
+            makeFakeLog(),
+            makeFakeStructuredLog(),
+        );
+
+        // Upstream yields the first chunk synchronously, then delays the
+        // second long enough to prove we don't wait for it before returning.
+        async function* slowStream() {
+            yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
+            await new Promise((r) => setTimeout(r, 50));
+            yield { id: 'c2', choices: [{ delta: {} }] };
+        }
+        fake.create.mockResolvedValueOnce(slowStream());
+
+        const start = Date.now();
+        const result = await service.completions(
+            buildSampleBody({ stream: true }) as any,
+        );
+        const elapsed = Date.now() - start;
+        // Return must happen *before* the slow chunk — proves no front-buffer.
+        expect(elapsed).toBeLessThan(40);
+        expect(result).toBeDefined();
+
+        // Drain so the post-iteration log fires and we don't leak timers.
+        for await (const _chunk of result as AsyncIterable<any>) {
+            /* drain */
+        }
+    });
+
+    it('forwards stream_options.include_usage=true to the upstream on streamed requests', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
+
+        async function* fakeStream() {
+            yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
+        }
+        fake.create.mockResolvedValueOnce(fakeStream());
+
+        await service.completions(buildSampleBody({ stream: true }) as any);
+
+        const arg = fake.create.mock.calls[0][0];
+        expect(arg.stream_options).toEqual({ include_usage: true });
+        expect(arg.stream).toBe(true);
+    });
+
+    it('does not overwrite caller-provided stream_options', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
+
+        async function* fakeStream() {
+            yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
+        }
+        fake.create.mockResolvedValueOnce(fakeStream());
+
+        await service.completions(
+            buildSampleBody({
+                stream: true,
+                stream_options: { include_usage: false },
+            }) as any,
+        );
+
+        const arg = fake.create.mock.calls[0][0];
+        expect(arg.stream_options).toEqual({ include_usage: false });
+    });
+
+    it('does not set stream_options for non-streaming requests', async () => {
+        const fake = makeFakeProvider();
+        const router = makeFakeRouter(fake.resolved);
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog());
+        fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
+
+        await service.completions(buildSampleBody() as any);
+
+        const arg = fake.create.mock.calls[0][0];
+        expect(arg.stream_options).toBeUndefined();
     });
 
     it('normalizes the body before calling the upstream (merges system messages)', async () => {
