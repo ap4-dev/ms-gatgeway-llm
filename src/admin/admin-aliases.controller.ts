@@ -7,7 +7,6 @@ import {
     Param,
     Put,
     UseGuards,
-    UsePipes,
 } from '@nestjs/common';
 import { z } from 'zod';
 import { ProviderRegistryService } from '../providers/provider.registry';
@@ -86,22 +85,20 @@ export class AdminAliasesController {
     }
 
     @Put(':id/strategy')
-    @UsePipes(new ZodValidationPipe(PutStrategySchema))
     @HttpCode(204)
     setStrategy(
         @Param('id') id: string,
-        @Body() body: { strategy: RoutingStrategyKind },
+        @Body(new ZodValidationPipe(PutStrategySchema)) body: { strategy: RoutingStrategyKind },
     ): void {
         this.ensureAlias(id);
         this.registry.upsertAliasPolicy(id, body.strategy);
     }
 
     @Put(':id/weights')
-    @UsePipes(new ZodValidationPipe(PutWeightsSchema))
     @HttpCode(204)
     setWeights(
         @Param('id') id: string,
-        @Body() body: { weights: number[] },
+        @Body(new ZodValidationPipe(PutWeightsSchema)) body: { weights: number[] },
     ): void {
         this.ensureAlias(id);
         const chain = this.registry.aliases[id]!;
@@ -114,11 +111,10 @@ export class AdminAliasesController {
     }
 
     @Put(':id/priorities')
-    @UsePipes(new ZodValidationPipe(PutPrioritiesSchema))
     @HttpCode(204)
     setPriorities(
         @Param('id') id: string,
-        @Body() body: { priorities: Record<number, number> },
+        @Body(new ZodValidationPipe(PutPrioritiesSchema)) body: { priorities: Record<number, number> },
     ): void {
         this.ensureAlias(id);
         const chain = this.registry.aliases[id]!;
