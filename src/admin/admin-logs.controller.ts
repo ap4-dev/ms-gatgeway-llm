@@ -72,6 +72,7 @@ interface LogItemView {
     promptTokens: number | null;
     completionTokens: number | null;
     totalTokens: number | null;
+    attemptDetails: string | null;
 }
 
 interface ListLogsResponse {
@@ -184,6 +185,7 @@ export class AdminLogsController {
                         promptTokens: 70441,
                         completionTokens: 86,
                         totalTokens: 70527,
+                        attemptDetails: null,
                     },
                 ],
                 count: 1,
@@ -257,5 +259,6 @@ function toView(r: RequestLogRow): LogItemView {
         promptTokens: r.promptTokens ?? null,
         completionTokens: r.completionTokens ?? null,
         totalTokens: r.totalTokens ?? null,
+        attemptDetails: r.attemptDetails ?? null,
     };
 }

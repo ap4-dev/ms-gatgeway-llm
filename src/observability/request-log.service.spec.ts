@@ -80,7 +80,7 @@ describe('RequestLogService', () => {
         const baseArgs: RecordFailureArgs = {
             requestedAt: 1_700_000_000,
             requestedModel: 'fast',
-            attempts: [{ ok: false, circuitOpen: true, providerId: 'openai' } as any],
+            attempts: 1,
             latencyMs: 5_000,
             error: new Error('all providers failed'),
         };
@@ -99,10 +99,10 @@ describe('RequestLogService', () => {
             new RequestLogService(repo).recordFailure({
                 ...baseArgs,
                 error: undefined,
-                attempts: [],
+                attempts: 0,
             });
             const row = repo.getLastRow();
-            // Empty attempts and no error → downgraded to circuit_open.
+            // No error → downgraded to circuit_open.
             expect(row?.status).toBe('circuit_open');
             expect(row?.error).toBeNull();
         });

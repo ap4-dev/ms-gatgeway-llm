@@ -518,7 +518,7 @@ describe('ChatService.completions', () => {
         );
         const args = (log.recordFailure as jest.Mock).mock.calls[0][0];
         expect(args.requestedModel).toBe('fast');
-        expect(args.attempts).toHaveLength(1);
+        expect(args.attempts).toBe(1);
     });
 
     it('propagates upstream errors from the OpenAI client', async () => {

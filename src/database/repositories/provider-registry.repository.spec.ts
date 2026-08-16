@@ -21,6 +21,7 @@ function makeDb(): { db: Database.Database; cleanup: () => void } {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
     db.exec(sql);
+    db.exec('ALTER TABLE model_configs ADD COLUMN disable_thinking INTEGER NOT NULL DEFAULT 0 CHECK (disable_thinking IN (0,1))');
     return { db, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

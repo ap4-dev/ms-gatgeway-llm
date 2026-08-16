@@ -15,6 +15,13 @@ const ModelConfigSchema = z.object({
     real: z.string().min(1, 'real model name is required'),
     maxTokens: z.number().int().positive().optional(),
     supportsStream: z.boolean().optional(),
+    /**
+     * Phase 11: pin `thinking: {type: 'disabled'}` on requests to this
+     * model. DeepSeek V4 emits `reasoning_content` and requires it echoed
+     * back; disabling relaxes that requirement so generic clients (Pi,
+     * Kilo) keep working across multi-turn threads.
+     */
+    disableThinking: z.boolean().optional(),
 });
 
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
@@ -124,6 +131,8 @@ export interface ResolvedModel {
     /** Per-model overrides applied to the outbound body. */
     overrides: {
         maxTokens?: number;
+        /** Phase 11: send `thinking: {type: 'disabled'}` when true. */
+        disableThinking?: boolean;
     };
     /** Streaming is supported when explicitly marked true (we default conservative). */
     supportsStream: boolean;

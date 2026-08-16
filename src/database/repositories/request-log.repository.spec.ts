@@ -12,6 +12,7 @@ function makeDb(): Database.Database {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0003_request_logs_tokens.sql'), 'utf-8'),
     );
+    db.exec('ALTER TABLE request_logs ADD COLUMN attempt_details TEXT');
     return db;
 }
 

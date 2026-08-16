@@ -47,7 +47,7 @@ export class ProviderRegistryRepository {
                 'SELECT id, api_key_env, base_url, timeout_ms FROM providers',
             ),
             listModels: this.db.prepare(
-                'SELECT provider_id, model_key, real_name, max_tokens, supports_stream FROM model_configs',
+                'SELECT provider_id, model_key, real_name, max_tokens, supports_stream, disable_thinking FROM model_configs',
             ),
             listAliases: this.db.prepare(
                 'SELECT alias_name, position, provider_id, model_key FROM alias_entries ORDER BY alias_name, position',
@@ -68,7 +68,7 @@ export class ProviderRegistryRepository {
                 'INSERT INTO providers (id, api_key_env, base_url, timeout_ms) VALUES (?, ?, ?, ?)',
             ),
             insertModel: this.db.prepare(
-                'INSERT INTO model_configs (provider_id, model_key, real_name, max_tokens, supports_stream) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO model_configs (provider_id, model_key, real_name, max_tokens, supports_stream, disable_thinking) VALUES (?, ?, ?, ?, ?, ?)',
             ),
             deleteAliasChain: this.db.prepare(
                 'DELETE FROM alias_entries WHERE alias_name = ?',
@@ -120,10 +120,12 @@ export class ProviderRegistryRepository {
             real_name: string;
             max_tokens: number | null;
             supports_stream: number;
+            disable_thinking: number;
         }>) {
             const cfg: ModelConfig = { real: r.real_name };
             if (r.max_tokens != null) cfg.maxTokens = r.max_tokens;
             if (r.supports_stream === 0) cfg.supportsStream = false;
+            if (r.disable_thinking === 1) cfg.disableThinking = true;
             const existing = modelsByProvider.get(r.provider_id) ?? {};
             existing[r.model_key] = cfg;
             modelsByProvider.set(r.provider_id, existing);
@@ -326,6 +328,7 @@ export class ProviderRegistryRepository {
                     cfg.real,
                     cfg.maxTokens ?? null,
                     cfg.supportsStream === false ? 0 : 1,
+                    cfg.disableThinking === true ? 1 : 0,
                 );
             }
         });

@@ -22,11 +22,14 @@ export interface RecordSuccessArgs {
 export interface RecordFailureArgs {
     requestedAt: number;
     requestedModel: string;
-    attempts: Array<{ ok: boolean; circuitOpen?: boolean }>;
+    attempts: number;
     latencyMs: number;
     error?: unknown;
+    resolvedProvider?: string | null;
+    resolvedModel?: string | null;
     clientKey?: string | null;
     promptHash?: string;
+    attemptDetails?: string | null;
 }
 
 /**
@@ -70,21 +73,63 @@ export class RequestLogService {
     }
 
     recordFailure(args: RecordFailureArgs): void {
-        const status = chooseFailureStatus(args.error, args.attempts);
         const errorMessage =
             args.error instanceof Error
                 ? `${args.error.name}: ${args.error.message}`
                 : typeof args.error === 'string'
                 ? args.error
                 : null;
+        const status = errorMessage != null ? 'error' : 'circuit_open';
         const row: RequestLogRow = {
             requestedAt: args.requestedAt,
             modelRequested: args.requestedModel,
-            resolvedProvider: null,
-            resolvedModel: null,
-            attempts: args.attempts.length,
+            resolvedProvider: args.resolvedProvider ?? null,
+            resolvedModel: args.resolvedModel ?? null,
+            attempts: args.attempts,
             latencyMs: args.latencyMs,
             status,
+            error: errorMessage,
+            clientKey: args.clientKey ?? null,
+            promptHash: args.promptHash ?? null,
+            attemptDetails: args.attemptDetails ?? null,
+        };
+        this.tryAppend(row);
+    }
+
+    /**
+     * Log each individual failed attempt from a fallback chain that
+     * eventually succeeded. Each call writes one row with status='error'.
+     */
+    recordAttemptFailure(args: {
+        requestedAt: number;
+        requestedModel: string;
+        resolvedProvider: string;
+        resolvedModel: string;
+        latencyMs: number;
+        durationMs: number;
+        error: unknown;
+        circuitOpen: boolean;
+        clientKey?: string | null;
+        promptHash?: string | null;
+        attemptIndex: number;
+        totalAttempts: number;
+    }): void {
+        const errorMessage =
+            args.error instanceof Error
+                ? `${args.error.name}: ${args.error.message}`
+                : typeof args.error === 'string'
+                ? args.error
+                : args.circuitOpen
+                ? 'Circuit breaker open'
+                : null;
+        const row: RequestLogRow = {
+            requestedAt: args.requestedAt,
+            modelRequested: args.requestedModel,
+            resolvedProvider: args.resolvedProvider,
+            resolvedModel: args.resolvedModel,
+            attempts: args.totalAttempts,
+            latencyMs: args.durationMs,
+            status: 'error',
             error: errorMessage,
             clientKey: args.clientKey ?? null,
             promptHash: args.promptHash ?? null,
@@ -103,12 +148,4 @@ export class RequestLogService {
     }
 }
 
-function chooseFailureStatus(
-    error: unknown,
-    attempts: ReadonlyArray<{ ok: boolean; circuitOpen?: boolean }>,
-): RequestLogStatus {
-    if (error != null) return 'error';
-    if (attempts.length === 0) return 'circuit_open';
-    if (attempts.every((a) => a.circuitOpen === true)) return 'circuit_open';
-    return 'error';
-}
+

@@ -211,6 +211,9 @@ export class ProviderService {
                 ...(typeof modelCfg.maxTokens === 'number'
                     ? { maxTokens: modelCfg.maxTokens }
                     : {}),
+                ...(modelCfg.disableThinking === true
+                    ? { disableThinking: true }
+                    : {}),
             },
             supportsStream: modelCfg.supportsStream ?? true,
             timeoutMs,

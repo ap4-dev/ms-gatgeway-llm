@@ -21,6 +21,13 @@ export interface RequestLogRow {
     promptTokens?: number | null;
     completionTokens?: number | null;
     totalTokens?: number | null;
+    /**
+     * Phase 10: JSON-serialised per-attempt details for multi-attempt
+     * requests. Each entry: { providerId, upstreamModel, ok, circuitOpen,
+     * durationMs, error? }. Populated by RequestLogService when a
+     * fallback chain had >1 attempt.
+     */
+    attemptDetails?: string | null;
 }
 
 /** Filter options for `RequestLogRepository.list`. All fields are AND-combined. */
@@ -63,11 +70,12 @@ export class RequestLogRepository {
             INSERT INTO request_logs (
                 requested_at, model_requested, resolved_provider, resolved_model,
                 attempts, latency_ms, status, error, client_key,
-                prompt_hash, prompt_tokens, completion_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                prompt_hash, prompt_tokens, completion_tokens, total_tokens,
+                attempt_details
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.recentStmt = this.db.prepare(
-            'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
+            'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens, attempt_details FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
         );
     }
 
@@ -86,6 +94,7 @@ export class RequestLogRepository {
             row.promptTokens ?? null,
             row.completionTokens ?? null,
             row.totalTokens ?? null,
+            row.attemptDetails ?? null,
         );
         return Number(info.lastInsertRowid);
     }
@@ -106,6 +115,7 @@ export class RequestLogRepository {
             prompt_tokens: number | null;
             completion_tokens: number | null;
             total_tokens: number | null;
+            attempt_details: string | null;
         }>;
         return rows.map((r) => ({
             requestedAt: r.requested_at,
@@ -121,6 +131,7 @@ export class RequestLogRepository {
             promptTokens: r.prompt_tokens,
             completionTokens: r.completion_tokens,
             totalTokens: r.total_tokens,
+            attemptDetails: r.attempt_details,
         }));
     }
 
@@ -170,7 +181,7 @@ export class RequestLogRepository {
             SELECT id, requested_at, model_requested, resolved_provider,
                    resolved_model, attempts, latency_ms, status, error,
                    client_key, prompt_hash, prompt_tokens, completion_tokens,
-                   total_tokens
+                   total_tokens, attempt_details
             FROM request_logs
             ${whereClause}
             ORDER BY requested_at DESC, id DESC
@@ -191,6 +202,7 @@ export class RequestLogRepository {
             prompt_tokens: number | null;
             completion_tokens: number | null;
             total_tokens: number | null;
+            attempt_details: string | null;
         }>;
         const hasMore = rows.length > opts.limit;
         const items = hasMore ? rows.slice(0, opts.limit) : rows;
@@ -213,6 +225,7 @@ function toRow(r: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
     total_tokens: number | null;
+    attempt_details: string | null;
 }): RequestLogRow {
     return {
         requestedAt: r.requested_at,
@@ -228,5 +241,6 @@ function toRow(r: {
         promptTokens: r.prompt_tokens,
         completionTokens: r.completion_tokens,
         totalTokens: r.total_tokens,
+        attemptDetails: r.attempt_details,
     };
 }

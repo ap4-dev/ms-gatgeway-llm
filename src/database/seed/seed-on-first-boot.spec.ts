@@ -32,6 +32,7 @@ function makeDbWithSchema(): Database.Database {
             kind        TEXT NOT NULL CHECK (kind IN ('schema','seed'))
         );
     `);
+    db.exec('ALTER TABLE model_configs ADD COLUMN disable_thinking INTEGER NOT NULL DEFAULT 0 CHECK (disable_thinking IN (0,1))');
     return db;
 }
 

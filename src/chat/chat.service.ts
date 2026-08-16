@@ -9,7 +9,7 @@ import { ENV_CONFIG } from '../config/env.token';
 import type { Env } from '../config/env.schema';
 import { ProviderService } from '../providers/provider.service';
 import type { ResolvedModel } from '../providers/provider.model';
-import { RoutingFailedError, RoutingService } from '../routing/routing.service';
+import { RoutingFailedError, RoutingService, type RouteAttempt } from '../routing/routing.service';
 import { RequestLogService } from '../observability/request-log.service';
 import {
     LlmLoggingService,
@@ -77,6 +77,15 @@ export class ChatService {
                 this.callUpstream(resolved, body, signal),
             );
             const resolvedModel = r.attempts.at(-1)?.upstreamModel ?? 'unknown';
+
+            // Log individual failed attempts before the success row
+            this.recordFailedAttempts(
+                requestedAt,
+                body.model,
+                r.attempts,
+                promptHash,
+                clientId,
+            );
 
             // Non-streaming: SDK already returned the full ChatCompletion
             // synchronously. Pull `usage` and log right now — latency is
@@ -201,11 +210,13 @@ export class ChatService {
             clientKey: clientId,
         };
         if (err instanceof RoutingFailedError) {
+            const details = serializeAttempts(err.attempts);
             this.requestLog.recordFailure({
                 ...argsBase,
                 requestedModel: err.requestedModel,
-                attempts: err.attempts,
+                attempts: err.attempts.length,
                 error: err,
+                attemptDetails: details,
             });
             this.structuredLog.logRequest(
                 buildEvent({
@@ -224,7 +235,7 @@ export class ChatService {
         this.requestLog.recordFailure({
             ...argsBase,
             requestedModel: body.model,
-            attempts: [],
+            attempts: 0,
             error: err,
         });
         this.structuredLog.logRequest(
@@ -240,6 +251,45 @@ export class ChatService {
                     err instanceof Error ? err.message : String(err),
             }),
         );
+    }
+
+    /**
+     * Log each failed attempt from a fallback chain that eventually
+     * succeeded. Each failed attempt becomes its own request_logs row
+     * with status='error' and the provider error message.
+     */
+    private recordFailedAttempts(
+        requestedAt: number,
+        model: string,
+        attempts: RouteAttempt[],
+        promptHash: string,
+        clientId: string | null,
+    ): void {
+        const totalAttempts = attempts.length;
+        for (let i = 0; i < attempts.length; i++) {
+            const a = attempts[i];
+            if (a.ok) continue;
+            const errMsg =
+                'error' in a && a.error
+                    ? a.error instanceof Error
+                        ? `${a.error.name}: ${a.error.message}`
+                        : String(a.error)
+                    : undefined;
+            this.requestLog.recordAttemptFailure({
+                requestedAt,
+                requestedModel: model,
+                resolvedProvider: a.providerId,
+                resolvedModel: a.upstreamModel,
+                latencyMs: a.durationMs,
+                durationMs: a.durationMs,
+                error: errMsg,
+                circuitOpen: a.circuitOpen,
+                clientKey: clientId,
+                promptHash,
+                attemptIndex: i,
+                totalAttempts,
+            });
+        }
     }
 
     /**
@@ -312,6 +362,17 @@ export class ChatService {
         };
         if (resolved.overrides.maxTokens && !('max_tokens' in body)) {
             (result as any).max_tokens = resolved.overrides.maxTokens;
+        }
+        // Phase 11: pin `thinking: {type: 'disabled'}` for models flagged
+        // in the registry. DeepSeek V4 emits `reasoning_content` and then
+        // requires it echoed back on the next turn; disabling relaxes that
+        // so generic clients survive multi-turn threads. Caller-supplied
+        // `thinking` always wins.
+        if (
+            resolved.overrides.disableThinking === true &&
+            !('thinking' in body)
+        ) {
+            (result as any).thinking = { type: 'disabled' };
         }
         // For streamed requests, ask the upstream to surface a final
         // `usage` chunk so the gateway can persist token counts alongside
@@ -497,6 +558,29 @@ function extractStreamTokens(
         };
     }
     return found ?? estimateTokens(chunks, promptBody);
+}
+
+/** Serialise attempt metadata to JSON for the `attempt_details` column. */
+function serializeAttempts(
+    attempts: ReadonlyArray<RouteAttempt>,
+): string | null {
+    const items = attempts.map((a) => {
+        const errMsg =
+            'error' in a && a.error
+                ? a.error instanceof Error
+                    ? `${a.error.name}: ${a.error.message}`
+                    : String(a.error)
+                : undefined;
+        return {
+            providerId: a.providerId,
+            upstreamModel: a.upstreamModel,
+            ok: a.ok,
+            circuitOpen: 'circuitOpen' in a ? a.circuitOpen : false,
+            durationMs: a.durationMs,
+            ...(errMsg ? { error: errMsg } : {}),
+        };
+    });
+    return items.length > 0 ? JSON.stringify(items) : null;
 }
 
 function chooseStatusForFailure(err: RoutingFailedError): 'error' | 'circuit_open' {
