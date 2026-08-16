@@ -5,28 +5,20 @@
       "baseURL": "https://api.nan.builders/v1",
       "timeoutMs": 180000,
       "models": {
-        "qwen3.6": {
+        "qwen": {
           "real": "qwen3.6"
         },
-        "qwen3-coder": {
-          "real": "qwen3-coder",
-          "maxTokens": 16384
+        "deepseek1": {
+          "real": "deepseek-v4-flash"
         },
-        "deepseek-r1": {
-          "real": "deepseek-r1"
-        }
-      }
-    },
-    "openai": {
-      "apiKeyEnv": "OPENAI_API_KEY",
-      "baseURL": "https://api.openai.com/v1",
-      "timeoutMs": 60000,
-      "models": {
-        "gpt-4o": {
-          "real": "gpt-4o"
+        "deepseek2": {
+          "real": "deepseek-v4-flash-0731"
         },
-        "gpt-4o-mini": {
-          "real": "gpt-4o-mini"
+        "gemma": {
+          "real": "gemma4"
+        },
+        "mimo": {
+          "real": "mimo-v2.5"
         }
       }
     }
@@ -40,9 +32,6 @@
     "halfOpenProbes": 1
   },
   "aliases": {
-    "default": ["nan/qwen3.6", "openai/gpt-4o-mini"],
-    "fast": ["openai/gpt-4o-mini", "nan/qwen3.6"],
-    "strong": ["nan/deepseek-r1"],
-    "coder": ["nan/qwen3-coder", "openai/gpt-4o"]
+    "coder": ["nan/qwen", "nan/deepseek1", "nan/deepseek2", "nan/gemma",  "nan/mimo"]
   }
 }
