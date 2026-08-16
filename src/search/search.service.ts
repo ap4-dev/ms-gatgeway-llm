@@ -169,6 +169,17 @@ function nowSeconds(): number {
     return Math.floor(Date.now() / 1000);
 }
 
+/** Drop the provider-internal `source` field before exposing results. */
+export function stripSource(response: SearchResponse): SearchResponse {
+    return {
+        ...response,
+        results: response.results.map((r) => {
+            const { source: _source, ...rest } = r;
+            return rest;
+        }),
+    };
+}
+
 /** Map the inbound wire shape (`fetch_content`) to provider options. */
 export function toOptions(body: SearchBody): SearchOptions {
     const opts: SearchOptions = { query: body.query };

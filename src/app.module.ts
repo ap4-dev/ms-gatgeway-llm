@@ -10,16 +10,18 @@ import { SentryGlobalFilter } from '@sentry/nestjs/setup';
 import { AppJsonLogger } from './app.logger.js';
 import { RedisModule } from './redis.module';
 import { ChatModule } from './chat/chat.module';
+import { SearchModule } from './search/search.module';
+import { McpModule } from './mcp/mcp.module';
+import { ToolsModule } from './tools/tools.module';
 import { HealthModule } from './health/health.module';
 import { AdminModule } from './admin/admin.module';
 import { CoreModule } from './config/core.module';
-import { SearchModule } from './search/search.module';
 
 @Module({
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
         SentryModule.forRoot(), CoreModule, RedisModule,
-        ChatModule, HealthModule, AdminModule, SearchModule,
+        ChatModule, HealthModule, AdminModule, SearchModule, McpModule, ToolsModule,
     ],
     controllers: [AppController],
     providers: [

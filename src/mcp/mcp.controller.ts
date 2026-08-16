@@ -5,10 +5,10 @@ import { RequireScopesGuard } from '../auth/require-scopes.guard';
 import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 import { RequireScopes } from '../auth/require-scopes.decorator';
 import type { Client } from '../auth/client.repository';
-import { SearchService, SearchBodySchema, type SearchBody } from './search.service';
-import { SearchProviderError } from './search-provider.interface';
-import { WEB_SEARCH_TOOL } from './web-search.tool';
-import { stripSource } from './search.controller';
+import { SearchService, SearchBodySchema, type SearchBody } from '../search/search.service';
+import { SearchProviderError } from '../search/search-provider.interface';
+import { WEB_SEARCH_TOOL } from '../tools/web-search.tool';
+import { stripSource } from '../search/search.service';
 
 /**
  * POST /v1/mcp — MCP (Model Context Protocol) server over JSON-RPC 2.0.

@@ -9,24 +9,60 @@ import {
     type SearchResult,
 } from './search-provider.interface';
 
-const DEFAULT_BASE_URL = 'https://api.nan.builders/v1/search';
+/**
+ * Last-resort search endpoint (fresh install / test default). Production
+ * resolution lives in the composition root (SearchModule factory): it reads
+ * the provider row from the DB and derives the endpoint from
+ * `providers.base_url` — never a hardcoded id here.
+ */
+export const DEFAULT_BASE_URL = 'https://api.nan.builders/v1/search';
 // NaN's search can take a while when `fetch_content` is requested — the
 // upstream has to retrieve and normalize full pages. Snippet-only queries
 // are much faster.
 const TIMEOUT_WITH_CONTENT_MS = 120_000;
 const TIMEOUT_SNIPPETS_MS = 30_000;
 
+/** Minimal provider-row view needed to build a search adapter. */
+export interface SearchProviderRow {
+    id: string;
+    baseURL?: string;
+    apiKeyEnv: string;
+}
+
+/**
+ * Derive the search endpoint from a DB provider row. NaN's search API
+ * lives under the provider base URL at `/search`. A provider without
+ * `base_url` falls back to {@link DEFAULT_BASE_URL}.
+ */
+export function searchEndpointFor(row: SearchProviderRow): string {
+    return row.baseURL
+        ? `${row.baseURL.replace(/\/+$/, '')}/search`
+        : DEFAULT_BASE_URL;
+}
+
 export interface NanSearchProviderOptions {
-    /** Override the upstream base URL (defaults to NaN's /v1/search). */
+    /** Provider id — persisted as `request_logs.resolved_provider`. */
+    id?: string;
+    /**
+     * Full search endpoint. The composition root passes the DB-derived
+     * endpoint; tests pass their own or rely on {@link DEFAULT_BASE_URL}.
+     */
     baseUrl?: string;
-    /** API key. Falls back to `process.env.NAN_API_KEY`. */
+    /**
+     * Env var holding the API key — mirrors `providers.api_key_env`, so
+     * the key name lives in the DB, not in this file.
+     */
+    apiKeyEnv?: string;
+    /** Explicit API key. Wins over `apiKeyEnv`; used by tests. */
     apiKey?: string;
     /** HTTP client. Injected for tests; defaults to axios. */
     http?: AxiosInstance;
 }
 
 /**
- * Current search provider: NaN (`https://api.nan.builders/v1/search`).
+ * Search wire-format adapter for NaN's search API. Holds no provider
+ * identity: id, endpoint and key env are injected from the DB row, so
+ * swapping the active search provider is a DB change — no code change.
  *
  * NaN's constraints (20 RPM / 3 concurrent / 500 req/day) are the reason
  * the gateway applies its own per-client rate limit (RateLimitGuard) on
@@ -34,22 +70,27 @@ export interface NanSearchProviderOptions {
  * REST layer can echo `Retry-After` to the caller.
  */
 export class NanSearchProvider implements SearchProvider {
-    readonly id = 'nan';
+    readonly id: string;
 
     private readonly baseUrl: string;
+    private readonly apiKeyEnv: string | undefined;
     private readonly apiKey: string | undefined;
     private readonly http: AxiosInstance;
 
     constructor(opts: NanSearchProviderOptions = {}) {
-        this.baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
-        this.apiKey = opts.apiKey ?? process.env.NAN_API_KEY;
+        this.id = opts.id ?? 'nan';
+        this.baseUrl = opts.baseUrl ?? process.env.NAN_SEARCH_BASE_URL ?? DEFAULT_BASE_URL;
+        this.apiKeyEnv = opts.apiKeyEnv;
+        this.apiKey =
+            opts.apiKey ??
+            (opts.apiKeyEnv ? process.env[opts.apiKeyEnv] : undefined);
         this.http = opts.http ?? axios.create();
     }
 
     async search(opts: SearchOptions): Promise<SearchResponse> {
         if (!this.apiKey) {
             throw new SearchProviderError(
-                'Provider "nan" requires env var NAN_API_KEY but it is not set.',
+                `Provider "${this.id}" requires env var ${this.apiKeyEnv ?? 'API key'} but it is not set.`,
             );
         }
         const timeoutMs = opts.fetchContent
@@ -143,7 +184,7 @@ export class NanSearchProvider implements SearchProvider {
  * empty strings, and entries without a usable `url` are skipped.
  *
  * The provider-internal `source` field is preserved here and stripped at
- * the REST/MCP boundary (`stripSource` in search.controller.ts).
+ * the REST/MCP boundary (`stripSource` in search.service.ts).
  */
 export function normalizeResponse(data: unknown): SearchResponse {
     if (!data || typeof data !== 'object') {

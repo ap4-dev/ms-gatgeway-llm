@@ -44,7 +44,7 @@ export class ProviderRegistryRepository {
     constructor(private readonly db: Database.Database) {
         this.queries = {
             listProviders: this.db.prepare(
-                'SELECT id, api_key_env, base_url, timeout_ms FROM providers',
+                'SELECT id, api_key_env, base_url, timeout_ms, supports_search FROM providers',
             ),
             listModels: this.db.prepare(
                 'SELECT provider_id, model_key, real_name, max_tokens, supports_stream, disable_thinking FROM model_configs',
@@ -65,7 +65,7 @@ export class ProviderRegistryRepository {
                 'DELETE FROM providers WHERE id = ?',
             ),
             insertProvider: this.db.prepare(
-                'INSERT INTO providers (id, api_key_env, base_url, timeout_ms) VALUES (?, ?, ?, ?)',
+                'INSERT INTO providers (id, api_key_env, base_url, timeout_ms, supports_search) VALUES (?, ?, ?, ?, ?)',
             ),
             insertModel: this.db.prepare(
                 'INSERT INTO model_configs (provider_id, model_key, real_name, max_tokens, supports_stream, disable_thinking) VALUES (?, ?, ?, ?, ?, ?)',
@@ -136,6 +136,7 @@ export class ProviderRegistryRepository {
             api_key_env: string;
             base_url: string | null;
             timeout_ms: number | null;
+            supports_search: number;
         }>) {
             const cfg: ProviderConfig = {
                 apiKeyEnv: p.api_key_env,
@@ -143,6 +144,7 @@ export class ProviderRegistryRepository {
             };
             if (p.base_url) cfg.baseURL = p.base_url;
             if (p.timeout_ms) cfg.timeoutMs = p.timeout_ms;
+            if (p.supports_search === 1) cfg.supportsSearch = true;
             out[p.id] = cfg;
         }
         return out;
@@ -320,6 +322,7 @@ export class ProviderRegistryRepository {
                 provider.apiKeyEnv,
                 provider.baseURL ?? null,
                 provider.timeoutMs ?? null,
+                provider.supportsSearch === true ? 1 : 0,
             );
             for (const [modelKey, cfg] of Object.entries(models)) {
                 this.queries.insertModel.run(

@@ -23,6 +23,9 @@ function makeDbWithSchema(): Database.Database {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0008_alias_strategy_enum_widen.sql'), 'utf-8'),
     );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0012_provider_capabilities.sql'), 'utf-8'),
+    );
     // _migrations is normally created by MigrationRunner. Tests that
     // pre-populate it (or assume it exists) need the table present.
     db.exec(`

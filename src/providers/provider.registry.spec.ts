@@ -27,6 +27,9 @@ function makeServiceWithSeed(seed: object = SEED): {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0008_alias_strategy_enum_widen.sql'), 'utf-8'),
     );
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0012_provider_capabilities.sql'), 'utf-8'),
+    );
     db.exec('ALTER TABLE model_configs ADD COLUMN disable_thinking INTEGER NOT NULL DEFAULT 0 CHECK (disable_thinking IN (0,1))');
     const tmp = require('node:fs').mkdtempSync(
         join(require('node:os').tmpdir(), 'ms-registry-spec-'),
@@ -160,6 +163,12 @@ describe('ProviderRegistryService (DB-backed)', () => {
             db.exec(
                 readFileSync(
                     join(process.cwd(), 'migrations/0001_providers.sql'),
+                    'utf-8',
+                ),
+            );
+            db.exec(
+                readFileSync(
+                    join(process.cwd(), 'migrations/0012_provider_capabilities.sql'),
                     'utf-8',
                 ),
             );

@@ -37,6 +37,14 @@ const ProviderConfigSchema = z.object({
     // Phase 3: per-provider request timeout (ms). Falls back to the global
     // `routing.requestTimeoutMs` when omitted.
     timeoutMs: z.number().int().positive().optional(),
+    /**
+     * Migration 0012: capability flag. `true` = this provider backs the
+     * search feature (see `src/search/`). No `supportsChat` flag exists:
+     * chat capability is derivable — a provider with rows in
+     * `model_configs` is a chat provider. Feature modules select providers
+     * by capability instead of hardcoding a provider id.
+     */
+    supportsSearch: z.boolean().optional(),
     models: z.record(z.string(), ModelConfigSchema),
 });
 

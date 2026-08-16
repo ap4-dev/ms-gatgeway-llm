@@ -1,4 +1,9 @@
-import { NanSearchProvider, normalizeResponse } from './nan-search.provider';
+import {
+    NanSearchProvider,
+    normalizeResponse,
+    searchEndpointFor,
+    DEFAULT_BASE_URL,
+} from './nan-search.provider';
 import {
     SearchProviderError,
     SearchRateLimitedError,
@@ -87,9 +92,57 @@ describe('NanSearchProvider', () => {
             );
         });
 
-        it('throws a clear error when NAN_API_KEY is missing', async () => {
+        it('resolves the key from the injected apiKeyEnv (DB column)', async () => {
+            const http = makeHttp();
+            http.post.mockResolvedValue({ data: { results: [], cached: false } });
+            process.env.MY_SEARCH_KEY = 'sk-db-driven';
+            try {
+                const provider = new NanSearchProvider({
+                    apiKeyEnv: 'MY_SEARCH_KEY',
+                    http,
+                });
+
+                await provider.search({ query: 'hi' });
+
+                expect(http.post).toHaveBeenCalledWith(
+                    expect.any(String),
+                    expect.anything(),
+                    expect.objectContaining({
+                        headers: expect.objectContaining({
+                            Authorization: 'Bearer sk-db-driven',
+                        }),
+                    }),
+                );
+            } finally {
+                delete process.env.MY_SEARCH_KEY;
+            }
+        });
+
+        it('falls back to NAN_SEARCH_BASE_URL env when no DB row exists', async () => {
+            const http = makeHttp();
+            http.post.mockResolvedValue({ data: { results: [], cached: false } });
+            process.env.NAN_SEARCH_BASE_URL = 'https://mirror.example/v1/search';
+            try {
+                const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+
+                await provider.search({ query: 'hi' });
+
+                expect(http.post).toHaveBeenCalledWith(
+                    'https://mirror.example/v1/search',
+                    expect.anything(),
+                    expect.anything(),
+                );
+            } finally {
+                delete process.env.NAN_SEARCH_BASE_URL;
+            }
+        });
+
+        it('throws a clear error when the key env var is missing', async () => {
             delete process.env.NAN_API_KEY;
-            const provider = new NanSearchProvider({ http: makeHttp() });
+            const provider = new NanSearchProvider({
+                apiKeyEnv: 'NAN_API_KEY',
+                http: makeHttp(),
+            });
 
             await expect(provider.search({ query: 'x' })).rejects.toThrow(
                 /NAN_API_KEY/,
@@ -136,6 +189,34 @@ describe('NanSearchProvider', () => {
             expect(thrown).toBeInstanceOf(SearchProviderError);
             expect(thrown.code).toBe('search_unavailable');
             expect(thrown.message).toContain('upstream down');
+        });
+    });
+
+    describe('searchEndpointFor', () => {
+        it('appends /search to the provider base URL', () => {
+            expect(
+                searchEndpointFor({
+                    id: 'nan',
+                    baseURL: 'https://api.nan.builders/v1',
+                    apiKeyEnv: 'NAN_API_KEY',
+                }),
+            ).toBe('https://api.nan.builders/v1/search');
+        });
+
+        it('tolerates a trailing slash on base_url', () => {
+            expect(
+                searchEndpointFor({
+                    id: 'nan',
+                    baseURL: 'https://api.nan.builders/v1/',
+                    apiKeyEnv: 'NAN_API_KEY',
+                }),
+            ).toBe('https://api.nan.builders/v1/search');
+        });
+
+        it('falls back to DEFAULT_BASE_URL when the row has no base_url', () => {
+            expect(
+                searchEndpointFor({ id: 'nan', apiKeyEnv: 'NAN_API_KEY' }),
+            ).toBe(DEFAULT_BASE_URL);
         });
     });
 

@@ -19,6 +19,7 @@ import {
     searchErrorEnvelope,
     searchErrorStatus,
     isSearchRateLimited,
+    stripSource,
     type SearchBody,
 } from './search.service';
 import {
@@ -78,13 +79,4 @@ export class SearchController {
     }
 }
 
-/** Drop the provider-internal `source` field before exposing results. */
-export function stripSource(response: SearchResponse): SearchResponse {
-    return {
-        ...response,
-        results: response.results.map((r) => {
-            const { source: _source, ...rest } = r;
-            return rest;
-        }),
-    };
-}
+

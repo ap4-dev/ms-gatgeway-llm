@@ -15,6 +15,7 @@ function makeDb(): { db: Database.Database; cleanup: () => void } {
         '0006_alias_weights.sql',
         '0007_alias_priority.sql',
         '0008_alias_strategy_enum_widen.sql',
+        '0012_provider_capabilities.sql',
     ]
         .map((f) => readFileSync(join(process.cwd(), 'migrations', f), 'utf-8'))
         .join('\n');

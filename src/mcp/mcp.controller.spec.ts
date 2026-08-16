@@ -1,6 +1,6 @@
 import { McpController, parseBody, dispatch, type JsonRpcResponse } from './mcp.controller';
-import type { SearchService } from './search.service';
-import { SearchProviderError } from './search-provider.interface';
+import type { SearchService } from '../search/search.service';
+import { SearchProviderError } from '../search/search-provider.interface';
 
 function makeSearch(overrides: { fail?: boolean } = {}): SearchService {
     return {

@@ -174,10 +174,19 @@ evento estructurado `search.request` en stdout. Consultable vía
 | Archivo | Rol |
 |---|---|
 | `src/search/search-provider.interface.ts` | `SearchProvider` + tipos + errores |
-| `src/search/nan-search.provider.ts` | Impl NaN (`NAN_API_KEY`, `POST /v1/search`) |
+| `src/search/nan-search.provider.ts` | Adapter wire NaN (`POST /v1/search`) — sin identidad de proveedor |
 | `src/search/search.service.ts` | Orquestador: validación, logging, dispatch |
 | `src/search/search.controller.ts` | `POST /v1/search` |
-| `src/search/mcp.controller.ts` | `POST /v1/mcp` JSON-RPC |
-| `src/search/tools.controller.ts` | `GET /v1/tools` |
-| `src/search/web-search.tool.ts` | Definición única del tool `web_search` |
-| `src/search/search.module.ts` | Módulo Nest |
+| `src/search/search.module.ts` | Módulo Nest — selecciona proveedor por capacidad (`supports_search`) |
+| `src/mcp/mcp.controller.ts` | `POST /v1/mcp` JSON-RPC (protocolo MCP) |
+| `src/mcp/mcp.module.ts` | Módulo protocolo MCP |
+| `src/tools/tools.controller.ts` | `GET /v1/tools` (registry de herramientas) |
+| `src/tools/web-search.tool.ts` | Definición única del tool `web_search` |
+| `src/tools/tools.module.ts` | Módulo tools |
+
+**Selección de proveedor:** el módulo de search no nombra ningún proveedor.
+`SearchModule` pregunta al registry cuál fila tiene `supports_search = 1`
+(migración 0012) y le pasa `id`, `base_url` (+ `/search`) y `api_key_env`
+al adapter. Cambiar de proveedor de search = UPDATE en `providers`, cero
+código. (Chat no tiene flag: su capacidad se deriva de tener filas en
+`model_configs`.)

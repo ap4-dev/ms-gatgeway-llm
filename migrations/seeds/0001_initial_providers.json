@@ -4,6 +4,7 @@
       "apiKeyEnv": "NAN_API_KEY",
       "baseURL": "https://api.nan.builders/v1",
       "timeoutMs": 180000,
+      "supportsSearch": true,
       "models": {
         "qwen": {
           "real": "qwen3.6"
