@@ -1,20 +1,28 @@
 import {
-    NanSearchProvider,
+    HttpSearchProvider,
     normalizeResponse,
     searchEndpointFor,
-    DEFAULT_BASE_URL,
-} from './nan-search.provider';
+} from './http-search.provider';
 import {
     SearchProviderError,
     SearchRateLimitedError,
     SearchTimeoutError,
 } from './search-provider.interface';
 
+const TEST_ENDPOINT = 'https://api.nan.builders/v1/search';
+
 function makeHttp() {
     return { post: jest.fn() } as any;
 }
 
-describe('NanSearchProvider', () => {
+function makeProvider(overrides: Record<string, unknown> = {}) {
+    return new HttpSearchProvider({
+        baseUrl: TEST_ENDPOINT,
+        ...overrides,
+    } as any);
+}
+
+describe('HttpSearchProvider', () => {
     const API_KEY = 'sk-nan-test';
 
     beforeEach(() => {
@@ -26,7 +34,7 @@ describe('NanSearchProvider', () => {
     });
 
     describe('search', () => {
-        it('posts to /v1/search with Bearer auth and maps the response', async () => {
+        it('posts to the search endpoint with Bearer auth and maps the response', async () => {
             const http = makeHttp();
             http.post.mockResolvedValue({
                 data: {
@@ -43,7 +51,7 @@ describe('NanSearchProvider', () => {
                     cached: true,
                 },
             });
-            const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+            const provider = makeProvider({ apiKey: API_KEY, http });
 
             const res = await provider.search({
                 query: 'hello',
@@ -53,7 +61,7 @@ describe('NanSearchProvider', () => {
             });
 
             expect(http.post).toHaveBeenCalledWith(
-                'https://api.nan.builders/v1/search',
+                TEST_ENDPOINT,
                 {
                     query: 'hello',
                     count: 5,
@@ -81,7 +89,7 @@ describe('NanSearchProvider', () => {
         it('uses a shorter timeout when content is not requested', async () => {
             const http = makeHttp();
             http.post.mockResolvedValue({ data: { results: [], cached: false } });
-            const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+            const provider = makeProvider({ apiKey: API_KEY, http });
 
             await provider.search({ query: 'hi' });
 
@@ -97,7 +105,7 @@ describe('NanSearchProvider', () => {
             http.post.mockResolvedValue({ data: { results: [], cached: false } });
             process.env.MY_SEARCH_KEY = 'sk-db-driven';
             try {
-                const provider = new NanSearchProvider({
+                const provider = makeProvider({
                     apiKeyEnv: 'MY_SEARCH_KEY',
                     http,
                 });
@@ -118,12 +126,12 @@ describe('NanSearchProvider', () => {
             }
         });
 
-        it('falls back to NAN_SEARCH_BASE_URL env when no DB row exists', async () => {
+        it('falls back to the SEARCH_BASE_URL env when no baseUrl is injected', async () => {
             const http = makeHttp();
             http.post.mockResolvedValue({ data: { results: [], cached: false } });
-            process.env.NAN_SEARCH_BASE_URL = 'https://mirror.example/v1/search';
+            process.env.SEARCH_BASE_URL = 'https://mirror.example/v1/search';
             try {
-                const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+                const provider = new HttpSearchProvider({ apiKey: API_KEY, http });
 
                 await provider.search({ query: 'hi' });
 
@@ -133,16 +141,19 @@ describe('NanSearchProvider', () => {
                     expect.anything(),
                 );
             } finally {
-                delete process.env.NAN_SEARCH_BASE_URL;
+                delete process.env.SEARCH_BASE_URL;
             }
+        });
+
+        it('throws at construction without baseUrl or SEARCH_BASE_URL', () => {
+            expect(() => new HttpSearchProvider({ apiKey: API_KEY })).toThrow(
+                /baseUrl or the SEARCH_BASE_URL/,
+            );
         });
 
         it('throws a clear error when the key env var is missing', async () => {
             delete process.env.NAN_API_KEY;
-            const provider = new NanSearchProvider({
-                apiKeyEnv: 'NAN_API_KEY',
-                http: makeHttp(),
-            });
+            const provider = makeProvider({ apiKeyEnv: 'NAN_API_KEY', http: makeHttp() });
 
             await expect(provider.search({ query: 'x' })).rejects.toThrow(
                 /NAN_API_KEY/,
@@ -155,7 +166,7 @@ describe('NanSearchProvider', () => {
             err.isAxiosError = true;
             err.response = { status: 429, headers: { 'retry-after': '42' } };
             http.post.mockRejectedValue(err);
-            const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+            const provider = makeProvider({ apiKey: API_KEY, http });
 
             const thrown = await provider.search({ query: 'x' }).catch((e) => e);
             expect(thrown).toBeInstanceOf(SearchRateLimitedError);
@@ -168,7 +179,7 @@ describe('NanSearchProvider', () => {
             err.isAxiosError = true;
             err.code = 'ECONNABORTED';
             http.post.mockRejectedValue(err);
-            const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+            const provider = makeProvider({ apiKey: API_KEY, http });
 
             const thrown = await provider.search({ query: 'x' }).catch((e) => e);
             expect(thrown).toBeInstanceOf(SearchTimeoutError);
@@ -183,7 +194,7 @@ describe('NanSearchProvider', () => {
                 data: { error: { message: 'upstream down' } },
             };
             http.post.mockRejectedValue(err);
-            const provider = new NanSearchProvider({ apiKey: API_KEY, http });
+            const provider = makeProvider({ apiKey: API_KEY, http });
 
             const thrown = await provider.search({ query: 'x' }).catch((e) => e);
             expect(thrown).toBeInstanceOf(SearchProviderError);
@@ -211,12 +222,6 @@ describe('NanSearchProvider', () => {
                     apiKeyEnv: 'NAN_API_KEY',
                 }),
             ).toBe('https://api.nan.builders/v1/search');
-        });
-
-        it('falls back to DEFAULT_BASE_URL when the row has no base_url', () => {
-            expect(
-                searchEndpointFor({ id: 'nan', apiKeyEnv: 'NAN_API_KEY' }),
-            ).toBe(DEFAULT_BASE_URL);
         });
     });
 

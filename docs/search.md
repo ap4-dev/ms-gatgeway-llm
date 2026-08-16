@@ -15,7 +15,7 @@ CLIENT (Pi, Kilo, OpenCode, curl)
   ▼
 GATEWAY
   └── SearchProvider interface  ← src/search/search-provider.interface.ts
-       └── NanSearchProvider    ← src/search/nan-search.provider.ts (NaN /v1/search)
+       └── HttpSearchProvider  ← src/search/http-search.provider.ts (POST /v1/search)
   │
   ▼
 PROVIDER (NaN hoy, otro mañana)
@@ -174,7 +174,7 @@ evento estructurado `search.request` en stdout. Consultable vía
 | Archivo | Rol |
 |---|---|
 | `src/search/search-provider.interface.ts` | `SearchProvider` + tipos + errores |
-| `src/search/nan-search.provider.ts` | Adapter wire NaN (`POST /v1/search`) — sin identidad de proveedor |
+| `src/search/http-search.provider.ts` | Adapter de wire format HTTP (`POST <base_url>/search`) — sin identidad de proveedor |
 | `src/search/search.service.ts` | Orquestador: validación, logging, dispatch |
 | `src/search/search.controller.ts` | `POST /v1/search` |
 | `src/search/search.module.ts` | Módulo Nest — selecciona proveedor por capacidad (`supports_search`) |

@@ -19,7 +19,7 @@ CLIENT (Pi, Kilo, OpenCode, curl)
   ▼
 GATEWAY
   └── SearchProvider interface
-       └── NanSearchProvider (current impl, calls NaN REST /v1/search)
+       └── HttpSearchProvider (wire-format adapter, POST /v1/search)
        └── ??? (future provider)
   │
   ▼
@@ -31,7 +31,7 @@ PROVIDER (NaN today, another tomorrow)
 | File | Purpose |
 |------|---------|
 | `src/search/search-provider.interface.ts` | `SearchProvider` interface + `SearchResult`, `SearchOptions` types |
-| `src/search/nan-search.provider.ts` | NaN implementation using NAN_API_KEY, calls `POST /v1/search` |
+| `src/search/http-search.provider.ts` | Wire-format adapter: JSON `POST /v1/search` (`NAN_API_KEY`) |
 | `src/search/search.controller.ts` | `POST /v1/search` REST endpoint |
 | `src/search/mcp.controller.ts` | `POST /v1/mcp` JSON-RPC (initialize, tools/list, tools/call, ping) |
 | `src/search/tools.controller.ts` | `GET /v1/tools` discovery endpoint |
@@ -65,7 +65,7 @@ interface SearchProvider {
 }
 ```
 
-### 2. NanSearchProvider (`nan-search.provider.ts`)
+### 2. HttpSearchProvider (`http-search.provider.ts`)
 
 - Reads NAN_API_KEY from env
 - Calls `POST https://api.nan.builders/v1/search` with Bearer auth

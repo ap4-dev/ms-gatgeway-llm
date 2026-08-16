@@ -9,43 +9,41 @@ import {
     type SearchResult,
 } from './search-provider.interface';
 
-/**
- * Last-resort search endpoint (fresh install / test default). Production
- * resolution lives in the composition root (SearchModule factory): it reads
- * the provider row from the DB and derives the endpoint from
- * `providers.base_url` — never a hardcoded id here.
- */
-export const DEFAULT_BASE_URL = 'https://api.nan.builders/v1/search';
-// NaN's search can take a while when `fetch_content` is requested — the
+// The current search wire format is a JSON POST to `<base_url>/search`.
+// Requests can take a while when `fetch_content` is requested — the
 // upstream has to retrieve and normalize full pages. Snippet-only queries
 // are much faster.
 const TIMEOUT_WITH_CONTENT_MS = 120_000;
 const TIMEOUT_SNIPPETS_MS = 30_000;
 
-/** Minimal provider-row view needed to build a search adapter. */
+/**
+ * Minimal provider-row view needed to build a search adapter. The row
+ * comes from the `providers` table (migration 0012, `supports_search`),
+ * so no provider identity is hardcoded in this file.
+ */
 export interface SearchProviderRow {
     id: string;
-    baseURL?: string;
+    baseURL: string;
     apiKeyEnv: string;
 }
 
 /**
- * Derive the search endpoint from a DB provider row. NaN's search API
- * lives under the provider base URL at `/search`. A provider without
- * `base_url` falls back to {@link DEFAULT_BASE_URL}.
+ * Derive the search endpoint from a DB provider row. This adapter's wire
+ * format serves search under the provider base URL at `/search`.
+ *
+ * `base_url` is required — a search-capable provider without one is a
+ * misconfiguration, and failing loudly at boot beats failing per-request.
  */
 export function searchEndpointFor(row: SearchProviderRow): string {
-    return row.baseURL
-        ? `${row.baseURL.replace(/\/+$/, '')}/search`
-        : DEFAULT_BASE_URL;
+    return `${row.baseURL.replace(/\/+$/, '')}/search`;
 }
 
-export interface NanSearchProviderOptions {
+export interface HttpSearchProviderOptions {
     /** Provider id — persisted as `request_logs.resolved_provider`. */
     id?: string;
     /**
      * Full search endpoint. The composition root passes the DB-derived
-     * endpoint; tests pass their own or rely on {@link DEFAULT_BASE_URL}.
+     * endpoint; tests pass their own or `SEARCH_BASE_URL` env.
      */
     baseUrl?: string;
     /**
@@ -60,16 +58,17 @@ export interface NanSearchProviderOptions {
 }
 
 /**
- * Search wire-format adapter for NaN's search API. Holds no provider
- * identity: id, endpoint and key env are injected from the DB row, so
- * swapping the active search provider is a DB change — no code change.
+ * Search wire-format adapter: JSON `POST <base_url>/search` with a
+ * `query`/`count`/`freshness`/`fetch_content` body. Holds no provider
+ * identity — id, endpoint and key env are injected from the DB row, so
+ * swapping the active search provider is a DB change, no code change.
  *
- * NaN's constraints (20 RPM / 3 concurrent / 500 req/day) are the reason
- * the gateway applies its own per-client rate limit (RateLimitGuard) on
- * top. A 429 from NaN surfaces as {@link SearchRateLimitedError} so the
- * REST layer can echo `Retry-After` to the caller.
+ * The current upstream (rate-limited: 20 RPM / 3 concurrent / 500 per
+ * day) is the reason the gateway applies its own per-client rate limit
+ * (RateLimitGuard) on top. A 429 surfaces as
+ * {@link SearchRateLimitedError} so the REST layer can echo `Retry-After`.
  */
-export class NanSearchProvider implements SearchProvider {
+export class HttpSearchProvider implements SearchProvider {
     readonly id: string;
 
     private readonly baseUrl: string;
@@ -77,9 +76,15 @@ export class NanSearchProvider implements SearchProvider {
     private readonly apiKey: string | undefined;
     private readonly http: AxiosInstance;
 
-    constructor(opts: NanSearchProviderOptions = {}) {
-        this.id = opts.id ?? 'nan';
-        this.baseUrl = opts.baseUrl ?? process.env.NAN_SEARCH_BASE_URL ?? DEFAULT_BASE_URL;
+    constructor(opts: HttpSearchProviderOptions = {}) {
+        this.id = opts.id ?? 'search';
+        const envBaseUrl = process.env.SEARCH_BASE_URL;
+        if (!opts.baseUrl && !envBaseUrl) {
+            throw new SearchProviderError(
+                `Search adapter requires a baseUrl or the SEARCH_BASE_URL env var (provider "${this.id}").`,
+            );
+        }
+        this.baseUrl = opts.baseUrl ?? envBaseUrl!;
         this.apiKeyEnv = opts.apiKeyEnv;
         this.apiKey =
             opts.apiKey ??

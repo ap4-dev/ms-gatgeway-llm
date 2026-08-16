@@ -2,9 +2,9 @@ import { Module } from '@nestjs/common';
 import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
 import {
-    NanSearchProvider,
+    HttpSearchProvider,
     searchEndpointFor,
-} from './nan-search.provider';
+} from './http-search.provider';
 import { SEARCH_PROVIDER } from './search-provider.interface';
 import { ProviderRegistryService } from '../providers/provider.registry';
 import { ChatModule } from '../chat/chat.module';
@@ -16,7 +16,7 @@ import { ChatModule } from '../chat/chat.module';
  * search provider **by capability**: the first `providers` row with
  * `supports_search = 1` (migration 0012). The chosen row's `id`,
  * `base_url` (+ `/search`) and `api_key_env` are handed to the wire-format
- * adapter (`NanSearchProvider`), which holds no provider identity. Swapping
+ * adapter (`HttpSearchProvider`), which holds no provider identity. Swapping
  * the search provider is a DB change — no code change.
  *
  * Exposed surfaces live in sibling modules:
@@ -44,7 +44,12 @@ import { ChatModule } from '../chat/chat.module';
                     );
                 }
                 const [id, cfg] = entry;
-                return new NanSearchProvider({
+                if (!cfg.baseURL) {
+                    throw new Error(
+                        `Search provider "${id}" has no base_url in the providers table; set one or the SEARCH_BASE_URL env var.`,
+                    );
+                }
+                return new HttpSearchProvider({
                     id,
                     baseUrl: searchEndpointFor({
                         id,

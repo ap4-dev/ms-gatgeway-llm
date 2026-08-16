@@ -36,7 +36,7 @@ export interface SearchResponse {
     cached: boolean;
 }
 
-/** Any search provider must implement this. See `NanSearchProvider`. */
+/** Any search provider must implement this. See `HttpSearchProvider`. */
 export interface SearchProvider {
     /** Stable provider id, persisted in `request_logs.resolved_provider`. */
     readonly id: string;
