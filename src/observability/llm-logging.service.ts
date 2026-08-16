@@ -37,7 +37,8 @@ export class LlmLoggingService {
 }
 
 export interface RequestLogEvent {
-    event: 'chat.request';
+    /** `chat.request` from ChatService; `search.request` from SearchService. */
+    event: 'chat.request' | 'search.request';
     /** Unix-seconds timestamp captured at the start of ChatService.completions. */
     ts: number;
     model: string;

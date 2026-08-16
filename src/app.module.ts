@@ -13,12 +13,13 @@ import { ChatModule } from './chat/chat.module';
 import { HealthModule } from './health/health.module';
 import { AdminModule } from './admin/admin.module';
 import { CoreModule } from './config/core.module';
+import { SearchModule } from './search/search.module';
 
 @Module({
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
         SentryModule.forRoot(), CoreModule, RedisModule,
-        ChatModule, HealthModule, AdminModule,
+        ChatModule, HealthModule, AdminModule, SearchModule,
     ],
     controllers: [AppController],
     providers: [

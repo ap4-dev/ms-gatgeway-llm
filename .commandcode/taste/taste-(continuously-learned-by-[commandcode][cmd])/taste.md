@@ -1,0 +1,12 @@
+# Taste (Continuously Learned by [CommandCode][cmd])
+- Communicates in Spanish (Español). Confidence: 0.9
+- Prefers to ask multiple related questions in a single message (numbered lists). Confidence: 0.8
+- Wants to understand trade-offs, costs, and capacity implications before making decisions. Confidence: 0.8
+- Works with Node.js, NestJS framework, and PM2 for process management. Confidence: 0.9
+- Uses pnpm as package manager. Confidence: 0.9
+- Builds microservices (ms-* naming convention), including LLM/AI gateway services. Confidence: 0.8
+- Uses SQLite in development/POC environments, considering PostgreSQL for scaling. Confidence: 0.8
+- Interested in Redis for caching strategies. Confidence: 0.7
+- Performance-conscious: concerned about CPU-blocking operations (e.g., scryptSync per request) and seeks optimizations. Confidence: 0.8
+- Thinks about scaling and production readiness during POC stage (capacity planning for multiple developers). Confidence: 0.8
+- Interested in pragmatic trade-offs (e.g., plaintext keys vs. security overhead). Confidence: 0.7

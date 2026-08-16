@@ -102,6 +102,49 @@ Passthrough: the schema is lenient — unknown fields are forwarded to the upstr
 
 ---
 
+### `POST /v1/search`
+
+Web search — provider-agnostic REST surface (see [`docs/search.md`](docs/search.md)). Request/response mirror the upstream wire format minus the internal `source` field.
+
+**Auth**: required + scope `chat.write`. **Rate-limit**: yes.
+
+```json
+{
+  "query": "mejores prácticas observability LLM",
+  "count": 5,
+  "freshness": "pm",
+  "fetch_content": true
+}
+```
+
+Required: `query` (1–500 chars). Optional: `count` (1–20, default 5), `freshness` (`pd|pw|pm|py` or `YYYY-MM-DDtoYYYY-MM-DD`), `fetch_content` (bool).
+
+**Response**: `{"results": [{"title", "url", "snippet", "content?"}], "cached": bool}`
+
+**Provider errors** (envelope `{"error": {"message", "type", "code", "retryAfterMs?"}}`):
+
+| `code` | HTTP | Meaning |
+|---|---|---|
+| `search_unavailable` | `502` | Upstream down / error |
+| `search_rate_limited` | `429` | Upstream rate limit (20 RPM / 3 concurrent / 500 day); `Retry-After` set |
+| `search_timeout` | `504` | Upstream timeout (30s snippets / 120s with `fetch_content`) |
+
+---
+
+### `POST /v1/mcp`
+
+MCP server over JSON-RPC 2.0 — stateless, one POST per round-trip. **Auth**: required + scope `chat.write`. **Rate-limit**: yes.
+
+Methods: `initialize`, `ping`, `tools/list` (exposes `web_search`), `tools/call`. Notifications (`notifications/initialized`, no `id`) → `202` empty. JSON-RPC errors are returned with **HTTP 200** and an `error` field (`-32700`/`-32600`/`-32601`/`-32602`); search failures inside `tools/call` come back as `isError: true`.
+
+---
+
+### `GET /v1/tools`
+
+Tool discovery for non-MCP clients (Kilo, OpenCode). OpenAI-shaped `{object: "list", data: [{type: "function", function: {name, description, parameters}}]}`. **Auth**: required. **Rate-limit**: yes. No extra scope.
+
+---
+
 ### `GET /v1/health`
 
 Process health check. **No auth required.** `@HealthCheck()` from `@nestjs/terminus`.

@@ -9,7 +9,8 @@ export interface RecordSuccessArgs {
     requestedAt: number;
     requestedModel: string;
     resolvedProvider: string;
-    resolvedModel: string;
+    /** Nullable since Phase-search: chat always resolves a model, search does not. */
+    resolvedModel?: string | null;
     attempts: number;
     latencyMs: number;
     clientKey?: string | null;
@@ -59,7 +60,7 @@ export class RequestLogService {
             requestedAt: args.requestedAt,
             modelRequested: args.requestedModel,
             resolvedProvider: args.resolvedProvider,
-            resolvedModel: args.resolvedModel,
+            resolvedModel: args.resolvedModel ?? null,
             attempts: args.attempts,
             latencyMs: args.latencyMs,
             status: 'ok',

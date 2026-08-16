@@ -17,6 +17,7 @@ autenticación por cliente (API keys) y logging de requests — todo persistido 
 | Capacidad | Detalle |
 |---|---|
 | Chat completions | `POST /v1/chat/completions` — OpenAI-compatible, buffered y SSE streaming |
+| Web search | `POST /v1/search` (REST) + `POST /v1/mcp` (MCP JSON-RPC) + `GET /v1/tools` (discovery) — ver [`docs/search.md`](docs/search.md) |
 | Aliases de modelos | El cliente pide `coder`; el gateway resuelve a `nan/qwen3.6`, etc. Nunca expone ids reales upstream |
 | Multi-proveedor | Registro de proveedores en SQLite (`providers`), clave por proveedor en env (`NAN_API_KEY`, …) |
 | Estrategias de balanceo | `primary`, `round-robin`, `weighted`, `priority-grouped` — configurable por alias vía API admin |
