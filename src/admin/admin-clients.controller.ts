@@ -11,6 +11,19 @@ import {
     UseGuards,
     UsePipes,
 } from '@nestjs/common';
+import {
+    ApiBadRequestResponse,
+    ApiBearerAuth,
+    ApiConflictResponse,
+    ApiCreatedResponse,
+    ApiNoContentResponse,
+    ApiNotFoundResponse,
+    ApiOkResponse,
+    ApiOperation,
+    ApiTags,
+    ApiUnauthorizedResponse,
+    ApiForbiddenResponse,
+} from '@nestjs/swagger';
 import { z } from 'zod';
 import { ClientService } from '../auth/client.service';
 import type { Client } from '../auth/client.repository';
@@ -85,15 +98,60 @@ interface ClientCreatedView extends ClientView {
 @Controller('admin/clients')
 @UseGuards(ApiKeyAuthGuard, RequireScopesGuard, RateLimitGuard)
 @RequireScopes('admin')
+@ApiTags('admin · clients')
+@ApiBearerAuth('admin-bearer')
+@ApiUnauthorizedResponse({ description: 'Missing or invalid API key.' })
+@ApiForbiddenResponse({
+    description: 'Client authenticated but lacks the `admin` scope.',
+})
 export class AdminClientsController {
     constructor(private readonly clients: ClientService) {}
 
     @Get()
+    @ApiOperation({ summary: 'List all clients (including revoked).' })
+    @ApiOkResponse({
+        description: 'All known clients, newest-first by `createdAt`.',
+        schema: {
+            example: {
+                clients: [
+                    {
+                        id: 'admin',
+                        name: 'Admin',
+                        scopes: ['admin', 'chat.read', 'chat.write'],
+                        rateLimitRpm: 1000,
+                        rateLimitTpm: null,
+                        apiKeyPrefix: 'sk-aaaaab',
+                        createdAt: 1780000000,
+                        lastUsedAt: 1783353000,
+                        revoked: false,
+                    },
+                ],
+            },
+        },
+    })
     list(): { clients: ClientView[] } {
         return { clients: this.clients.list().map(toView) };
     }
 
     @Get(':id')
+    @ApiOperation({ summary: 'Get one client by id.' })
+    @ApiOkResponse({
+        description: 'Client row.',
+        schema: {
+            example: {
+                id: 'admin',
+                name: 'Admin',
+                scopes: ['admin', 'chat.read', 'chat.write'],
+                rateLimitRpm: 1000,
+                rateLimitTpm: null,
+                apiKeyPrefix: 'sk-aaaaab',
+                createdAt: 1780000000,
+                lastUsedAt: 1783353000,
+                revoked: false,
+            },
+        },
+    })
+    @ApiNotFoundResponse({ description: 'Client id unknown.' })
     get(@Param('id') id: string): ClientView {
         const client = this.mustFind(id);
         return toView(client);
@@ -101,6 +159,34 @@ export class AdminClientsController {
 
     @Post()
     @UsePipes(new ZodValidationPipe(CreateClientSchema))
+    @ApiOperation({
+        summary: 'Create a new client. Returns the plaintext API key ONCE.',
+    })
+    @ApiCreatedResponse({
+        description: 'Client created. `plaintextApiKey` is shown once.',
+        schema: {
+            example: {
+                id: 'tenant-acme',
+                name: 'Acme Co.',
+                scopes: ['chat.read', 'chat.write'],
+                rateLimitRpm: 300,
+                rateLimitTpm: null,
+                apiKeyPrefix: 'sk-aaaaab',
+                createdAt: 1783353000,
+                lastUsedAt: null,
+                revoked: false,
+                plaintextApiKey: 'sk-…',
+                warning:
+                    'Save this API key now. It will never be shown again.',
+            },
+        },
+    })
+    @ApiBadRequestResponse({
+        description: 'Body failed zod validation.',
+    })
+    @ApiConflictResponse({
+        description: 'A client with the same id already exists.',
+    })
     create(@Body() body: CreateClientDto): ClientCreatedView {
         const id = body.id ?? generateSlugId();
         const existing = this.clients.findById(id);
@@ -128,6 +214,14 @@ export class AdminClientsController {
 
     @Patch(':id')
     @UsePipes(new ZodValidationPipe(PatchClientSchema))
+    @ApiOperation({
+        summary: 'Partial update (name, scopes, rate limits).',
+    })
+    @ApiOkResponse({ description: 'Updated client row.' })
+    @ApiBadRequestResponse({
+        description: 'Body failed zod validation or violates invariants (e.g. zero scopes).',
+    })
+    @ApiNotFoundResponse({ description: 'Client id unknown.' })
     update(
         @Param('id') id: string,
         @Body() body: PatchClientDto,
@@ -143,6 +237,29 @@ export class AdminClientsController {
 
     @Post(':id/rotate')
     @HttpCode(200)
+    @ApiOperation({
+        summary: 'Mint a new API key for an existing client. Old key stops working.',
+    })
+    @ApiOkResponse({
+        description: 'New client row + the new plaintext API key (shown once).',
+        schema: {
+            example: {
+                id: 'tenant-acme',
+                name: 'Acme Co.',
+                scopes: ['chat.read', 'chat.write'],
+                rateLimitRpm: 300,
+                rateLimitTpm: null,
+                apiKeyPrefix: 'sk-newkey',
+                createdAt: 1783353000,
+                lastUsedAt: null,
+                revoked: false,
+                plaintextApiKey: 'sk-…',
+                warning:
+                    'Save this API key now. It will never be shown again.',
+            },
+        },
+    })
+    @ApiNotFoundResponse({ description: 'Client id unknown.' })
     rotate(@Param('id') id: string): ClientView & {
         plaintextApiKey: string;
         warning: string;
@@ -158,6 +275,11 @@ export class AdminClientsController {
 
     @Post(':id/revoke')
     @HttpCode(204)
+    @ApiOperation({
+        summary: 'Mark a client revoked. Cache clears within 5 minutes.',
+    })
+    @ApiNoContentResponse({ description: 'Revoked (no body).' })
+    @ApiNotFoundResponse({ description: 'Client id unknown.' })
     revoke(@Param('id') id: string): void {
         this.mustFind(id); // 404 before mutating.
         this.clients.revoke(id);
@@ -165,6 +287,11 @@ export class AdminClientsController {
 
     @Delete(':id')
     @HttpCode(204)
+    @ApiOperation({
+        summary: 'Hard-delete a client row. Idempotent.',
+    })
+    @ApiNoContentResponse({ description: 'Deleted (no body).' })
+    @ApiNotFoundResponse({ description: 'Client id unknown.' })
     remove(@Param('id') id: string): void {
         const existing = this.clients.findById(id);
         if (!existing) {

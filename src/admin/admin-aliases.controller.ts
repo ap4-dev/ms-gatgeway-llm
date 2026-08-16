@@ -8,6 +8,18 @@ import {
     Put,
     UseGuards,
 } from '@nestjs/common';
+import {
+    ApiBadRequestResponse,
+    ApiBearerAuth,
+    ApiForbiddenResponse,
+    ApiNoContentResponse,
+    ApiNotFoundResponse,
+    ApiOkResponse,
+    ApiOperation,
+    ApiParam,
+    ApiTags,
+    ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
 import { z } from 'zod';
 import { ProviderRegistryService } from '../providers/provider.registry';
 import { type RoutingStrategyKind, RoutingStrategySchema } from '../providers/provider.model';
@@ -64,10 +76,37 @@ interface AliasView {
 @Controller('admin/aliases')
 @UseGuards(ApiKeyAuthGuard, RequireScopesGuard, RateLimitGuard)
 @RequireScopes('admin')
+@ApiTags('admin · aliases')
+@ApiBearerAuth('admin-bearer')
+@ApiUnauthorizedResponse({ description: 'Missing or invalid API key.' })
+@ApiForbiddenResponse({
+    description: 'Client authenticated but lacks the `admin` scope.',
+})
 export class AdminAliasesController {
     constructor(private readonly registry: ProviderRegistryService) {}
 
     @Get()
+    @ApiOperation({ summary: 'List all alias chains with their routing policy.' })
+    @ApiOkResponse({
+        description: 'All aliases.',
+        schema: {
+            example: {
+                aliases: [
+                    {
+                        id: 'code',
+                        chain: [
+                            'nan/qwen3.6',
+                            'nan/mimo-v2.5',
+                            'nan/deepseek-v4-flash',
+                        ],
+                        strategy: 'primary',
+                        weights: [1, 1, 1],
+                        priorities: [0, 1, 2],
+                    },
+                ],
+            },
+        },
+    })
     list(): { aliases: AliasView[] } {
         const views: AliasView[] = Object.entries(this.registry.aliases).map(
             ([aliasKey, chain]) => this.toView(aliasKey, chain),
@@ -76,6 +115,21 @@ export class AdminAliasesController {
     }
 
     @Get(':id')
+    @ApiOperation({ summary: 'Get one alias chain + policy.' })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiOkResponse({
+        description: 'Single alias view.',
+        schema: {
+            example: {
+                id: 'code',
+                chain: ['nan/qwen3.6', 'nan/mimo-v2.5', 'nan/deepseek-v4-flash'],
+                strategy: 'primary',
+                weights: [1, 1, 1],
+                priorities: [0, 1, 2],
+            },
+        },
+    })
+    @ApiNotFoundResponse({ description: 'Alias id unknown.' })
     get(@Param('id') id: string): AliasView {
         const chain = this.registry.aliases[id];
         if (!chain) {
@@ -86,6 +140,11 @@ export class AdminAliasesController {
 
     @Put(':id/strategy')
     @HttpCode(204)
+    @ApiOperation({ summary: 'Set per-alias routing strategy.' })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiNoContentResponse({ description: 'Strategy updated (no body).' })
+    @ApiBadRequestResponse({ description: 'Body failed zod validation.' })
+    @ApiNotFoundResponse({ description: 'Alias id unknown.' })
     setStrategy(
         @Param('id') id: string,
         @Body(new ZodValidationPipe(PutStrategySchema)) body: { strategy: RoutingStrategyKind },
@@ -96,6 +155,18 @@ export class AdminAliasesController {
 
     @Put(':id/weights')
     @HttpCode(204)
+    @ApiOperation({
+        summary: 'Set per-position weights for strategy=`weighted`.',
+        description:
+            'Body.weights.length MUST match the alias chain length. ' +
+            'Out-of-order weights produce deterministic sampling bias.',
+    })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiNoContentResponse({ description: 'Weights updated (no body).' })
+    @ApiBadRequestResponse({
+        description: 'Body failed zod validation or weights.length != chain.length.',
+    })
+    @ApiNotFoundResponse({ description: 'Alias id unknown.' })
     setWeights(
         @Param('id') id: string,
         @Body(new ZodValidationPipe(PutWeightsSchema)) body: { weights: number[] },
@@ -112,6 +183,15 @@ export class AdminAliasesController {
 
     @Put(':id/priorities')
     @HttpCode(204)
+    @ApiOperation({
+        summary: 'Sparse per-position priority map for strategy=`priority-grouped`.',
+        description:
+            'Positions not listed keep their current priority. Listed positions must be in [0, chain.length - 1].',
+    })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiNoContentResponse({ description: 'Priorities updated (no body).' })
+    @ApiBadRequestResponse({ description: 'Out-of-range position or invalid body.' })
+    @ApiNotFoundResponse({ description: 'Alias id unknown.' })
     setPriorities(
         @Param('id') id: string,
         @Body(new ZodValidationPipe(PutPrioritiesSchema)) body: { priorities: Record<number, number> },
@@ -148,7 +228,7 @@ export class AdminAliasesController {
             id: aliasKey,
             chain,
             strategy: this.registry.getStrategy(aliasKey),
-            weights: weightArr,
+            weights: weightsMap ? weightArr : weightArr,
             priorities,
         };
     }

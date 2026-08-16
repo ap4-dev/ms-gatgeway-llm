@@ -5,6 +5,16 @@ import {
     Query,
     UseGuards,
 } from '@nestjs/common';
+import {
+    ApiBadRequestResponse,
+    ApiBearerAuth,
+    ApiForbiddenResponse,
+    ApiOkResponse,
+    ApiOperation,
+    ApiQuery,
+    ApiTags,
+    ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
 import { z } from 'zod';
 import { ApiKeyAuthGuard } from '../auth/api-key.guard';
 import { RequireScopesGuard } from '../auth/require-scopes.guard';
@@ -99,10 +109,93 @@ interface ListLogsResponse {
 @Controller('admin/logs')
 @UseGuards(ApiKeyAuthGuard, RequireScopesGuard, RateLimitGuard)
 @RequireScopes('admin')
+@ApiTags('admin · logs')
+@ApiBearerAuth('admin-bearer')
+@ApiUnauthorizedResponse({ description: 'Missing or invalid API key.' })
+@ApiForbiddenResponse({
+    description: 'Client authenticated but lacks the `admin` scope.',
+})
 export class AdminLogsController {
     constructor(private readonly repo: RequestLogRepository) {}
 
     @Get()
+    @ApiOperation({
+        summary:
+            'Recent request_logs with filters. Admin-privileged — exposes `resolvedProvider` / `resolvedModel`.',
+    })
+    @ApiQuery({
+        name: 'client_id',
+        required: false,
+        description: 'Matches `client_key`. 1–64 chars.',
+        example: 'tenant-acme',
+    })
+    @ApiQuery({
+        name: 'model',
+        required: false,
+        description: 'Filters on the alias (`modelRequested`). E.g. `code`.',
+        example: 'code',
+    })
+    @ApiQuery({
+        name: 'provider',
+        required: false,
+        description: 'Filters on the upstream provider. E.g. `nan`.',
+        example: 'nan',
+    })
+    @ApiQuery({
+        name: 'status',
+        required: false,
+        enum: ['ok', 'error', 'circuit_open'],
+        description: 'Filter by request status.',
+    })
+    @ApiQuery({
+        name: 'from',
+        required: false,
+        description: 'Inclusive lower bound on `requested_at`. ISO-8601 datetime.',
+        example: '2026-07-01T00:00:00Z',
+    })
+    @ApiQuery({
+        name: 'to',
+        required: false,
+        description: 'Inclusive upper bound on `requested_at`. ISO-8601 datetime.',
+        example: '2026-07-07T23:59:59Z',
+    })
+    @ApiQuery({
+        name: 'limit',
+        required: false,
+        description: 'Default 100, max 500.',
+        example: '100',
+    })
+    @ApiOkResponse({
+        description: 'Filtered page of request_logs, newest first.',
+        schema: {
+            example: {
+                items: [
+                    {
+                        requestedAt: 1783353000,
+                        modelRequested: 'code',
+                        resolvedProvider: 'nan',
+                        resolvedModel: 'qwen3-coder',
+                        attempts: 1,
+                        latencyMs: 4200,
+                        status: 'ok',
+                        error: null,
+                        clientKey: 'tenant-acme',
+                        promptHash: '26296f7c…',
+                        promptTokens: 70441,
+                        completionTokens: 86,
+                        totalTokens: 70527,
+                    },
+                ],
+                count: 1,
+                limit: 100,
+                hasMore: false,
+            },
+        },
+    })
+    @ApiBadRequestResponse({
+        description:
+            'Malformed query (unknown parameter, bad limit, bad ISO, from > to).',
+    })
     list(@Query() raw: Record<string, string | undefined>): ListLogsResponse {
         const parsed = ListLogsQuerySchema.safeParse(raw);
         if (!parsed.success) {

@@ -11,10 +11,12 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import fastifyMultipart from '@fastify/multipart';
+import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import { inyectEnv } from './app.enviroment.js';
 import { getEnv } from './config/env.schema';
 import { buildCorsHandler } from './config/cors.config';
+import { setupSwagger } from './swagger.setup';
 
 async function msCoreOne() {
   await inyectEnv();
@@ -35,6 +37,15 @@ async function msCoreOne() {
 //  await app.register(fastifyCookie as any);
   await app.register(fastifyWebsocket as any);
 
+  // /assets, /favicon, etc. that /docs (Swagger UI) requests. The UI is
+  // served by @fastify/swagger-ui inside SwaggerModule.setup; the assets
+  // here cover the static bits that ship with @nestjs/swagger.
+  app.register(fastifyStatic as any, {
+    root: require('node:path').join(__dirname, '..'),
+    serve: false,
+    wildcard: false,
+  });
+
   app.enableCors({
     origin: buildCorsHandler(env.CORS_ORIGINS) as any,
     methods: 'GET,HEAD,PUT,PATCH,POST,OPTIONS',
@@ -45,7 +56,14 @@ async function msCoreOne() {
       fileSize: 10 * 1024 * 1024, // 10MB
     },
   });
-  app.setGlobalPrefix('v1');
+  app.setGlobalPrefix('v1', {
+    exclude: ['docs', 'docs-json'],
+  });
+
+  // Swagger UI at /docs. DocumentBuilder in src/swagger.setup.ts
+  // limits the spec to AdminModule only.
+  setupSwagger(app);
+
   const logger = app.get(AppJsonLogger);
   app.useLogger(logger);
   await app.listen(env.PORT, '0.0.0.0');
