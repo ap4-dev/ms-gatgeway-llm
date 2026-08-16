@@ -220,18 +220,27 @@ Conexión singleton vía `DatabaseService` (`better-sqlite3`, síncrono). Path:
 migraciones (`migrations/`) y siembra el registro de proveedores
 (`migrations/seeds/0001_initial_providers.json`).
 
-Tablas (migraciones `0001`–`0009`):
+Tablas (migraciones `0001`–`0011`):
 
 | Tabla | Contenido |
 |---|---|
 | `providers` | `id`, `api_key_env`, `base_url`, `timeout_ms` |
-| `model_configs` | `real`, `max_tokens`, `supports_stream` por modelo |
+| `model_configs` | `real`, `max_tokens`, `supports_stream`, `disable_thinking` por modelo (0011) |
 | `alias_policy` | estrategia por alias (`primary`/`round-robin`/`weighted`/`priority-grouped`/`fallback`) |
 | `alias_entries` | posiciones de la chain + `weight` y `priority` por posición |
 | `alias_weights` | pesos por posición (estrategia `weighted`) |
 | `routing_policy` | knobs globales del breaker/fallback |
 | `clients` | `id`, `name`, `api_key_hash`, `api_key_prefix`, `scopes`, `rate_limit_rpm`, `rate_limit_tpm`, `revoked_at`, `last_used_at` |
-| `request_logs` | `requested_at`, `client_key`, `model_requested`, `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens` (+ índices en `0009`) |
+| `request_logs` | `requested_at`, `client_key`, `model_requested`, `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `attempt_details` (+ índices en `0009`) |
+
+> Migraciones `0010` (attempt_details) y `0011` (disable_thinking) — ver
+> `migrations/0010_request_logs_attempts.sql` y `migrations/0011_model_disable_thinking.sql`.
+> Desde `0010`, cada intento fallido de una chain de fallback se loggea como
+> su propia fila `status='error'` con el mensaje de error del provider;
+> `attempt_details` (JSON) guarda el detalle por intento (provider, model,
+> duración, error, circuit open). `disable_thinking` inyecta
+> `thinking: {type: 'disabled'}` en requests a modelos DeepSeek V4 que exigen
+> el echo de `reasoning_content` en threads multi-turno.
 
 > El gateway registra en la tabla **después** de responder: `request_logs`
 > documenta lo que pasó; no bloquea la respuesta. Con la réplica única actual
@@ -272,8 +281,9 @@ scope `admin`.
 
 **Hecho:** multi-proveedor, aliases, 4 estrategias de balanceo, circuit
 breaker, auth por cliente (HMAC+pepper), rotación/revocación, rate limiting
-RPM/TPM, request logs + tokens, métricas por ventana, health LLM, admin API +
-Swagger, Doppler, NewRelic/Sentry.
+RPM/TPM, request logs + tokens, log de intentos fallidos individuales,
+`disable_thinking` por modelo (DeepSeek V4), métricas por ventana, health LLM,
+admin API + Swagger, Doppler, NewRelic/Sentry.
 
 **Pendiente / deuda técnica:**
 

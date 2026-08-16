@@ -394,6 +394,7 @@ Query parameters (all optional, AND-combined):
 | `client_id` | string 1–64 | Matches `client_key` |
 | `model` | string 1–120 | **Alias**, e.g. `code`. |
 | `provider` | string 1–64 | Filters on `resolved_provider` (admin sees it). |
+| `resolved_model` | string 1–120 | Filters on `resolved_model` (admin sees it). |
 | `status` | `ok` \| `error` \| `circuit_open` | |
 | `from` | ISO-8601 datetime | Inclusive lower bound on `requested_at` |
 | `to` | ISO-8601 datetime | Inclusive upper bound on `requested_at` |
@@ -419,7 +420,8 @@ Query parameters (all optional, AND-combined):
       "promptHash": "26296f7c…",
       "promptTokens": 70441,
       "completionTokens": 86,
-      "totalTokens": 70527
+      "totalTokens": 70527,
+      "attemptDetails": null
     }
   ],
   "count": 1,
@@ -429,6 +431,7 @@ Query parameters (all optional, AND-combined):
 ```
 
 - Newest first, ordered by `(requestedAt DESC, id DESC)`.
+- `attemptDetails` (JSON string): per-attempt metadata — provider, model, duration, error, circuit-open flag. Populated when a fallback chain had >1 attempt; `null` otherwise. Each failed attempt is also its own `status: "error"` row.
 - `hasMore: true` means at least one row matched beyond `items`.
 - Indexes used: `(client_key, requested_at DESC, id DESC)` and `(status, requested_at DESC, id DESC)`. `?model=` and `?provider=` are `requested_at` scans, fine while volume stays ≤ ~5M rows.
 - `resolvedProvider` / `resolvedModel` are exposed here **on purpose** — admin scope is the privilege boundary. The public surface (`/v1/models`, `/v1/metrics/summary`) still hides them.

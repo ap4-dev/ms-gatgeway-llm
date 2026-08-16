@@ -187,5 +187,5 @@ expuesto en la API admin (`POST /admin/clients`, `PATCH`, `/:id/rotate`,
 
 - **Logs de proceso:** stdout (pino/Nest logger) + NewRelic/Sentry según config.
 - **Shutdown:** señal `SIGTERM` → cierre graceful de Fastify.
-- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `src/database/migrations`; seed de proveedores al primer boot.
+- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `migrations/` (raíz, `0001`–`0011`); seed de proveedores al primer boot.
 - **Redis:** solo para cache de auth (TTL 5 min). Caída → fallback a SQLite.
