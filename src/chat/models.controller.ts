@@ -39,7 +39,7 @@ interface ModelsListResponse {
  * is applied by `main.ts` via `app.setGlobalPrefix('v1')`. Putting
  * `v1` here too would yield `/v1/v1/models`.
  */
-@Controller('models')
+@Controller('v1/models')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
 export class ModelsController {
     // Stable timestamp per process boot — OpenAI clients only compare this

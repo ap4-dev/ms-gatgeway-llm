@@ -56,9 +56,9 @@ async function msCoreOne() {
       fileSize: 10 * 1024 * 1024, // 10MB
     },
   });
-  app.setGlobalPrefix('v1', {
-    exclude: ['docs', 'docs-json'],
-  });
+//  app.setGlobalPrefix('v1', {
+//    exclude: ['docs', 'docs-json'],
+//  });
 
   // Swagger UI at /docs. DocumentBuilder in src/swagger.setup.ts
   // limits the spec to AdminModule only.

@@ -17,7 +17,7 @@ import { ApiKeyAuthGuard } from '../auth/api-key.guard';
 import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 import type { Client } from '../auth/client.repository';
 
-@Controller('chat')
+@Controller('v1/chat')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
 export class ChatController {
     constructor(private readonly chat: ChatService) {}
