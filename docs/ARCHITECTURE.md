@@ -1,252 +1,289 @@
-# ms-gateway-llm — Architecture & Roadmap
+# ms-gateway-llm — Arquitectura
 
-## 1. Current State (POC v0.1)
+> **Estado:** este documento describe la implementación **actual** del código
+> (feb 2026, POC con funcionalidad en producción). Si algo no coincide con lo
+> que ves en `src/`, es que el doc quedó viejo — actualizalo.
 
-The service is a NestJS 11 + Fastify proxy that forwards **OpenAI-compatible** `/chat/completions` requests to upstream LLM providers.
+---
+
+## 1. Resumen
+
+Gateway LLM **OpenAI-compatible** en **NestJS 11 sobre Fastify** (`@nestjs/platform-fastify`).
+Recibe `/v1/chat/completions`, resuelve el modelo pedido (alias → proveedor
+real), rutea la llamada upstream bajo un **circuit breaker por proveedor** con
+**estrategias de balanceo** configurables, y registra cada request en **SQLite**.
 
 ```
-Client (Kilo / OpenCode / etc.)
-  │
-  ▼
-POST /v1/chat/completions
-  │
-  ▼
-┌─────────────────────────────────────┐
-│  ProxyController                   │
-│  ├── validates body                │
-│  ├── if stream → SSE passthrough   │
-│  └── else → JSON response          │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  ProxyService                      │
-│  ├── normalizeBody()               │
-│  │   └── mergeSystemMessages()     │
-│  └── OpenAI SDK → upstream         │
-└─────────────────────────────────────┘
-               │
-               ▼
-  Provider (nan.builders / OpenAI / etc.)
+Cliente (Kilo / OpenCode / Claude Code / …)
+   │  Authorization: Bearer sk-…
+   ▼
+POST /v1/chat/completions  ──▶  ChatController
+                                   │  guards: ApiKeyAuth → RequireScopes → RateLimit
+                                   ▼
+                              ChatService
+                                   │  normalize (merge system) + prompt hash
+                                   │  tee del stream (para tokens)
+                                   ▼
+                              RoutingService
+                                   │  alias → chain ordenada (pickOrder por estrategia)
+                                   │  walk bajo CircuitBreaker
+                                   ▼
+                              ProviderService  ──▶  OpenAI SDK (cliente cacheado por provider)
+                                   │  apiKey env · baseURL · timeoutMs · overrides
+                                   ▼
+                              Upstream (nan / openai / …)
 ```
 
-### Files
+**Stack:** NestJS 11 · Fastify · TypeScript · zod · `better-sqlite3` · OpenAI SDK ·
+ioredis (cache de auth + rate limit) · Doppler (secretos) · NewRelic + Sentry ·
+Swagger (`@nestjs/swagger`).
 
-| File | Purpose |
+---
+
+## 2. Módulos
+
+`src/app.module.ts` cablea:
+
+| Módulo | Responsabilidad |
 |---|---|
-| `src/main.ts` | Bootstrap, Fastify adapter, CORS, global prefix `v1` |
-| `src/app.module.ts` | Root module, wires controllers + providers |
-| `src/proxy.controller.ts` | `POST /chat/completions` — streaming & non-streaming |
-| `src/openia/proxy.service.ts` | Normalization + OpenAI SDK client |
-| `config/providers.json` | Provider/model registry (not yet consumed) |
+| `ConfigModule` + `CoreModule` | Env schema zod, CORS, tokens DI (`ENV_CONFIG`) |
+| `RedisModule` / `RedisService` | Cliente ioredis (cache de auth, rate limit) |
+| `ChatModule` | `chat.controller` (completions) + `models.controller` (catálogo) + `chat.service` |
+| `HealthModule` | `GET /v1/health` (AppController), `/v1/health/llm`, `/v1/metrics/summary` |
+| `AdminModule` | `admin/clients`, `admin/aliases`, `admin/logs`, `admin-reset-cli` |
+| `AuthModule` | `ApiKeyAuthGuard`, `RequireScopesGuard`, repositorio/servicio de clientes, cache de auth |
+| `DatabaseModule` (global) | Conexión SQLite, migraciones, seed, repositorios |
+| `RatelimitModule` | `RateLimitGuard` + limiter Redis (fail-open) |
+| Sentry | `APP_FILTER` global + `sentry.instrument.ts` |
+
+### Bootstrap (`src/main.ts`)
+
+1. Carga `newrelic`, `dotenv`, `sentry.instrument` (efectos al import).
+2. `inyectEnv()` → Doppler escribe secretos en `process.env` (ganan sobre `.env`).
+3. `getEnv()` → valida el schema zod; **fail-fast** si falta algo
+   (p. ej. `API_KEY_PEPPER` < 32 chars).
+4. `NestFactory.create` con `FastifyAdapter` (`trustProxy: true`, logger).
+5. Registra websocket, static (assets de Swagger), multipart (10 MB), CORS.
+6. Prefijo global `/v1` (excluye `docs` y `docs-json`).
+7. `setupSwagger()` → UI en `/docs`, spec en `/docs-json` (solo AdminModule).
+8. Escucha en `PORT` (default 3000) y manda `process.send('ready')` (pm2 `wait_ready`).
+9. `SIGINT`/`SIGTERM` → `app.close()` graceful.
 
 ---
 
-## 2. Methodology: TDD
+## 3. Flujo de una request (`POST /v1/chat/completions`)
 
-**Why TDD for this POC:**
-- Proxy correctness is binary — it either passes the right payload upstream or it doesn't.
-- Streaming SSE has subtle contract issues (newline framing, `[DONE]`, chunk shape) that unit tests catch cheaply.
-- Normalization logic (system message merging, role coercion) is pure-function territory — perfect for TDD.
-- Tests double as documentation for the team on how the proxy behaves.
+1. **Guards** (pre-hooks): `ApiKeyAuthGuard` valida la key y adjunta el
+   `clientId`; `RateLimitGuard` aplica RPM/TPM del cliente. Scope `chat.write`
+   requerido si el guard de scopes está activo en esa ruta.
+2. **`ChatService.completions`**:
+   - Calcula `promptHash` (hash de messages + model).
+   - Delega en `RoutingService.route(model, body, executor)`.
+   - `executor` → `callUpstream`: normaliza body (`mergeSystemMessages`),
+     aplica overrides (`maxTokens`, `stream_options.include_usage`), y llama al
+     **OpenAI SDK** con un `AbortSignal` cuyo timeout es el `timeoutMs` efectivo.
+3. **Respuesta:**
+   - `stream: false` → `ChatCompletion` completa; se extrae `usage` y se
+     registra success (DB + log estructurado).
+   - `stream: true` → se **tee** el iterable del SDK: el cliente recibe los
+     chunks en vivo (TTFT intacto) mientras una copia se acumula para capturar
+     tokens al final (uso real si llega, si no, estimador local 1 token ≈ 4 chars).
+4. **Errores:** `RoutingFailedError` (todas las posiciones fallaron) o
+   `CircuitOpenError` → se registra failure y se responde el error estructurado.
 
-### Test Layers
+---
 
-| Layer | Tool | What it covers |
+## 4. Registro de proveedores y resolución de modelos
+
+Fuente de verdad: `config/providers.json` (validado con zod en
+`provider.model.ts`). Se siembra en SQLite al primer boot y se cachea en
+`ProviderRegistryService`.
+
+```jsonc
+{
+  "providers": {
+    "nan": {
+      "apiKeyEnv": "NAN_API_KEY",          // env var de la key
+      "baseURL": "https://api.nan.builders/v1",
+      "timeoutMs": 120000,                  // override del timeout global
+      "models": { "qwen3-coder": { "real": "qwen3-coder", "maxTokens": 32768 } }
+    }
+  },
+  "aliases": {
+    "coder": ["nan/qwen3-coder", "nan/mimo-v2.5", "nan/deepseek-v4-flash"]
+  },
+  "routing": { /* knobs globales del breaker, ver §6 */ }
+}
+```
+
+`ProviderService.resolveChain(model)` devuelve la **chain ordenada** de
+`ResolvedModel[]`. Orden de resolución del string recibido:
+
+1. **Alias** (`coder`) → su chain.
+2. **`provider/model`** (`nan/qwen3-coder`) → chain de un elemento.
+3. **model key** → scan entre todos los proveedores.
+4. **`default`** → chain del alias `default` si existe.
+5. → error con la lista de aliases/modelos conocidos.
+
+El `baseURL` default es `LLM_PROVIDER_BASE_URL` (o `api.openai.com/v1`). El
+`apiKey` se lee de `process.env[apiKeyEnv]` al resolver; si falta → error al
+primer uso. `clientFor()` cachea **un cliente OpenAI por provider** (un pool de
+conexiones por upstream).
+
+---
+
+## 5. Ruteo y estrategias de balanceo
+
+`RoutingService.route` combina tres piezas:
+
+- **`ProviderService.resolveChain`** → chain (fallbacks ordenados).
+- **`pickOrder(strategy, chain, cursorNext, weights)`** (`src/routing/strategy.ts`)
+  → secuencia de índices a intentar.
+- **`CircuitBreakerService`** → decide qué posiciones se intentan (skip si el
+  circuito del provider está abierto).
+
+La estrategia es **por alias** (`PUT /admin/aliases/:id/strategy` la cambia en
+caliente; se persiste en `alias_policy`). Valores:
+
+| Estrategia | `pickOrder` produce | Estado compartido |
 |---|---|---|
-| Unit | Jest | `normalizeBody`, `mergeSystemMessages`, provider routing |
-| Integration | Jest + NestJS `TestingModule` | Controller ↔ Service wiring, mock upstream |
-| E2E | Jest + supertest | Full HTTP round-trip against a mock OpenAI server |
+| `primary` (y alias `fallback`) | chain en orden (`[0,1,2,…]`) — posición 0 primero | ninguno |
+| `round-robin` | arranca en el cursor (avanza por request) y camina hacia adelante | cursor por modelo (`RoundRobinCursor`) |
+| `weighted` | muestra un índice de arranque ponderado por `weights[i]` y camina adelante | ninguno (aleatorio por call) |
+| `priority-grouped` | ordena por (prioridad asc, posición asc) | prioridades en `alias_entries` |
+
+Durante el walk, por cada posición: si el breaker rechaza al provider →
+`attempts.push({circuitOpen:true})` y sigue; si no, ejecuta con
+`AbortSignal.timeout(timeoutMs)` bajo `breaker.execute`. Éxito → retorna.
+Fallo → intenta la siguiente. Si se agotan todas → `RoutingFailedError` con el
+detalle de `attempts`.
+
+> Los pesos (`weights`) y prioridades (`priorities`) se cambian con
+> `PUT /admin/aliases/:id/weights` y `/priorities`; ver `docs/API.md`.
 
 ---
 
-## 3. Target Architecture (v1.0)
+## 6. Circuit breaker (`src/resilience/circuit-breaker.service.ts`)
+
+Uno por **provider** (estado keyed por `providerId`), tres estados:
 
 ```
-src/
-  chat/
-    chat.controller.ts          # POST /chat/completions
-    chat.module.ts              # Feature module
-  normalization/
-    normalize.service.ts        # system merge, role fix
-    normalize.service.spec.ts   # TDD tests
-  providers/
-    provider.service.ts         # resolve model → provider, API key, baseURL
-    provider.service.spec.ts    # TDD tests
-    provider.model.ts           # types/interfaces
-  routing/
-    routing.service.ts          # fallback, round-robin, health-check
-    routing.service.spec.ts     # TDD tests
-  resilience/
-    circuit-breaker.service.ts  # per-provider circuit breaker
-    rate-limiter.service.ts     # rate limiting per API key
-  observability/
-    llm-logging.service.ts      # structured logs (prompt hash, latency, tokens)
-    llm-logging.service.spec.ts
-  config/
-    providers.json              # provider registry
-    providers.schema.ts         # Zod validation of providers.json
-  health/
-    llm-health.controller.ts    # GET /health/llm — per-provider status
+closed ──(failureThreshold fallos consecutivos)──▶ open
+open   ──(cooldownMs transcurrido)────────────────▶ half-open
+half-open ──(probe OK)────────────────────────────▶ closed
+half-open ──(probe falla)─────────────────────────▶ open
 ```
+
+Knobs (defaults en `provider.model.ts`):
+
+| Knob | Default | Significado |
+|---|---|---|
+| `failureThreshold` | 5 | Fallos consecutivos en `closed` que abren el circuito |
+| `cooldownMs` | 30 000 | Tiempo en `open` antes de permitir un probe |
+| `halfOpenProbes` | 1 | Probes concurrentes máximos en `half-open` |
+| `requestTimeoutMs` | 120 000 | Timeout efectivo por intento upstream |
+| `fallbackEnabled` | true | Habilita el walk de fallbacks |
+
+`GET /v1/health/llm` expone el snapshot por provider (`state`, `failures`,
+`canServe`) sin auth.
 
 ---
 
-## 4. Key Design Decisions
+## 7. Autenticación, autorización y rate limiting
 
-### 4.1 Provider Abstraction
+### API keys (`src/auth/`)
 
-```ts
-// provider.model.ts
-interface ProviderConfig {
-  apiKey: string;
-  baseURL: string;
-  models: Record<string, {
-    real: string;          // model name upstream
-    maxTokens?: number;    // override
-    supportsStream?: boolean;
-  }>;
-}
+- Formato `sk-` + 64 hex. En DB solo vive el hash
+  `HMAC-SHA256(API_KEY_PEPPER, plaintext)` (ver `docs/API-KEYS.md`).
+- `ApiKeyAuthGuard`: lee `Authorization: Bearer` (o `X-API-Key`), extrae el
+  prefix (8 chars) → lookup en **Redis** (`ak:v1:<prefix>:<sha256>`, TTL 5 min)
+  o fallback a SQLite (`clients`). Verifica con timing-safe. Adjunta `clientId`.
+- `RequireScopesGuard` + `@RequireScopes('admin')`: las rutas admin exigen el
+  scope `admin`.
+- `ClientService`: create / rotate / revoke; `seed-default-client` crea el
+  cliente `admin` en el primer boot si la tabla está vacía.
 
-interface ResolvedModel {
-  provider: string;        // "nan" | "openai" | ...
-  config: ProviderConfig;
-  modelName: string;       // real model name
-}
-```
+### Rate limiting (`src/ratelimit/`)
 
-**Routing flow:** `client model → alias lookup → provider resolution → OpenAI SDK call`
+- `RateLimitGuard` aplica `rate_limit_rpm` (requests/min) y `rate_limit_tpm`
+  (tokens/min) del cliente autenticado.
+- `RedisRateLimiterService` (ventana deslizante en Redis); ante fallo de Redis
+  **fail-open** (nunca bloquea tráfico legítimo). Los tests usan un fake en
+  memoria con la misma interfaz.
 
-All providers must be OpenAI-compatible (the SDK enforces the protocol).
+---
 
-### 4.2 Normalization Pipeline
+## 8. Persistencia (SQLite)
 
-```
-Incoming body
-  → validate (Zod schema)
-  → normalize messages (merge system, coerce roles)
-  → apply model overrides (maxTokens, etc.)
-  → forward to upstream
-```
+Conexión singleton vía `DatabaseService` (`better-sqlite3`, síncrono). Path:
+`DATABASE_PATH` (default `./data/ms-gateway.db`). Al primer boot: corre
+migraciones (`migrations/`) y siembra el registro de proveedores
+(`migrations/seeds/0001_initial_providers.json`).
 
-**Why normalize upstream instead of rejecting:**
-- Clients (Kilo, OpenCode, Claude Code) all send slightly different formats.
-- The proxy should be forgiving — absorb differences, return clean results.
+Tablas (migraciones `0001`–`0009`):
 
-### 4.3 Streaming Contract
-
-```
-Content-Type: text/event-stream
-
-data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"}}]}
-data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":" world"}}]}
-data: [DONE]
-```
-
-**Critical:** The proxy MUST forward raw OpenAI chunk objects (not a custom format). Clients parse these directly.
-
-### 4.4 Error Handling
-
-| Scenario | Behavior |
+| Tabla | Contenido |
 |---|---|
-| Upstream 4xx | Forward status + body to client |
-| Upstream timeout | 504 + structured error |
-| Upstream 5xx + fallback enabled | Retry on next provider |
-| All providers down | 503 + circuit state |
-| Invalid client request | 400 + Zod validation errors |
+| `providers` | `id`, `api_key_env`, `base_url`, `timeout_ms` |
+| `model_configs` | `real`, `max_tokens`, `supports_stream` por modelo |
+| `alias_policy` | estrategia por alias (`primary`/`round-robin`/`weighted`/`priority-grouped`/`fallback`) |
+| `alias_entries` | posiciones de la chain + `weight` y `priority` por posición |
+| `alias_weights` | pesos por posición (estrategia `weighted`) |
+| `routing_policy` | knobs globales del breaker/fallback |
+| `clients` | `id`, `name`, `api_key_hash`, `api_key_prefix`, `scopes`, `rate_limit_rpm`, `rate_limit_tpm`, `revoked_at`, `last_used_at` |
+| `request_logs` | `requested_at`, `client_key`, `model_requested`, `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens` (+ índices en `0009`) |
+
+> El gateway registra en la tabla **después** de responder: `request_logs`
+> documenta lo que pasó; no bloquea la respuesta. Con la réplica única actual
+> alcanza SQLite; si escala, la tabla pasa a Postgres sin cambiar la forma de
+> la respuesta (`GET /admin/logs`).
 
 ---
 
-## 5. Implementation Roadmap
+## 9. Observabilidad
 
-### Phase 1 — POC Hardening (this sprint)
+| Capa | Mecanismo |
+|---|---|
+| Logs de proceso | Nest logger / Pino vía Fastify (`bufferLogs`), formato JSON (`AppJsonLogger`) |
+| Logs estructurados de LLM | `LlmLoggingService` — evento `chat.request` a stdout: model, resolvedProvider, promptHash, latency, tokens, status, clientKey |
+| Request logs persistidos | `request_logs` (SQLite) — consultables por `GET /admin/logs` |
+| Métricas agregadas | `GET /v1/metrics/summary` (ventana 1h/24h/7d, por alias) — `MetricsService` |
+| Health | `GET /v1/health` (memoria), `GET /v1/health/llm` (circuit breakers) |
+| APM / errores | NewRelic (import en `main.ts`) + Sentry (`sentry.instrument.ts`, `APP_FILTER`) |
 
-- [ ] Move hardcoded env vars to Doppler/Dotenv
-- [ ] Add Zod validation for incoming body
-- [ ] Add unit tests for `normalizeMessages`
-- [ ] Add unit tests for `completions` (stream + non-stream) with mock OpenAI client
-- [ ] Register `ProxyService` in `ChatModule` (feature module extraction)
-
-### Phase 2 — Multi-Provider
-
-- [ ] Implement `ProviderService` consuming `config/providers.json`
-- [ ] Model alias resolution (`fast` → `openai/gpt-4o-mini`)
-- [ ] `ProviderConfig` schema validation (Zod)
-- [ ] Unit tests for routing logic
-
-### Phase 3 — Resilience
-
-- [ ] Per-provider circuit breaker (closed/open/half-open)
-- [ ] Fallback routing: primary fails → try next provider
-- [ ] Configurable timeouts per provider
-- [ ] Health check endpoint per provider
-
-### Phase 4 — Observability
-
-- [ ] Structured logging: prompt hash, model, latency, token counts
-- [ ] Metrics: request count, error rate, latency p50/p95/p99 per model
-- [ ] Dashboard-ready OpenTelemetry traces
-
-### Phase 5 — Production
-
-- [ ] API key management (per-client, rotation)
-- [ ] Rate limiting (per API key, per model)
-- [ ] Request/response caching (for identical non-streaming calls)
-- [ ] Load testing with k6/artillery
+**Privilegios de visibilidad:** la superficie pública (`/v1/models`,
+`/v1/metrics/summary`) solo expone **aliases**. `GET /admin/logs` expone
+`resolvedProvider` / `resolvedModel` (identidad real upstream) — gated por el
+scope `admin`.
 
 ---
 
-## 6. Open Questions
+## 10. Superficie admin y Swagger
 
-| # | Question | Options | Decision |
-|---|---|---|---|
-| 1 | Feature module naming? | `chat` vs `llm` vs `openai` | **TBD** |
-| 2 | Where to store provider config? | `config/providers.json` vs DB vs Doppler | **TBD** |
-| 3 | Auth strategy? | Bearer token passthrough vs proxy API keys vs mTLS | **TBD** |
-| 4 | Caching? | Redis (already in deps) vs in-memory LRU | **TBD** |
-| 5 | Tool/function calling support? | Passthrough as-is vs structured response | **TBD** |
-| 6 | Models endpoint? | `GET /v1/models` (OpenAI compat) vs custom | **TBD** |
+- **Rutas:** `GET/POST/PATCH/DELETE /admin/clients…`, `GET/PUT
+  /admin/aliases…`, `GET /admin/logs`. Auth: key válida + scope `admin` +
+  rate limit.
+- **Swagger:** `/docs` (UI) y `/docs-json` (spec) — solo documenta el
+  AdminModule, fuera del prefijo `/v1`.
 
 ---
 
-## 7. Quick Start
+## 11. Estado actual y roadmap pendiente
 
-```bash
-# Env vars
-export LLM_PROVIDER_API_KEY="sk-..."
-export LLM_PROVIDER_BASE_URL="https://api.nan.builders/v1"
+**Hecho:** multi-proveedor, aliases, 4 estrategias de balanceo, circuit
+breaker, auth por cliente (HMAC+pepper), rotación/revocación, rate limiting
+RPM/TPM, request logs + tokens, métricas por ventana, health LLM, admin API +
+Swagger, Doppler, NewRelic/Sentry.
 
-# Run
-pnpm run start:dev
+**Pendiente / deuda técnica:**
 
-# Test (non-streaming)
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.6",
-    "messages": [{"role":"user","content":"Hola mundo"}],
-    "stream": false
-  }'
-
-# Test (streaming)
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.6",
-    "messages": [{"role":"user","content":"Hola mundo"}],
-    "stream": true
-  }'
-```
-
----
-
-## 8. Client Compatibility
-
-| Client | Protocol | Status |
-|---|---|---|
-| Kilo (OpenCode) | OpenAI-compatible streaming | ✅ Working |
-| Claude Code | OpenAI-compatible streaming | 🔍 Needs testing |
-| Continue.dev | OpenAI-compatible streaming | 🔍 Needs testing |
-| Cursor | OpenAI-compatible streaming | 🔍 Needs testing |
-| Aider | OpenAI-compatible streaming | 🔍 Needs testing |
-| Cline | OpenAI-compatible streaming | 🔍 Needs testing |
+- El controlador de aliases escribe prioridades tocando la DB directamente
+  (comentario en `admin-aliases.controller.ts`) — falta un método
+  `replacePriorities` en el repositorio.
+- `GET /admin/logs` con `?model=` / `?provider=` son scans por `requested_at`;
+  ok hasta ~5M filas.
+- Streaming: los tokens se estiman si el upstream no manda chunk de `usage`
+  (el `stream_options.include_usage` se fuerza salvo que el cliente lo desactive).
+- `API_KEY_PEPPER` y otras secrets viven en `process.env` — redacción en logs
+  y rotación de pepper a revisar para hardening.
+- No hay caché de respuestas idénticas ni paginación con cursor en `/admin/logs`.

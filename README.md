@@ -1,98 +1,191 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# ms-gateway-llm
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Gateway LLM **OpenAI-compatible** construido con **NestJS 11 + Fastify**.
+Proxy con aliases de modelos, ruteo multi-proveedor, circuit breaker,
+autenticación por cliente (API keys) y logging de requests — todo persistido en
+**SQLite** (`better-sqlite3`).
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+> ⚠️ **Estado:** POC con funcionalidad real en producción. La documentación
+> completa de API está en [`docs/API.md`](docs/API.md); gestión de API keys en
+> [`docs/API-KEYS.md`](docs/API-KEYS.md); arquitectura/roadmap en
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Qué hace
 
-## Project setup
+| Capacidad | Detalle |
+|---|---|
+| Chat completions | `POST /v1/chat/completions` — OpenAI-compatible, buffered y SSE streaming |
+| Aliases de modelos | El cliente pide `coder`; el gateway resuelve a `nan/qwen3.6`, etc. Nunca expone ids reales upstream |
+| Multi-proveedor | Registro de proveedores en SQLite (`providers`), clave por proveedor en env (`NAN_API_KEY`, …) |
+| Estrategias de balanceo | `primary`, `round-robin`, `weighted`, `priority-grouped` — configurable por alias vía API admin |
+| Circuit breaker | Por proveedor: `closed` / `open` / `half-open`; fallback a la siguiente posición de la chain |
+| API keys por cliente | Formato `sk-` + 64 hex. Hash `HMAC-SHA256(pepper, plaintext)` en DB. Scopes, rotación, revocación |
+| Rate limiting | Por cliente: `rate_limit_rpm` (requests/min) y `rate_limit_tpm` (tokens/min) |
+| Request logs | SQLite `request_logs`: prompt hash, tokens, latencia, proveedor resuelto |
+| Métricas | `GET /v1/metrics/summary` — ventana `1h/24h/7d` por alias |
+| Health | `GET /v1/health` (proceso) y `GET /v1/health/llm` (por proveedor) |
+| Admin | CRUD de clientes, política de aliases, consulta de logs — scope `admin` |
+| Swagger | UI interactiva en `/docs` (solo superficie admin), spec OpenAPI en `/docs-json` |
 
-```bash
-$ pnpm install
-```
+**Auth:** cada request requiere `Authorization: Bearer sk-…` (o `X-API-Key`).
+El cache de autenticación vive en **Redis** (TTL 5 min); si Redis cae, se cae a
+SQLite (fail-open).
 
-## Compile and run the project
+---
 
-```bash
-# development
-$ pnpm run start
-
-# watch mode
-$ pnpm run start:dev
-
-# production mode
-$ pnpm run start:prod
-```
-
-## Run tests
+## Arranque rápido
 
 ```bash
-# unit tests
-$ pnpm run test
-
-# e2e tests
-$ pnpm run test:e2e
-
-# test coverage
-$ pnpm run test:cov
+pnpm install
+cp .env.example .env            # completar las claves
+pnpm build
+pnpm start:prod                 # o pnpm start:dev para watch
 ```
 
-## Deployment
+El servicio escucha en `PORT` (default **3000**), bind `0.0.0.0`, prefijo global
+`/v1`.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+### Variables de entorno clave
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+| Variable | Requerida | Default | Descripción |
+|---|---|---|---|
+| `API_KEY_PEPPER` | **sí** | — | Pepper server-side (≥32 chars) para hashear API keys. `openssl rand -hex 32`. Idéntica en gateway y CLI admin. |
+| `DATABASE_PATH` | no | `./data/ms-gateway.db` | Ruta del SQLite. El primer boot crea schema y siembra el registro de proveedores. |
+| `NAN_API_KEY` | sí* | — | API key del proveedor `nan`. Cada proveedor del registro usa su propia env var. |
+| `CORS_ORIGINS` | no | `*` | Allowlist de orígenes separados por coma. |
+| `NODE_ENV` | no | `development` | Alias Doppler: `dev`/`stg`/`prd`. |
+| `MS` / `START_TOKEN` | no | — | Proyecto + PAT de Doppler para secretos (ganan sobre `.env`). |
+| `SENTRY_DSN` | no | — | Tracking de errores (opcional). |
+
+---
+
+## Probar que funciona
 
 ```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
+# Health del proceso (sin auth)
+curl -s http://localhost:3000/v1/health
+
+# Listar aliases de modelos (requiere API key)
+curl -s http://localhost:3000/v1/models -H "Authorization: Bearer sk-…"
+
+# Chat completions (requiere API key)
+curl -s http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+  -d '{"model":"coder","messages":[{"role":"user","content":"Hola"}],"stream":false}'
+
+# Métricas agregadas (sin auth)
+curl -s "http://localhost:3000/v1/metrics/summary?window=1h"
+
+# Swagger (admin)
+# navegador → http://localhost:3000/docs
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+---
 
-## Resources
+## Ver los logs (requests)
 
-Check out a few resources that may come in handy when working with NestJS:
+**`GET /admin/logs`** — admin scope requerido. Lee la tabla `request_logs` de
+SQLite (nuevos primero).
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```bash
+curl -s "http://localhost:3000/admin/logs?limit=50" \
+  -H "Authorization: Bearer sk-<key-con-scope-admin>"
 
-## Support
+# Con filtros (AND combinados)
+curl -s "http://localhost:3000/admin/logs?client_id=tenant-acme&status=error&from=2026-07-01T00:00:00Z" \
+  -H "Authorization: Bearer sk-…"
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+Filtros: `client_id`, `model` (alias), `provider`, `resolved_model`, `status`
+(`ok`/`error`/`circuit_open`), `from`/`to` (ISO-8601), `limit` (default 100,
+máx 500). Respuesta con `hasMore` para paginar. **Solo los admin ven
+`resolvedProvider` / `resolvedModel`** — la superficie pública siempre oculta
+la identidad real del upstream.
 
-## Stay in touch
+> Referencia completa: [`docs/API.md`](docs/API.md) → sección `GET /admin/logs`.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+---
 
-## License
+## Modificar la estrategia de balanceo
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+La política de ruteo es **por alias** y se cambia en caliente vía API admin
+(se persiste en SQLite; sin redeploy).
+
+```bash
+# Ver la política actual de todos los aliases
+curl -s http://localhost:3000/admin/aliases -H "Authorization: Bearer sk-…"
+
+# Cambiar la estrategia de un alias
+curl -s -X PUT http://localhost:3000/admin/aliases/coder/strategy \
+  -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+  -d '{"strategy":"weighted"}'
+
+# Poner pesos por posición (length debe == length de la chain)
+curl -s -X PUT http://localhost:3000/admin/aliases/coder/weights \
+  -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+  -d '{"weights":[1,3]}'
+
+# Prioridades por posición (mapa sparse; posiciones omitidas conservan su valor)
+curl -s -X PUT http://localhost:3000/admin/aliases/coder/priorities \
+  -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+  -d '{"priorities":{"0":5}}'
+```
+
+### Estrategias soportadas (`PUT /admin/aliases/:id/strategy`)
+
+| Valor | Comportamiento |
+|---|---|
+| `primary` | Siempre la chain en orden: posición 0 primero, las demás solo si falla (fallback) |
+| `round-robin` | Un cursor avanza una posición por request; se reparte de forma pareja |
+| `weighted` | Muestra un índice de arranque ponderado por `weights[i]` y recorre la chain desde ahí |
+| `priority-grouped` | Ordena por (prioridad asc, posición asc): los grupos de menor prioridad solo se intentan si fallan los de mayor |
+
+La decisión efectiva la toma `src/routing/strategy.ts` (`pickOrder`), con estado
+de cursor en `src/routing/round-robin-cursor.ts`. La caída de un proveedor se
+detecta con circuit breaker (ver `GET /v1/health/llm` → campo `state`).
+
+---
+
+## Gestión de API keys de cliente
+
+Las keys tienen formato `sk-` + 64 hex. Se crean con el CLI `admin:reset`, que
+**imprime el SQL a aplicar** en la DB (nunca abre la DB):
+
+```bash
+export API_KEY_PEPPER=$(openssl rand -hex 32)
+
+# Crear cliente (genera key nueva)
+pnpm admin:reset -- --create --id tenant-acme --name "Acme Co." --rpm 300
+
+# Rotar key de un cliente existente
+pnpm admin:reset -- --reset admin
+
+# Hash de una key existente (migración POC)
+pnpm admin:reset -- --reset admin --plain "sk-mi-key-existente"
+```
+
+La key plana se muestra **una sola vez**. Alternativamente, todo esto está
+expuesto en la API admin (`POST /admin/clients`, `PATCH`, `/:id/rotate`,
+`/:id/revoke`, `DELETE`). Guía completa: [`docs/API-KEYS.md`](docs/API-KEYS.md).
+
+---
+
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [`docs/API.md`](docs/API.md) | Referencia completa de endpoints (públicos + admin), auth, status codes |
+| [`docs/API-KEYS.md`](docs/API-KEYS.md) | Gestión de API keys: formato, CLI, rotación, migración |
+| [`docs/api-curls.md`](docs/api-curls.md) | Curls listos para copiar y pegar (públicos + admin). Versión ejecutable: `scripts/api-curls.sh` |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Arquitectura, decisiones de diseño y roadmap |
+
+---
+
+## Operación
+
+- **Logs de proceso:** stdout (pino/Nest logger) + NewRelic/Sentry según config.
+- **Shutdown:** señal `SIGTERM` → cierre graceful de Fastify.
+- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `src/database/migrations`; seed de proveedores al primer boot.
+- **Redis:** solo para cache de auth (TTL 5 min). Caída → fallback a SQLite.
