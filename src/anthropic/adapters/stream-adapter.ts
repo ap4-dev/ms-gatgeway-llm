@@ -2,7 +2,7 @@ import type { ChatCompletionChunk } from 'openai/resources/chat/completions';
 import type {
     AnthropicStreamEvent,
     AnthropicResponseBlock,
-    DeepSeekChatDelta,
+    ReasoningChatDelta,
 } from '../types';
 
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -67,9 +67,9 @@ export function createStreamAdapter(
         const delta = choice.delta;
         const finishReason = choice.finish_reason;
 
-        // Reasoning content (DeepSeek thinking mode) — surfaced as an
+        // Reasoning content (thinking-mode upstreams) — surfaced as an
         // Anthropic `thinking` content block with `thinking_delta` events.
-        const reasoning = (delta as DeepSeekChatDelta)?.reasoning_content;
+        const reasoning = (delta as ReasoningChatDelta)?.reasoning_content;
         if (typeof reasoning === 'string' && reasoning.length > 0) {
             if (state === 'WAITING') {
                 yield emitMessageStart();

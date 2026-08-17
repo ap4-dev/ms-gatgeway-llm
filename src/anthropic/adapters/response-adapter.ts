@@ -2,7 +2,7 @@ import type { ChatCompletion } from 'openai/resources/chat/completions';
 import type {
     AnthropicMessageResponse,
     AnthropicResponseBlock,
-    DeepSeekChatMessage,
+    ReasoningChatMessage,
 } from '../types';
 
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -23,9 +23,9 @@ export function translateResponse(
     const message = choice?.message;
     const content: AnthropicResponseBlock[] = [];
 
-    // DeepSeek reasoning models surface chain-of-thought in
+    // Reasoning models (DeepSeek, Qwen…) surface chain-of-thought in
     // `reasoning_content` — expose it as an Anthropic thinking block.
-    const reasoning = (message as DeepSeekChatMessage)?.reasoning_content;
+    const reasoning = (message as ReasoningChatMessage)?.reasoning_content;
     if (typeof reasoning === 'string' && reasoning.length > 0) {
         content.push({ type: 'thinking', thinking: reasoning, signature: '' });
     }

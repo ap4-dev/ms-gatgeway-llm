@@ -28,9 +28,10 @@ export function translateRequest(body: AnthropicMessagesBody): ChatCompletionCre
     // gateway keeps the wire format conservative — top_k is accepted and
     // ignored for Anthropic-client compatibility.
     // Extended thinking is forwarded to the OpenAI-compatible upstream.
-    // Anthropic and DeepSeek share the `{type, budget_tokens}` shape, but
+    // Anthropic and reasoning-capable upstreams (DeepSeek) share the
+    // `{type, budget_tokens}` shape, but
     // Claude Code 2.x also sends `{type: "adaptive"}` (4.6+ models) which
-    // DeepSeek doesn't understand — map it to "enabled" (reasoning on).
+    // reasoning-capable upstreams don't understand — map it to "enabled" (reasoning on).
     // Unknown types are dropped so the upstream default / the per-model
     // `disableThinking` pin applies instead of a 400.
     if (body.thinking) {
@@ -154,7 +155,8 @@ function translateMessages(
         const text = textBlocks.map((b) => b.text).join('');
         assistant.content = text || null;
 
-        // Echo prior reasoning back so DeepSeek (thinking mode) accepts the
+        // Echo prior reasoning back so reasoning upstreams (DeepSeek thinking
+        // mode) accept the
         // next turn. Empty thinking blocks are skipped.
         if (thinkingBlocks.length > 0) {
             const joined = thinkingBlocks.map((b) => b.thinking).join('');

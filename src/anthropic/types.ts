@@ -114,15 +114,15 @@ export type AnthropicStreamEvent =
 
 // --- Upstream extended wire types ---
 //
-// DeepSeek / Qwen reasoning models surface chain-of-thought in a
-// `reasoning_content` field that the OpenAI SDK types don't model.
-// Intersections keep the base OpenAI shape intact and only add the extra
-// field, so the reads below are typed (a typo fails to compile instead of
-// silently losing the CoT at runtime).
-export type DeepSeekChatMessage = ChatCompletionMessage & {
+// Reasoning models (DeepSeek, Qwen, Kimi, GLM, MiniMax…) surface
+// chain-of-thought in a `reasoning_content` field that the OpenAI SDK
+// types don't model. Intersections keep the base OpenAI shape intact and
+// only add the extra field, so the reads below are typed (a typo fails to
+// compile instead of silently losing the CoT at runtime).
+export type ReasoningChatMessage = ChatCompletionMessage & {
     reasoning_content?: string;
 };
 
-export type DeepSeekChatDelta = ChatCompletionChunk.Choice.Delta & {
+export type ReasoningChatDelta = ChatCompletionChunk.Choice.Delta & {
     reasoning_content?: string;
 };
