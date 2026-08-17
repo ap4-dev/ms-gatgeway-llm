@@ -15,6 +15,8 @@ export interface AnthropicMessagesRequest {
     top_k?: number;
     stop_sequences?: string[];
     metadata?: { user_id?: string };
+    /** Extended thinking (DeepSeek supports `{type:'enabled', budget_tokens}`). */
+    thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number };
 }
 
 export interface AnthropicMessage {
@@ -24,6 +26,7 @@ export interface AnthropicMessage {
 
 export type AnthropicContentBlock =
     | { type: 'text'; text: string }
+    | { type: 'thinking'; thinking: string; signature?: string }
     | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
     | {
           type: 'tool_result';
@@ -59,6 +62,7 @@ export interface AnthropicMessageResponse {
 
 export type AnthropicResponseBlock =
     | { type: 'text'; text: string }
+    | { type: 'thinking'; thinking: string; signature?: string }
     | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
 
 // --- Streaming event types ---
@@ -66,6 +70,11 @@ export type AnthropicResponseBlock =
 export interface TextDelta {
     type: 'text_delta';
     text: string;
+}
+
+export interface ThinkingDelta {
+    type: 'thinking_delta';
+    thinking: string;
 }
 
 export interface InputJsonDelta {
@@ -84,7 +93,7 @@ export type AnthropicStreamEvent =
     | {
           type: 'content_block_delta';
           index: number;
-          delta: TextDelta | InputJsonDelta;
+          delta: TextDelta | InputJsonDelta | ThinkingDelta;
       }
     | { type: 'content_block_stop'; index: number }
     | {

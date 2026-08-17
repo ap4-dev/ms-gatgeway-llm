@@ -27,6 +27,10 @@ export function translateRequest(body: AnthropicMessagesBody): ChatCompletionCre
     // reject unknown fields. Some upstreams (e.g. Qwen) support it, but the
     // gateway keeps the wire format conservative — top_k is accepted and
     // ignored for Anthropic-client compatibility.
+    // Extended thinking is forwarded verbatim (Anthropic and DeepSeek share
+    // the `{type, budget_tokens}` shape). `ChatService.applyResolved` honors
+    // caller-supplied `thinking` over the per-model `disableThinking` flag.
+    if (body.thinking) out.thinking = body.thinking;
     if (body.stream) out.stream = body.stream;
     if (body.metadata?.user_id) out.user = body.metadata.user_id;
 
@@ -122,6 +126,9 @@ function translateMessages(
         const textBlocks = msg.content.filter(
             (b): b is { type: 'text'; text: string } => b.type === 'text',
         );
+        const thinkingBlocks = msg.content.filter(
+            (b): b is { type: 'thinking'; thinking: string } => b.type === 'thinking',
+        );
         const toolUseBlocks = msg.content.filter(
             (b): b is Extract<AnthropicContentBlock, { type: 'tool_use' }> =>
                 b.type === 'tool_use',
@@ -131,6 +138,13 @@ function translateMessages(
 
         const text = textBlocks.map((b) => b.text).join('');
         assistant.content = text || null;
+
+        // Echo prior reasoning back so DeepSeek (thinking mode) accepts the
+        // next turn. Empty thinking blocks are skipped.
+        if (thinkingBlocks.length > 0) {
+            const joined = thinkingBlocks.map((b) => b.thinking).join('');
+            if (joined) assistant.reasoning_content = joined;
+        }
 
         if (toolUseBlocks.length > 0) {
             assistant.tool_calls = toolUseBlocks.map((tu) => ({

@@ -134,5 +134,49 @@ describe('request-adapter', () => {
 
             expect((result as any).user).toBe('u123');
         });
+
+        it('forwards thinking config verbatim', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [{ role: 'user', content: 'hi' }],
+                thinking: { type: 'enabled', budget_tokens: 2048 },
+            });
+
+            expect((result as any).thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
+        });
+
+        it('echoes assistant thinking blocks as reasoning_content', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [
+                    { role: 'user', content: '1+1?' },
+                    {
+                        role: 'assistant',
+                        content: [
+                            { type: 'thinking', thinking: 'suma simple', signature: 'sig_1' },
+                            { type: 'text', text: '2' },
+                        ],
+                    },
+                ],
+            });
+
+            const assistant = result.messages[1] as any;
+            expect(assistant.role).toBe('assistant');
+            expect(assistant.content).toBe('2');
+            expect(assistant.reasoning_content).toBe('suma simple');
+        });
+
+        it('skips empty thinking blocks when echoing', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [
+                    { role: 'user', content: 'hi' },
+                    { role: 'assistant', content: [{ type: 'thinking', thinking: '' }] },
+                ],
+            });
+
+            const assistant = result.messages[1] as any;
+            expect(assistant.reasoning_content).toBeUndefined();
+        });
     });
 });

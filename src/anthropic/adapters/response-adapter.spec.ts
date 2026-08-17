@@ -129,5 +129,45 @@ describe('response-adapter', () => {
 
             expect((result.content[0] as any).input).toEqual({});
         });
+
+        it('surfaces reasoning_content as a thinking block before text', () => {
+            const result = translateResponse(
+                makeCompletion({
+                    choices: [{
+                        index: 0,
+                        message: {
+                            role: 'assistant',
+                            content: 'ok',
+                            refusal: null,
+                            reasoning_content: 'We need answer only ok.',
+                        },
+                        finish_reason: 'stop',
+                    }],
+                } as any),
+                'm',
+            );
+
+            expect(result.content).toEqual([
+                { type: 'thinking', thinking: 'We need answer only ok.', signature: '' },
+                { type: 'text', text: 'ok' },
+            ]);
+        });
+
+        it('omits thinking block when reasoning_content is absent or empty', () => {
+            const plain = translateResponse(makeCompletion(), 'm');
+            expect(plain.content).toEqual([{ type: 'text', text: 'Hello!' }]);
+
+            const empty = translateResponse(
+                makeCompletion({
+                    choices: [{
+                        index: 0,
+                        message: { role: 'assistant', content: 'hi', refusal: null, reasoning_content: '' },
+                        finish_reason: 'stop',
+                    }],
+                } as any),
+                'm',
+            );
+            expect(empty.content).toEqual([{ type: 'text', text: 'hi' }]);
+        });
     });
 });

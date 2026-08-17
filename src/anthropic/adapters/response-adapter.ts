@@ -19,6 +19,13 @@ export function translateResponse(
     const message = choice?.message;
     const content: AnthropicResponseBlock[] = [];
 
+    // DeepSeek reasoning models surface chain-of-thought in
+    // `reasoning_content` — expose it as an Anthropic thinking block.
+    const reasoning = (message as any)?.reasoning_content;
+    if (typeof reasoning === 'string' && reasoning.length > 0) {
+        content.push({ type: 'thinking', thinking: reasoning, signature: '' });
+    }
+
     if (message?.content) {
         content.push({ type: 'text', text: message.content });
     }

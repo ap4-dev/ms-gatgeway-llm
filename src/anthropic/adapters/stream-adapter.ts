@@ -11,7 +11,7 @@ function generateMessageId(): string {
     return id;
 }
 
-type StreamState = 'WAITING' | 'IN_TEXT' | 'IN_TOOL_USE' | 'CLOSED';
+type StreamState = 'WAITING' | 'IN_THINKING' | 'IN_TEXT' | 'IN_TOOL_USE' | 'CLOSED';
 
 interface ToolCallAccumulator {
     id: string;
@@ -63,6 +63,41 @@ export function createStreamAdapter(
         const delta = choice.delta;
         const finishReason = choice.finish_reason;
 
+        // Reasoning content (DeepSeek thinking mode) — surfaced as an
+        // Anthropic `thinking` content block with `thinking_delta` events.
+        const reasoning = (delta as any)?.reasoning_content;
+        if (typeof reasoning === 'string' && reasoning.length > 0) {
+            if (state === 'WAITING') {
+                yield emitMessageStart();
+                yield emitContentBlockStart(blockIndex, {
+                    type: 'thinking',
+                    thinking: '',
+                    signature: '',
+                });
+                if (!pingSent) {
+                    yield { type: 'ping' };
+                    pingSent = true;
+                }
+                state = 'IN_THINKING';
+            } else if (state === 'IN_TEXT' || state === 'IN_TOOL_USE') {
+                yield { type: 'content_block_stop', index: blockIndex };
+                blockIndex++;
+                state = 'IN_THINKING';
+                yield emitContentBlockStart(blockIndex, {
+                    type: 'thinking',
+                    thinking: '',
+                    signature: '',
+                });
+            }
+            if (state === 'IN_THINKING') {
+                yield {
+                    type: 'content_block_delta',
+                    index: blockIndex,
+                    delta: { type: 'thinking_delta', thinking: reasoning },
+                };
+            }
+        }
+
         // Text content
         if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (state === 'WAITING') {
@@ -73,6 +108,11 @@ export function createStreamAdapter(
                     pingSent = true;
                 }
                 state = 'IN_TEXT';
+            } else if (state === 'IN_THINKING') {
+                yield { type: 'content_block_stop', index: blockIndex };
+                blockIndex++;
+                state = 'IN_TEXT';
+                yield emitContentBlockStart(blockIndex, { type: 'text', text: '' });
             }
             if (state === 'IN_TEXT') {
                 yield {
@@ -107,7 +147,7 @@ export function createStreamAdapter(
                         name: toolCalls.get(tcIdx)!.name,
                         input: {},
                     });
-                } else if (state === 'IN_TEXT') {
+                } else if (state === 'IN_TEXT' || state === 'IN_THINKING') {
                     yield { type: 'content_block_stop', index: blockIndex };
                     blockIndex++;
                     state = 'IN_TOOL_USE';
@@ -193,7 +233,7 @@ export function createStreamAdapter(
             if (finalState === 'WAITING') {
                 yield emitMessageStart();
             }
-            if (finalState === 'IN_TEXT' || finalState === 'IN_TOOL_USE') {
+            if (finalState === 'IN_TEXT' || finalState === 'IN_TOOL_USE' || finalState === 'IN_THINKING') {
                 yield { type: 'content_block_stop' as const, index: blockIndex };
             }
             yield {

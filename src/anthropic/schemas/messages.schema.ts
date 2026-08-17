@@ -5,6 +5,12 @@ const TextBlock = z.object({
     text: z.string(),
 });
 
+const ThinkingBlock = z.object({
+    type: z.literal('thinking'),
+    thinking: z.string(),
+    signature: z.string().optional(),
+});
+
 const ToolUseBlock = z.object({
     type: z.literal('tool_use'),
     id: z.string(),
@@ -30,7 +36,7 @@ const ImageBlock = z.object({
     }),
 });
 
-const ContentBlock = z.union([TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock]);
+const ContentBlock = z.union([TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock, ImageBlock]);
 
 const Message = z.object({
     role: z.string(),
@@ -62,6 +68,12 @@ export const AnthropicMessagesSchema = z.object({
     top_k: z.number().int().positive().optional(), // accepted for client compat; dropped in request-adapter (no OpenAI equivalent)
     stop_sequences: z.array(z.string()).optional(),
     metadata: z.object({ user_id: z.string().optional() }).optional(),
+    thinking: z
+        .object({
+            type: z.enum(['enabled', 'disabled']),
+            budget_tokens: z.number().int().positive().optional(),
+        })
+        .optional(),
 }).passthrough();
 
 export type AnthropicMessagesBody = z.infer<typeof AnthropicMessagesSchema>;

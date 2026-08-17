@@ -30,6 +30,20 @@ function textChunk(content: string, finishReason?: string | null): ChatCompletio
     } as ChatCompletionChunk;
 }
 
+function reasoningChunk(reasoning: string): ChatCompletionChunk {
+    return {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        created: Date.now(),
+        model: 'deepseek-v4-flash',
+        choices: [{
+            index: 0,
+            delta: { reasoning_content: reasoning, role: 'assistant' },
+            finish_reason: null,
+        }],
+    } as ChatCompletionChunk;
+}
+
 function toolCallStartChunk(id: string, name: string): ChatCompletionChunk {
     return {
         id: 'chatcmpl-1',
@@ -235,5 +249,77 @@ describe('stream-adapter', () => {
 
         const blockStarts = events.filter((e) => e.type === 'content_block_start');
         expect(blockStarts).toHaveLength(2);
+    });
+
+    it('emits thinking block for reasoning_content deltas', async () => {
+        const events = await collectEvents(
+            createStreamAdapter(
+                makeChunks([
+                    reasoningChunk('Vamos a'),
+                    reasoningChunk(' calcular.'),
+                    finishChunk('stop'),
+                ]),
+                'deepseek-v4-flash',
+            ),
+        );
+
+        const types = events.map((e) => e.type);
+        expect(types).toEqual([
+            'message_start',
+            'content_block_start',
+            'ping',
+            'content_block_delta',
+            'content_block_delta',
+            'content_block_stop',
+            'message_delta',
+            'message_stop',
+        ]);
+
+        const blockStart = events[1] as Extract<AnthropicStreamEvent, { type: 'content_block_start' }>;
+        expect(blockStart.content_block).toEqual({
+            type: 'thinking',
+            thinking: '',
+            signature: '',
+        });
+
+        const d1 = events[3] as Extract<AnthropicStreamEvent, { type: 'content_block_delta' }>;
+        expect(d1.delta).toEqual({ type: 'thinking_delta', thinking: 'Vamos a' });
+        const d2 = events[4] as Extract<AnthropicStreamEvent, { type: 'content_block_delta' }>;
+        expect(d2.delta).toEqual({ type: 'thinking_delta', thinking: ' calcular.' });
+    });
+
+    it('transitions from thinking block to text block', async () => {
+        const events = await collectEvents(
+            createStreamAdapter(
+                makeChunks([
+                    reasoningChunk('pensando'),
+                    textChunk('Hola'),
+                    finishChunk('stop'),
+                ]),
+                'deepseek-v4-flash',
+            ),
+        );
+
+        const types = events.map((e) => e.type);
+        expect(types).toEqual([
+            'message_start',
+            'content_block_start',
+            'ping',
+            'content_block_delta',
+            'content_block_stop',
+            'content_block_start',
+            'content_block_delta',
+            'content_block_stop',
+            'message_delta',
+            'message_stop',
+        ]);
+
+        const thinkingBlock = events[1] as Extract<AnthropicStreamEvent, { type: 'content_block_start' }>;
+        expect(thinkingBlock.content_block.type).toBe('thinking');
+        const textBlock = events[5] as Extract<AnthropicStreamEvent, { type: 'content_block_start' }>;
+        expect(textBlock.content_block).toEqual({ type: 'text', text: '' });
+        expect((events[4] as any).type).toBe('content_block_stop');
+        const textDelta = events[6] as Extract<AnthropicStreamEvent, { type: 'content_block_delta' }>;
+        expect(textDelta.delta).toEqual({ type: 'text_delta', text: 'Hola' });
     });
 });
