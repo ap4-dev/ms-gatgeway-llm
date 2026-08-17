@@ -15,6 +15,10 @@ lerna-debug.log*
 # OS
 .DS_Store
 
+# agent tooling (may contain secrets in allow-lists)
+/.commandcode
+/.pi
+
 # Tests
 /coverage
 /.nyc_output

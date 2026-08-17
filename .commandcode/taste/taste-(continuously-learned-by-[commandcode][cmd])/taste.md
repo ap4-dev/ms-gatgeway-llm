@@ -10,3 +10,17 @@
 - Performance-conscious: concerned about CPU-blocking operations (e.g., scryptSync per request) and seeks optimizations. Confidence: 0.8
 - Thinks about scaling and production readiness during POC stage (capacity planning for multiple developers). Confidence: 0.8
 - Interested in pragmatic trade-offs (e.g., plaintext keys vs. security overhead). Confidence: 0.7
+- Uses git commit review as part of development workflow — asks assistant to review recent commits and give architectural opinions. Confidence: 0.8
+- Seeks architectural validation: wants confirmation that design decisions (module separation, naming, provider patterns) are sound, not just that code compiles. Confidence: 0.8
+- Workflow: uses AI agents to implement code improvements, then does personal visual inspection and E2E testing, then requests a formal technical review ("OK técnico") as a gate before deploying to production. Confidence: 0.9
+- Expects a structured production readiness review covering: migration safety, error handling, module boundaries, stale references, test pass rate, and clean build — not just a cursory glance. Confidence: 0.8
+- Prefers full API-level compatibility when expanding service boundaries (e.g., chose full Anthropic Messages endpoint over partial MCP or tool-only integrations). Confidence: 0.8
+- Prefers standard protocol behavior over custom/proprietary implementations — agreed with returning tool_use blocks to the client (standard Anthropic behavior) rather than auto-executing server-side. Confidence: 0.7
+- Prefers translation/adapter layers at API boundaries that leave core services untouched — new protocol support should be an isolated module that translates and delegates, not modify existing ChatService/RoutingService. Confidence: 0.8
+- Proactively standardizes new code to match established patterns across controllers/modules — manually refactors for consistency before asking for review. Confidence: 0.8
+- Workflow: expects explore → plan → implement pattern — explore agents to understand the codebase, then a detailed plan document, then step-by-step implementation with verification at each step. Confidence: 0.7
+- Uses Claude Code as a client connected to their own LLM gateway — expects custom model aliases ("coder", "code", "deep") to work transparently across all clients, including those that do client-side model validation. Confidence: 0.9
+- Workflow: manages multiple Claude Code backend configurations via shell functions that set environment variables (ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, etc.) to switch between providers (DeepSeek, own gateway). Confidence: 0.9
+- Reports issues by pasting raw server JSON logs directly — expects the assistant to parse and diagnose from log output, not by describing symptoms verbally. Confidence: 0.9
+- Prefers permissive/flexible validation schemas in API gateways (e.g., `z.string()` over `z.enum(...)`) to handle evolving client payloads gracefully, rather than rejecting unknown fields eagerly. Confidence: 0.8
+- Uses structured Claude Code configuration with global (`~/.claude/CLAUDE.md`) and project-level (`./CLAUDE.md`) instruction files, including RTK (Rust Token Killer) for token optimization. Confidence: 0.9

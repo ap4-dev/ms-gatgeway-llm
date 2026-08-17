@@ -13,6 +13,7 @@ import { ChatModule } from './chat/chat.module';
 import { SearchModule } from './search/search.module';
 import { McpModule } from './mcp/mcp.module';
 import { ToolsModule } from './tools/tools.module';
+import { AnthropicModule } from './anthropic/anthropic.module';
 import { HealthModule } from './health/health.module';
 import { AdminModule } from './admin/admin.module';
 import { CoreModule } from './config/core.module';
@@ -21,7 +22,7 @@ import { CoreModule } from './config/core.module';
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
         SentryModule.forRoot(), CoreModule, RedisModule,
-        ChatModule, HealthModule, AdminModule, SearchModule, McpModule, ToolsModule,
+        ChatModule, HealthModule, AdminModule, SearchModule, McpModule, ToolsModule, AnthropicModule,
     ],
     controllers: [AppController],
     providers: [

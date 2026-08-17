@@ -37,7 +37,7 @@ export class LlmLoggingService {
 }
 
 export interface RequestLogEvent {
-    /** `chat.request` from ChatService; `search.request` from SearchService. */
+    /** `chat.request` from ChatService; `search.request` from SearchService. (AnthropicService delegates to ChatService, so its calls log as `chat.request`.) */
     event: 'chat.request' | 'search.request';
     /** Unix-seconds timestamp captured at the start of ChatService.completions. */
     ts: number;
