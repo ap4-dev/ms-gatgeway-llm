@@ -15,8 +15,8 @@ export interface AnthropicMessagesRequest {
     top_k?: number;
     stop_sequences?: string[];
     metadata?: { user_id?: string };
-    /** Extended thinking (DeepSeek supports `{type:'enabled', budget_tokens}`). */
-    thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number };
+    /** Extended thinking. `adaptive` = Claude 4.6+ style, mapped to `enabled` upstream. */
+    thinking?: { type: string; budget_tokens?: number; [key: string]: unknown };
 }
 
 export interface AnthropicMessage {

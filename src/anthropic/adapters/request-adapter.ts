@@ -27,10 +27,25 @@ export function translateRequest(body: AnthropicMessagesBody): ChatCompletionCre
     // reject unknown fields. Some upstreams (e.g. Qwen) support it, but the
     // gateway keeps the wire format conservative — top_k is accepted and
     // ignored for Anthropic-client compatibility.
-    // Extended thinking is forwarded verbatim (Anthropic and DeepSeek share
-    // the `{type, budget_tokens}` shape). `ChatService.applyResolved` honors
-    // caller-supplied `thinking` over the per-model `disableThinking` flag.
-    if (body.thinking) out.thinking = body.thinking;
+    // Extended thinking is forwarded to the OpenAI-compatible upstream.
+    // Anthropic and DeepSeek share the `{type, budget_tokens}` shape, but
+    // Claude Code 2.x also sends `{type: "adaptive"}` (4.6+ models) which
+    // DeepSeek doesn't understand — map it to "enabled" (reasoning on).
+    // Unknown types are dropped so the upstream default / the per-model
+    // `disableThinking` pin applies instead of a 400.
+    if (body.thinking) {
+        const t = body.thinking.type;
+        if (t === 'enabled' || t === 'adaptive') {
+            out.thinking = {
+                type: 'enabled',
+                ...(typeof body.thinking.budget_tokens === 'number'
+                    ? { budget_tokens: body.thinking.budget_tokens }
+                    : {}),
+            };
+        } else if (t === 'disabled') {
+            out.thinking = { type: 'disabled' };
+        }
+    }
     if (body.stream) out.stream = body.stream;
     if (body.metadata?.user_id) out.user = body.metadata.user_id;
 

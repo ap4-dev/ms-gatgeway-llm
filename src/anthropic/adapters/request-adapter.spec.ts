@@ -145,6 +145,36 @@ describe('request-adapter', () => {
             expect((result as any).thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
         });
 
+        it('maps adaptive thinking to enabled (Claude 4.6+ style)', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [{ role: 'user', content: 'hi' }],
+                thinking: { type: 'adaptive' },
+            });
+
+            expect((result as any).thinking).toEqual({ type: 'enabled' });
+        });
+
+        it('forwards disabled thinking verbatim', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [{ role: 'user', content: 'hi' }],
+                thinking: { type: 'disabled' },
+            });
+
+            expect((result as any).thinking).toEqual({ type: 'disabled' });
+        });
+
+        it('drops unknown thinking types instead of forwarding', () => {
+            const result = translateRequest({
+                model: 'm', max_tokens: 100,
+                messages: [{ role: 'user', content: 'hi' }],
+                thinking: { type: 'auto' },
+            });
+
+            expect((result as any).thinking).toBeUndefined();
+        });
+
         it('echoes assistant thinking blocks as reasoning_content', () => {
             const result = translateRequest({
                 model: 'm', max_tokens: 100,

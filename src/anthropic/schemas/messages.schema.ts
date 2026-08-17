@@ -70,9 +70,13 @@ export const AnthropicMessagesSchema = z.object({
     metadata: z.object({ user_id: z.string().optional() }).optional(),
     thinking: z
         .object({
-            type: z.enum(['enabled', 'disabled']),
+            // Permissive on purpose: Claude Code 2.x sends "adaptive" for
+            // 4.6+ models; unknown future values must not 400 the client.
+            // request-adapter maps known values and drops unknown ones.
+            type: z.string(),
             budget_tokens: z.number().int().positive().optional(),
         })
+        .passthrough()
         .optional(),
 }).passthrough();
 
