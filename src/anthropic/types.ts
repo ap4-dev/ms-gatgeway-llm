@@ -1,5 +1,10 @@
 // Anthropic Messages API types
 
+import type {
+    ChatCompletionMessage,
+    ChatCompletionChunk,
+} from 'openai/resources/chat/completions';
+
 // --- Request types ---
 
 export interface AnthropicMessagesRequest {
@@ -106,3 +111,18 @@ export type AnthropicStreamEvent =
       }
     | { type: 'message_stop' }
     | { type: 'error'; error: { type: string; message: string } };
+
+// --- Upstream extended wire types ---
+//
+// DeepSeek / Qwen reasoning models surface chain-of-thought in a
+// `reasoning_content` field that the OpenAI SDK types don't model.
+// Intersections keep the base OpenAI shape intact and only add the extra
+// field, so the reads below are typed (a typo fails to compile instead of
+// silently losing the CoT at runtime).
+export type DeepSeekChatMessage = ChatCompletionMessage & {
+    reasoning_content?: string;
+};
+
+export type DeepSeekChatDelta = ChatCompletionChunk.Choice.Delta & {
+    reasoning_content?: string;
+};
