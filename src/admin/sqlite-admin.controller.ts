@@ -248,7 +248,7 @@ export class SQLiteAdminController {
         return { tables: withCounts };
     }
 
-    /** Execute read-only SQL */
+    /** Execute SQL */
     @Post('query')
     @UseGuards(ApiKeyAuthGuard, RequireScopesGuard)
     @RequireScopes('admin')
@@ -258,11 +258,6 @@ export class SQLiteAdminController {
 
         const t0 = Date.now();
         try {
-            const upper = sql.toUpperCase();
-            if (/^\s*(DELETE|UPDATE|DROP|ALTER|CREATE|ATTACH|DETACH|REINDEX|VACUUM|PRAGMA|BEGIN|COMMIT|ROLLBACK|INSERT)/.test(upper)) {
-                return { rows: [], columns: [], duration: Date.now() - t0, error: 'read-only access (writes blocked)' };
-            }
-
             const stmt = this.dbService.db.prepare(sql);
             const rows = stmt.all() as Record<string, unknown>[];
             const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
@@ -294,6 +289,6 @@ export class SQLiteAdminController {
             "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).get() as { c: number };
 
-        return { file: fname, size, count: count.c, scope: 'read-only' };
+        return { file: fname, size, count: count.c, scope: 'admin' };
     }
 }

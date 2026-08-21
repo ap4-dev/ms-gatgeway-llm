@@ -24,3 +24,5 @@
 - Reports issues by pasting raw server JSON logs directly — expects the assistant to parse and diagnose from log output, not by describing symptoms verbally. Confidence: 0.9
 - Prefers permissive/flexible validation schemas in API gateways (e.g., `z.string()` over `z.enum(...)`) to handle evolving client payloads gracefully, rather than rejecting unknown fields eagerly. Confidence: 0.8
 - Uses structured Claude Code configuration with global (`~/.claude/CLAUDE.md`) and project-level (`./CLAUDE.md`) instruction files, including RTK (Rust Token Killer) for token optimization. Confidence: 0.9
+- Questions and removes redundant security layers — prefers a single strong gate (e.g., scope-based auth) over stacking additional restrictions that block legitimate admin operations. Confidence: 0.8
+- Workflow: when removing or changing code, expects the assistant to check whether existing tests validate the modified behavior before proceeding. Confidence: 0.8
