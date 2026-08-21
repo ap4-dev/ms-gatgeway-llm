@@ -259,9 +259,17 @@ export class SQLiteAdminController {
         const t0 = Date.now();
         try {
             const stmt = this.dbService.db.prepare(sql);
-            const rows = stmt.all() as Record<string, unknown>[];
-            const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
-            return { rows, columns, duration: Date.now() - t0 };
+            if (stmt.reader) {
+                const rows = stmt.all() as Record<string, unknown>[];
+                const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+                return { rows, columns, duration: Date.now() - t0 };
+            }
+            const result = stmt.run();
+            return {
+                rows: [{ changes: result.changes, lastInsertRowid: result.lastInsertRowid }],
+                columns: ['changes', 'lastInsertRowid'],
+                duration: Date.now() - t0,
+            };
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             return { rows: [], columns: [], error: msg };
