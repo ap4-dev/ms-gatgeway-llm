@@ -26,3 +26,5 @@
 - Uses structured Claude Code configuration with global (`~/.claude/CLAUDE.md`) and project-level (`./CLAUDE.md`) instruction files, including RTK (Rust Token Killer) for token optimization. Confidence: 0.9
 - Questions and removes redundant security layers — prefers a single strong gate (e.g., scope-based auth) over stacking additional restrictions that block legitimate admin operations. Confidence: 0.8
 - Workflow: when removing or changing code, expects the assistant to check whether existing tests validate the modified behavior before proceeding. Confidence: 0.8
+- Prefers GUI/interactive forms over raw SQL for routine database operations — avoids repetitive manual SQL for CRUD tasks. Confidence: 0.8
+- Expects list/table views to be clickable drill-downs that pre-populate the corresponding edit form with the selected row's data — no manual re-typing. Confidence: 0.8
