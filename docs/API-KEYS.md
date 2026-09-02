@@ -34,6 +34,59 @@ openssl rand -hex 32
 
 ---
 
+## Primer cliente (auto-seed del primer boot)
+
+La tabla `clients` partiendo vacía hace que el gateway **cree un cliente `admin`
+automáticamente al primer arranque** (`DatabaseModule` → `FIRST_BOOT_PROVISIONING`
+→ `ensureDefaultAdminClient`):
+
+```bash
+pnpm start:dev        # o: pnpm start:prod
+```
+
+Busca en stdout:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ First-boot: created default admin client                       │
+│   client id : admin                                            │
+│   key prefix: sk-xxxxxx…  (for log correlation)                │
+│   rate limit: 60 rpm                                           │
+│   API key (save now — never shown again):                      │
+│     sk-a1b2c3...                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+- El cliente se crea con scopes `admin,chat.read,chat.write` y rpm 60.
+- La key plana se imprime **una sola vez** — si la pierdes, rótala (ver más abajo).
+- Si la tabla ya tiene filas, el arranque es no-op (no imprime nada).
+
+## Vía HTTP (API de administración)
+
+Con una key con scope `admin` puedes gestionar clientes sin tocar la DB:
+
+```bash
+# crear cliente
+curl -X POST http://localhost:3000/admin/clients \
+  -H "Authorization: Bearer sk-key-admin" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"dayana","name":"Dayana","scopes":["chat.read","chat.write"],"rateLimitRpm":60}'
+
+# rotar key (devuelve la key plana una vez)
+curl -X POST http://localhost:3000/admin/clients/dayana/rotate \
+  -H "Authorization: Bearer sk-key-admin"
+
+# listar clientes
+curl http://localhost:3000/admin/clients -H "Authorization: Bearer sk-key-admin"
+
+# ver uno, actualizar (PATCH), revocar (POST :id/revoke), borrar (DELETE :id)
+```
+
+Endpoint: `@Controller('admin/clients')` (`src/admin/admin-clients.controller.ts`),
+protegido por `RequireScopesGuard` (scope `admin`).
+
+---
+
 ## Crear una nueva API Key
 
 ### Opción A: Generar key nueva + hash (recomendado)
@@ -89,8 +142,11 @@ pnpm admin:reset -- --reset admin --plain "sk-mi-key-existente"
 
 ## Aplicar el SQL en la DB
 
+> ⚠️ Ruta real según tu `.env`: `DATABASE_PATH` (la BD de dev en este repo es
+> `data/gateway.db`, no la del default del schema).
+
 ```bash
-sqlite3 data/ms-gateway.db
+sqlite3 data/gateway.db    # o la que diga tu .env DATABASE_PATH
 ```
 
 Pega el SQL generado por el script y presiona Enter. Para verificar:

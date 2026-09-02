@@ -218,16 +218,33 @@ export class ChatService {
                 error: err,
                 attemptDetails: details,
             });
+            // Best-effort attribution for the structured log: instead of the
+            // unhelpful "All N provider(s) failed", surface the provider /
+            // upstream model / real error of the first attempt that actually
+            // hit the wire (non-circuit). Falls back to the last attempt
+            // when every entry was skipped by the breaker.
+            const hitWire =
+                err.attempts.find((a) => !a.ok && !a.circuitOpen) ??
+                err.attempts.at(-1);
+            const hitWireError = (hitWire as { error?: unknown } | undefined)
+                ?.error;
+            const errorMessage =
+                hitWireError instanceof Error
+                    ? `${hitWireError.name}: ${hitWireError.message}`
+                    : typeof hitWireError === 'string'
+                      ? hitWireError
+                      : err.message;
             this.structuredLog.logRequest(
                 buildEvent({
                     ...argsBase,
                     body: { model: err.requestedModel } as any,
-                    resolvedProvider: null,
-                    resolvedModel: null,
+                    resolvedProvider: hitWire?.providerId ?? null,
+                    resolvedModel: hitWire?.upstreamModel ?? null,
                     attempts: err.attempts.length,
                     status: chooseStatusForFailure(err),
                     tokens: undefined,
-                    errorMessage: err.message,
+                    errorMessage,
+                    attemptDetails: details,
                 }),
             );
             return;
@@ -604,6 +621,7 @@ interface BuildEventArgs {
         | { promptTokens: number; completionTokens: number; totalTokens: number }
         | undefined;
     errorMessage?: string;
+    attemptDetails?: string | null;
     clientKey: string | null;
 }
 
@@ -626,6 +644,7 @@ function buildEvent(a: BuildEventArgs): RequestLogEvent {
               }
             : {}),
         ...(a.errorMessage ? { error: a.errorMessage } : {}),
+        ...(a.attemptDetails ? { attemptDetails: a.attemptDetails } : {}),
         ...(a.clientKey ? { clientKey: a.clientKey } : {}),
     };
 }

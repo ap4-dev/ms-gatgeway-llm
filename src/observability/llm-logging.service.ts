@@ -52,5 +52,7 @@ export interface RequestLogEvent {
     totalTokens?: number;
     status: 'ok' | 'error' | 'circuit_open';
     error?: string;
+    /** Serialized per-attempt failures from a RoutingFailedError (`serializeAttempts`). */
+    attemptDetails?: string;
     clientKey?: string;
 }
