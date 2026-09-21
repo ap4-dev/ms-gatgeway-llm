@@ -1,0 +1,7 @@
+allowBuilds:
+  '@newrelic/fn-inspect': true
+  '@newrelic/native-metrics': true
+  '@scarf/scarf': true
+  better-sqlite3: true
+  protobufjs: true
+  unrs-resolver: true
