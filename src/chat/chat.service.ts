@@ -82,6 +82,7 @@ export class ChatService {
             this.recordFailedAttempts(
                 requestedAt,
                 body.model,
+                body,
                 r.attempts,
                 promptHash,
                 clientId,
@@ -209,6 +210,9 @@ export class ChatService {
             promptHash,
             clientKey: clientId,
         };
+        // Diagnostic snapshot of the outbound request (scalar params plus a
+        // truncated first user message). Failed rows only — never on success.
+        const requestParams = serializeRequestParams(body);
         if (err instanceof RoutingFailedError) {
             const details = serializeAttempts(err.attempts);
             this.requestLog.recordFailure({
@@ -217,6 +221,7 @@ export class ChatService {
                 attempts: err.attempts.length,
                 error: err,
                 attemptDetails: details,
+                requestParams,
             });
             // Best-effort attribution for the structured log: instead of the
             // unhelpful "All N provider(s) failed", surface the provider /
@@ -254,6 +259,7 @@ export class ChatService {
             requestedModel: body.model,
             attempts: 0,
             error: err,
+            requestParams,
         });
         this.structuredLog.logRequest(
             buildEvent({
@@ -278,11 +284,13 @@ export class ChatService {
     private recordFailedAttempts(
         requestedAt: number,
         model: string,
+        body: ChatCompletionCreateParams,
         attempts: RouteAttempt[],
         promptHash: string,
         clientId: string | null,
     ): void {
         const totalAttempts = attempts.length;
+        const requestParams = serializeRequestParams(body);
         for (let i = 0; i < attempts.length; i++) {
             const a = attempts[i];
             if (a.ok) continue;
@@ -305,6 +313,7 @@ export class ChatService {
                 promptHash,
                 attemptIndex: i,
                 totalAttempts,
+                requestParams,
             });
         }
     }
@@ -399,7 +408,10 @@ export class ChatService {
         if (body.stream && !('stream_options' in body)) {
             (result as any).stream_options = { include_usage: true };
         }
-        return result;
+        // Clamp the final `max_tokens` (caller-supplied or override) to
+        // the upstream ceiling: nan rejects anything above 131072 with a
+        // hard 400, which then burns fallback attempts for nothing.
+        return clampMaxTokens(result) as ChatCompletionCreateParams;
     }
 }
 
@@ -407,6 +419,99 @@ export class ChatService {
 // Pure helpers — exported separately so unit tests can exercise them
 // without spinning up Nest DI.
 // ---------------------------------------------------------------------------
+
+/**
+ * Hard ceiling for `max_tokens` accepted by the nan upstream (family of
+ * OpenAI-compatible models that reject with 400 "Range of max_tokens
+ * should be [1, 131072]"). Requests above it are clamped instead of
+ * letting the upstream fail — a clamped answer is strictly better than
+ * a hard error for the caller, and it keeps fallback chains from burning
+ * retries on a deterministic 400.
+ */
+export const MAX_TOKENS_CEILING = 131_072;
+
+/**
+ * Clamp `max_tokens` to {@link MAX_TOKENS_CEILING} when it exceeds the
+ * upstream range. Covers both caller-supplied values and per-model
+ * overrides injected by {@link ChatService.applyResolved}. Immutable:
+ * returns the same object when nothing needs clamping.
+ */
+export function clampMaxTokens<T extends { max_tokens?: number }>(body: T): T {
+    if (
+        typeof body.max_tokens === 'number' &&
+        body.max_tokens > MAX_TOKENS_CEILING
+    ) {
+        return { ...body, max_tokens: MAX_TOKENS_CEILING };
+    }
+    return body;
+}
+
+/**
+ * Maximum characters captured from the first user message in the diagnostic
+ * `request_params` snapshot. Anything longer is truncated with an ellipsis so
+ * a failure row never carries the full prompt.
+ */
+export const REQUEST_PARAMS_SNIPPET_CHARS = 200;
+
+/** Hard ceiling for the serialized `request_params` snapshot. */
+const REQUEST_PARAMS_MAX_CHARS = 2048;
+
+/**
+ * Build the diagnostic `request_params` snapshot persisted on failed rows.
+ *
+ * Keeps every top-level request field except `messages` — the full
+ * conversation is never stored — and appends a truncated first user message
+ * so an upstream 400 can be traced without retaining the thread. Returns
+ * `null` when the body is not a usable object, when the snapshot cannot be
+ * capped to a useful size, or when serialization fails.
+ */
+export function serializeRequestParams(body: unknown): string | null {
+    if (body === null || typeof body !== 'object') return null;
+    const source = body as Record<string, unknown>;
+    try {
+        const params: Record<string, unknown> = {};
+        for (const key of Object.keys(source)) {
+            if (key === 'messages') continue;
+            params[key] = source[key];
+        }
+        const firstUser = firstUserMessage(source.messages);
+        if (firstUser) {
+            const text = extractText(firstUser.content);
+            params.first_user_message =
+                text.length > REQUEST_PARAMS_SNIPPET_CHARS
+                    ? `${text.slice(0, REQUEST_PARAMS_SNIPPET_CHARS)}\u2026`
+                    : text;
+        }
+        let json = JSON.stringify(params);
+        if (json.length > REQUEST_PARAMS_MAX_CHARS) {
+            delete params.first_user_message;
+            json = JSON.stringify(params);
+        }
+        if (json.length > REQUEST_PARAMS_MAX_CHARS) {
+            const core: Record<string, unknown> = {};
+            for (const key of ['model', 'max_tokens', 'temperature', 'stream']) {
+                if (key in source && source[key] !== undefined) {
+                    core[key] = source[key];
+                }
+            }
+            return Object.keys(core).length > 0 ? JSON.stringify(core) : null;
+        }
+        return json;
+    } catch {
+        return null;
+    }
+}
+
+/** First message with `role === 'user'`, or undefined when none exists. */
+function firstUserMessage(messages: unknown): ChatMessage | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    return messages.find(
+        (m) =>
+            m !== null &&
+            typeof m === 'object' &&
+            (m as ChatMessage).role === 'user',
+    ) as ChatMessage | undefined;
+}
 
 function nowSeconds(): number {
     return Math.floor(Date.now() / 1000);

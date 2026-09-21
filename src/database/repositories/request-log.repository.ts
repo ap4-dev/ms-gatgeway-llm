@@ -28,6 +28,12 @@ export interface RequestLogRow {
      * fallback chain had >1 attempt.
      */
     attemptDetails?: string | null;
+    /**
+     * Diagnostic snapshot of the outbound request (scalar params plus a
+     * truncated first user message) for failure debugging. Populated only
+     * for failed rows; see migration 0013.
+     */
+    requestParams?: string | null;
 }
 
 /** Filter options for `RequestLogRepository.list`. All fields are AND-combined. */
@@ -71,8 +77,8 @@ export class RequestLogRepository {
                 requested_at, model_requested, resolved_provider, resolved_model,
                 attempts, latency_ms, status, error, client_key,
                 prompt_hash, prompt_tokens, completion_tokens, total_tokens,
-                attempt_details
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                attempt_details, request_params
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.recentStmt = this.db.prepare(
             'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens, attempt_details FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
@@ -95,6 +101,7 @@ export class RequestLogRepository {
             row.completionTokens ?? null,
             row.totalTokens ?? null,
             row.attemptDetails ?? null,
+            row.requestParams ?? null,
         );
         return Number(info.lastInsertRowid);
     }
@@ -181,7 +188,7 @@ export class RequestLogRepository {
             SELECT id, requested_at, model_requested, resolved_provider,
                    resolved_model, attempts, latency_ms, status, error,
                    client_key, prompt_hash, prompt_tokens, completion_tokens,
-                   total_tokens, attempt_details
+                   total_tokens, attempt_details, request_params
             FROM request_logs
             ${whereClause}
             ORDER BY requested_at DESC, id DESC
@@ -203,6 +210,7 @@ export class RequestLogRepository {
             completion_tokens: number | null;
             total_tokens: number | null;
             attempt_details: string | null;
+            request_params: string | null;
         }>;
         const hasMore = rows.length > opts.limit;
         const items = hasMore ? rows.slice(0, opts.limit) : rows;
@@ -226,6 +234,7 @@ function toRow(r: {
     completion_tokens: number | null;
     total_tokens: number | null;
     attempt_details: string | null;
+    request_params: string | null;
 }): RequestLogRow {
     return {
         requestedAt: r.requested_at,
@@ -242,5 +251,6 @@ function toRow(r: {
         completionTokens: r.completion_tokens,
         totalTokens: r.total_tokens,
         attemptDetails: r.attempt_details,
+        requestParams: r.request_params,
     };
 }

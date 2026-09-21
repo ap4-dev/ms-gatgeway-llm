@@ -31,6 +31,11 @@ export interface RecordFailureArgs {
     clientKey?: string | null;
     promptHash?: string;
     attemptDetails?: string | null;
+    /**
+     * Diagnostic snapshot of the outbound request (scalar params plus a
+     * truncated first user message). Populated only for failed rows.
+     */
+    requestParams?: string | null;
 }
 
 /**
@@ -93,6 +98,7 @@ export class RequestLogService {
             clientKey: args.clientKey ?? null,
             promptHash: args.promptHash ?? null,
             attemptDetails: args.attemptDetails ?? null,
+            requestParams: args.requestParams ?? null,
         };
         this.tryAppend(row);
     }
@@ -114,6 +120,8 @@ export class RequestLogService {
         promptHash?: string | null;
         attemptIndex: number;
         totalAttempts: number;
+        /** Diagnostic snapshot of the outbound request; see migration 0013. */
+        requestParams?: string | null;
     }): void {
         const errorMessage =
             args.error instanceof Error
@@ -134,6 +142,7 @@ export class RequestLogService {
             error: errorMessage,
             clientKey: args.clientKey ?? null,
             promptHash: args.promptHash ?? null,
+            requestParams: args.requestParams ?? null,
         };
         this.tryAppend(row);
     }

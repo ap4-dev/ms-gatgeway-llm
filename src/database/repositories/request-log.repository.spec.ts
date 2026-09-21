@@ -13,6 +13,9 @@ function makeDb(): Database.Database {
         readFileSync(join(process.cwd(), 'migrations/0003_request_logs_tokens.sql'), 'utf-8'),
     );
     db.exec('ALTER TABLE request_logs ADD COLUMN attempt_details TEXT');
+    db.exec(
+        readFileSync(join(process.cwd(), 'migrations/0013_request_params.sql'), 'utf-8'),
+    );
     return db;
 }
 
@@ -113,6 +116,98 @@ describe('RequestLogRepository', () => {
             expect(row.prompt_tokens).toBe(42);
             expect(row.completion_tokens).toBe(17);
             expect(row.total_tokens).toBe(59);
+        });
+    });
+
+    describe('request_params diagnostics (0013)', () => {
+        it('persists request_params when provided', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 6_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'error',
+                error: 'upstream 400',
+                requestParams: '{"model":"fast","max_tokens":512}',
+            });
+            const row = db
+                .prepare('SELECT request_params FROM request_logs ORDER BY id DESC LIMIT 1')
+                .get() as Record<string, unknown>;
+            expect(row.request_params).toBe('{"model":"fast","max_tokens":512}');
+        });
+
+        it('persists NULL request_params when omitted', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 6_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'error',
+                error: 'upstream 400',
+            });
+            const row = db
+                .prepare('SELECT request_params FROM request_logs ORDER BY id DESC LIMIT 1')
+                .get() as Record<string, unknown>;
+            expect(row.request_params).toBeNull();
+        });
+
+        it('persists request_params on attempt-failure rows', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 6_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 2,
+                latencyMs: 30,
+                status: 'error',
+                error: 'attempt 1 failed',
+                requestParams: '{"first_user_message":"hi"}',
+            });
+            const row = db
+                .prepare('SELECT request_params FROM request_logs ORDER BY id DESC LIMIT 1')
+                .get() as Record<string, unknown>;
+            expect(row.request_params).toBe('{"first_user_message":"hi"}');
+        });
+
+        it('keeps request_params NULL on success rows', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 6_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'ok',
+            });
+            const row = db
+                .prepare('SELECT request_params FROM request_logs ORDER BY id DESC LIMIT 1')
+                .get() as Record<string, unknown>;
+            expect(row.request_params).toBeNull();
+        });
+
+        it('exposes request_params through list() as requestParams', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 6_000_000,
+                modelRequested: 'fast',
+                resolvedProvider: 'openai',
+                resolvedModel: 'gpt-4o-mini',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'error',
+                error: 'upstream 400',
+                requestParams: '{"model":"fast"}',
+            });
+            const page = repo.list({ limit: 10 });
+            expect(page.items[0].requestParams).toBe('{"model":"fast"}');
         });
     });
 

@@ -1,5 +1,47 @@
-import { extractText, mergeSystemMessages } from './chat.service';
+import {
+    MAX_TOKENS_CEILING,
+    REQUEST_PARAMS_SNIPPET_CHARS,
+    clampMaxTokens,
+    extractText,
+    mergeSystemMessages,
+    serializeRequestParams,
+} from './chat.service';
 import type { ChatMessage } from './chat.service';
+
+describe('clampMaxTokens', () => {
+    it('leaves requests without max_tokens untouched', () => {
+        const body = { model: 'qwen3.6', messages: [] };
+        expect(clampMaxTokens(body)).toBe(body);
+    });
+
+    it('leaves max_tokens within the accepted range untouched', () => {
+        const body = { model: 'qwen3.6', max_tokens: 4096 };
+        expect(clampMaxTokens(body)).toBe(body);
+    });
+
+    it('leaves max_tokens exactly at the ceiling untouched', () => {
+        const body = { model: 'qwen3.6', max_tokens: MAX_TOKENS_CEILING };
+        expect(clampMaxTokens(body)).toBe(body);
+    });
+
+    it('clamps caller-supplied max_tokens above the upstream ceiling', () => {
+        // nan rejects with: "Range of max_tokens should be [1, 131072]".
+        const body = { model: 'qwen3.6', max_tokens: 200_000 };
+        expect(clampMaxTokens(body).max_tokens).toBe(MAX_TOKENS_CEILING);
+    });
+
+    it('does not mutate the input body', () => {
+        const body = { model: 'qwen3.6', max_tokens: 500_000 };
+        const clamped = clampMaxTokens(body);
+        expect(body.max_tokens).toBe(500_000);
+        expect(clampMaxTokens(body)).not.toBe(body);
+    });
+
+    it('ignores non-numeric max_tokens values', () => {
+        const body = { model: 'qwen3.6', max_tokens: 'lots' };
+        expect(clampMaxTokens(body as any)).toBe(body);
+    });
+});
 
 describe('mergeSystemMessages', () => {
     it('returns the input untouched when it is not an array', () => {
@@ -139,5 +181,142 @@ describe('extractText', () => {
         expect(extractText(42 as unknown as string)).toBe('');
         expect(extractText(null as unknown as string)).toBe('');
         expect(extractText({} as unknown as string)).toBe('');
+    });
+});
+
+describe('serializeRequestParams', () => {
+    it('excludes messages from the serialized params', () => {
+        const out = serializeRequestParams({
+            model: 'fast',
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+        expect(out).not.toBeNull();
+        const parsed = JSON.parse(out as string);
+        expect(parsed.messages).toBeUndefined();
+        expect(parsed.model).toBe('fast');
+    });
+
+    it('includes scalar request params', () => {
+        const out = serializeRequestParams({
+            model: 'fast',
+            max_tokens: 512,
+            temperature: 0.2,
+            stream: true,
+            messages: [{ role: 'user', content: 'hi' }],
+        });
+        const parsed = JSON.parse(out as string);
+        expect(parsed).toMatchObject({
+            model: 'fast',
+            max_tokens: 512,
+            temperature: 0.2,
+            stream: true,
+        });
+    });
+
+    it('truncates a long first user message at the snippet cap with an ellipsis', () => {
+        const long = 'x'.repeat(REQUEST_PARAMS_SNIPPET_CHARS + 50);
+        const out = serializeRequestParams({
+            model: 'fast',
+            messages: [{ role: 'user', content: long }],
+        });
+        const parsed = JSON.parse(out as string);
+        expect(parsed.first_user_message).toHaveLength(
+            REQUEST_PARAMS_SNIPPET_CHARS + 1,
+        );
+        expect(parsed.first_user_message.endsWith('\u2026')).toBe(true);
+        expect(
+            parsed.first_user_message.startsWith(
+                'x'.repeat(REQUEST_PARAMS_SNIPPET_CHARS),
+            ),
+        ).toBe(true);
+    });
+
+    it('does not add an ellipsis when the first user message fits', () => {
+        const out = serializeRequestParams({
+            model: 'fast',
+            messages: [{ role: 'user', content: 'short' }],
+        });
+        expect(JSON.parse(out as string).first_user_message).toBe('short');
+    });
+
+    it('extracts text from array-content user messages via extractText', () => {
+        const out = serializeRequestParams({
+            model: 'fast',
+            messages: [
+                { role: 'system', content: 'sys' },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'part-a' },
+                        { type: 'text', text: 'part-b' },
+                    ],
+                },
+            ],
+        });
+        expect(JSON.parse(out as string).first_user_message).toBe('part-apart-b');
+    });
+
+    it('returns null for null or undefined bodies', () => {
+        expect(serializeRequestParams(null)).toBeNull();
+        expect(serializeRequestParams(undefined)).toBeNull();
+    });
+
+    it('includes first_user_message when the body has only messages', () => {
+        const out = serializeRequestParams({
+            messages: [{ role: 'user', content: 'only message' }],
+        });
+        expect(out).not.toBeNull();
+        const parsed = JSON.parse(out as string);
+        expect(parsed.first_user_message).toBe('only message');
+        expect(parsed.messages).toBeUndefined();
+    });
+
+    it('drops first_user_message and re-serializes when the JSON exceeds the cap', () => {
+        // 3000 chars of metadata blow past the 2048-char cap; dropping the
+        // 200-char snippet brings the row back under it.
+        const out = serializeRequestParams({
+            model: 'fast',
+            max_tokens: 512,
+            metadata: { note: 'z'.repeat(2000) },
+            messages: [{ role: 'user', content: 'short' }],
+        });
+        const parsed = JSON.parse(out as string);
+        expect(parsed.first_user_message).toBeUndefined();
+        expect(parsed.max_tokens).toBe(512);
+    });
+
+    it('falls back to the core scalars when even the trimmed JSON exceeds the cap', () => {
+        const out = serializeRequestParams({
+            model: 'fast',
+            max_tokens: 4096,
+            temperature: 0.5,
+            stream: true,
+            metadata: { note: 'z'.repeat(3000) },
+            messages: [{ role: 'user', content: 'short' }],
+        });
+        expect(JSON.parse(out as string)).toEqual({
+            model: 'fast',
+            max_tokens: 4096,
+            temperature: 0.5,
+            stream: true,
+        });
+    });
+
+    it('returns null when the oversized body has no core scalar params', () => {
+        const out = serializeRequestParams({
+            metadata: { note: 'z'.repeat(3000) },
+            messages: [{ role: 'user', content: 'short' }],
+        });
+        expect(out).toBeNull();
+    });
+
+    it('never throws on non-serializable bodies and returns null', () => {
+        expect(() => serializeRequestParams(() => undefined)).not.toThrow();
+        expect(serializeRequestParams(() => undefined)).toBeNull();
+
+        const circular: Record<string, unknown> = { model: 'fast' };
+        circular.self = circular;
+        expect(() => serializeRequestParams(circular)).not.toThrow();
+        expect(serializeRequestParams(circular)).toBeNull();
     });
 });
