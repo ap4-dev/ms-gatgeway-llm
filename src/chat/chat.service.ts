@@ -436,7 +436,9 @@ export const MAX_TOKENS_CEILING = 131_072;
  * overrides injected by {@link ChatService.applyResolved}. Immutable:
  * returns the same object when nothing needs clamping.
  */
-export function clampMaxTokens<T extends { max_tokens?: number }>(body: T): T {
+export function clampMaxTokens<
+    T extends { max_tokens?: number | null },
+>(body: T): T {
     if (
         typeof body.max_tokens === 'number' &&
         body.max_tokens > MAX_TOKENS_CEILING
