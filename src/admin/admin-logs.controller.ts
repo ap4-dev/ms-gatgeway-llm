@@ -73,6 +73,8 @@ interface LogItemView {
     completionTokens: number | null;
     totalTokens: number | null;
     attemptDetails: string | null;
+    /** Diagnostic snapshot of the failed request (JSON string, failure rows only). */
+    requestParams: string | null;
 }
 
 interface ListLogsResponse {
@@ -260,5 +262,6 @@ function toView(r: RequestLogRow): LogItemView {
         completionTokens: r.completionTokens ?? null,
         totalTokens: r.totalTokens ?? null,
         attemptDetails: r.attemptDetails ?? null,
+        requestParams: r.requestParams ?? null,
     };
 }

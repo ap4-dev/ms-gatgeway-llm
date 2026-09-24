@@ -1,0 +1,22 @@
+{
+  "name": "ms-gateway-llm-dashboard",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Vue 3 admin dashboard for the ms-gateway-llm Fastify gateway.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.4.3",
+    "vue-tsc": "^2.2.12"
+  }
+}

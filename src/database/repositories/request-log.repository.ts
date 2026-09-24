@@ -61,6 +61,65 @@ export interface RequestLogPage {
 }
 
 /**
+ * Optional AND-combined filters shared by every summary aggregation.
+ * `model` matches `model_requested`, `client` matches `client_key` and
+ * `provider` matches `resolved_provider`.
+ */
+export interface SummaryFilters {
+    model?: string;
+    client?: string;
+    provider?: string;
+}
+
+/** Shared count fields present in every summary bucket. */
+export interface SummaryCountFields {
+    requests: number;
+    ok: number;
+    errors: number;
+    circuitOpen: number;
+    totalTokens: number;
+    avgLatencyMs: number;
+}
+
+/** Grand totals for a requested range, plus token sums. */
+export interface SummaryTotals extends SummaryCountFields {
+    promptTokens: number;
+    completionTokens: number;
+}
+
+/** One UTC-day bucket. */
+export type SummaryDayBucket = { day: string } & SummaryCountFields;
+
+/** One `model_requested` bucket. */
+export type SummaryModelBucket = { model: string } & SummaryCountFields;
+
+/** One `client_key` bucket (`null` for unattributed rows). */
+export type SummaryClientBucket = { client: string | null } & SummaryCountFields;
+
+/**
+ * Count/latency projection shared by every summary query. `COUNT(*)` never
+ * returns NULL, but the `SUM(...)` columns can when the range is empty, so
+ * they are coalesced to 0 in SQL. `AVG` of an empty set is NULL -- coalesced
+ * to 0 as well.
+ */
+const SUMMARY_COUNT_AGGREGATES = `
+            COUNT(*) AS requests,
+            COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) AS ok,
+            COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors,
+            COALESCE(SUM(CASE WHEN status = 'circuit_open' THEN 1 ELSE 0 END), 0) AS circuit_open,
+            COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            COALESCE(ROUND(AVG(latency_ms)), 0) AS avg_latency_ms`;
+
+interface SummaryAggRow {
+    requests: number;
+    ok: number;
+    errors: number;
+    circuit_open: number;
+    total_tokens: number;
+    avg_latency_ms: number;
+}
+
+/**
  * Phase 3.5+ request-log persistence. Wired into `RequestLogService` which
  * `ChatService.completions` calls on success and failure. Phase 4 added
  * prompt-hash + token-count columns (0003 migration); Phase 6+ added
@@ -216,6 +275,166 @@ export class RequestLogRepository {
         const items = hasMore ? rows.slice(0, opts.limit) : rows;
         return { items: items.map(toRow), hasMore };
     }
+
+    /**
+     * Aggregate totals for `[fromTs, toTs]` (inclusive, unix seconds)
+     * plus the optional filters.
+     *
+     * NOTE: failed attempts are persisted as their own `request_logs`
+     * rows with `status = 'error'`; this aggregation counts rows as-is
+     * and does NOT deduplicate attempts. A request that exhausted a
+     * multi-provider fallback chain therefore contributes one row per
+     * attempt to `requests`.
+     */
+    summaryTotals(
+        fromTs: number,
+        toTs: number,
+        filters: SummaryFilters = {},
+    ): SummaryTotals {
+        const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
+        const row = this.db
+            .prepare(
+                `
+            SELECT
+                COUNT(*) AS requests,
+                COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) AS ok,
+                COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors,
+                COALESCE(SUM(CASE WHEN status = 'circuit_open' THEN 1 ELSE 0 END), 0) AS circuit_open,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(ROUND(AVG(latency_ms)), 0) AS avg_latency_ms
+            FROM request_logs
+            ${clause}
+        `,
+            )
+            .get(...params) as SummaryAggRow & {
+            prompt_tokens: number;
+            completion_tokens: number;
+        };
+        const counts = toSummaryCounts(row);
+        return {
+            requests: counts.requests,
+            ok: counts.ok,
+            errors: counts.errors,
+            circuitOpen: counts.circuitOpen,
+            promptTokens: row.prompt_tokens,
+            completionTokens: row.completion_tokens,
+            totalTokens: counts.totalTokens,
+            avgLatencyMs: counts.avgLatencyMs,
+        };
+    }
+
+    /** One bucket per UTC calendar day, ordered ascending. */
+    summaryByDay(
+        fromTs: number,
+        toTs: number,
+        filters: SummaryFilters = {},
+    ): SummaryDayBucket[] {
+        const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
+        const rows = this.db
+            .prepare(
+                `
+            SELECT
+                strftime('%Y-%m-%d', datetime(requested_at, 'unixepoch')) AS day,
+                ${SUMMARY_COUNT_AGGREGATES}
+            FROM request_logs
+            ${clause}
+            GROUP BY day
+            ORDER BY day ASC
+        `,
+            )
+            .all(...params) as Array<SummaryAggRow & { day: string }>;
+        return rows.map((r) => ({ day: r.day, ...toSummaryCounts(r) }));
+    }
+
+    /** One bucket per `model_requested`, ordered by request count DESC. */
+    summaryByModel(
+        fromTs: number,
+        toTs: number,
+        filters: SummaryFilters = {},
+    ): SummaryModelBucket[] {
+        const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
+        const rows = this.db
+            .prepare(
+                `
+            SELECT
+                model_requested AS model,
+                ${SUMMARY_COUNT_AGGREGATES}
+            FROM request_logs
+            ${clause}
+            GROUP BY model_requested
+            ORDER BY requests DESC
+        `,
+            )
+            .all(...params) as Array<SummaryAggRow & { model: string }>;
+        return rows.map((r) => ({ model: r.model, ...toSummaryCounts(r) }));
+    }
+
+    /**
+     * One bucket per `client_key`, ordered by request count DESC. Rows
+     * with a NULL `client_key` collapse into a single bucket whose
+     * `client` is null.
+     */
+    summaryByClient(
+        fromTs: number,
+        toTs: number,
+        filters: SummaryFilters = {},
+    ): SummaryClientBucket[] {
+        const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
+        const rows = this.db
+            .prepare(
+                `
+            SELECT
+                client_key AS client,
+                ${SUMMARY_COUNT_AGGREGATES}
+            FROM request_logs
+            ${clause}
+            GROUP BY client_key
+            ORDER BY requests DESC
+        `,
+            )
+            .all(...params) as Array<SummaryAggRow & { client: string | null }>;
+        return rows.map((r) => ({ client: r.client, ...toSummaryCounts(r) }));
+    }
+
+    /**
+     * Build the shared `WHERE requested_at >= ? AND requested_at <= ?`
+     * clause plus any optional filter predicates, in parameter order.
+     */
+    private summaryWhere(
+        fromTs: number,
+        toTs: number,
+        filters: SummaryFilters,
+    ): { clause: string; params: any[] } {
+        const where: string[] = ['requested_at >= ?', 'requested_at <= ?'];
+        const params: any[] = [fromTs, toTs];
+        if (filters.model !== undefined) {
+            where.push('model_requested = ?');
+            params.push(filters.model);
+        }
+        if (filters.client !== undefined) {
+            where.push('client_key = ?');
+            params.push(filters.client);
+        }
+        if (filters.provider !== undefined) {
+            where.push('resolved_provider = ?');
+            params.push(filters.provider);
+        }
+        return { clause: `WHERE ${where.join(' AND ')}`, params };
+    }
+}
+
+/** Map a raw aggregate row into the shared camelCase count fields. */
+function toSummaryCounts(r: SummaryAggRow): SummaryCountFields {
+    return {
+        requests: r.requests,
+        ok: r.ok,
+        errors: r.errors,
+        circuitOpen: r.circuit_open,
+        totalTokens: r.total_tokens,
+        avgLatencyMs: Math.round(r.avg_latency_ms),
+    };
 }
 
 function toRow(r: {

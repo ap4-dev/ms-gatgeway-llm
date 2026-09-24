@@ -11,7 +11,9 @@
     ]
   },
   "scripts": {
-    "build": "nest build",
+    "build": "nest build && pnpm dashboard:build",
+    "dashboard:dev": "pnpm --dir dashboard dev",
+    "dashboard:build": "pnpm --dir dashboard build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "admin:reset": "node -e \"const m=require('./dist/admin/admin-reset-cli'); console.log(m.main(process.argv.slice(2)));\" --",
     "start": "nest start",

@@ -354,3 +354,161 @@ describe('RequestLogRepository', () => {
         });
     });
 });
+
+describe('RequestLogRepository summary aggregations', () => {
+    /**
+     * This block shares ONE in-memory DB across all tests instead of the
+     * per-test `makeDb()` pattern used above. The summary methods read
+     * aggregates; they do not mutate persistence state, so a fresh DB per
+     * test adds nothing but churn (and many better-sqlite3 instances alive
+     * at process exit are flaky under Node 24 — SIGABRT in the native
+     * cleanup hook). `beforeEach` clears the table so every test starts
+     * from an empty `request_logs`.
+     */
+    let db: Database.Database;
+    let repo: RequestLogRepository;
+
+    const DAY1 = Math.floor(Date.parse('2026-09-21T00:00:00Z') / 1000);
+    const DAY2 = Math.floor(Date.parse('2026-09-22T00:00:00Z') / 1000);
+
+    const appendRow = (
+        overrides: Partial<Parameters<RequestLogRepository['append']>[0]>,
+    ) =>
+        repo.append({
+            requestedAt: 0,
+            modelRequested: 'fast',
+            resolvedProvider: 'openai',
+            resolvedModel: 'gpt-4o-mini',
+            attempts: 1,
+            latencyMs: 100,
+            status: 'ok',
+            clientKey: 'admin',
+            ...overrides,
+        });
+
+    beforeAll(() => {
+        db = makeDb();
+    });
+
+    afterAll(() => {
+        db.close();
+        // Drop the last reference and force a GC so better-sqlite3 Database
+        // objects are finalized while the Node environment is still alive.
+        // Under Node 24 the native cleanup hook can otherwise run during
+        // worker teardown and abort the process (SIGABRT).
+        db = null as unknown as Database.Database;
+        forceGc();
+    });
+
+    beforeEach(() => {
+        db.exec('DELETE FROM request_logs');
+        repo = new RequestLogRepository(db);
+    });
+
+    it('summaryTotals aggregates counts, tokens and rounded latency', () => {
+        appendRow({ requestedAt: DAY1 + 10, status: 'ok', latencyMs: 1000, promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+        appendRow({ requestedAt: DAY1 + 20, status: 'error', latencyMs: 3000 });
+        appendRow({ requestedAt: DAY1 + 30, status: 'circuit_open', latencyMs: 2000, promptTokens: 100, completionTokens: 50, totalTokens: 150 });
+
+        const totals = repo.summaryTotals(DAY1, DAY2, {});
+        expect(totals).toEqual({
+            requests: 3,
+            ok: 1,
+            errors: 1,
+            circuitOpen: 1,
+            promptTokens: 110,
+            completionTokens: 55,
+            totalTokens: 165,
+            avgLatencyMs: 2000,
+        });
+    });
+
+    it('summaryTotals returns zeros for an empty range', () => {
+        const totals = repo.summaryTotals(DAY1, DAY2, {});
+        expect(totals).toEqual({
+            requests: 0,
+            ok: 0,
+            errors: 0,
+            circuitOpen: 0,
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+            avgLatencyMs: 0,
+        });
+    });
+
+    it('summaryTotals applies optional model/client/provider filters', () => {
+        appendRow({ requestedAt: DAY1 + 10, modelRequested: 'code', resolvedProvider: 'nan', clientKey: 'alex' });
+        appendRow({ requestedAt: DAY1 + 20, modelRequested: 'chat', resolvedProvider: 'openai', clientKey: 'bob' });
+        appendRow({ requestedAt: DAY1 + 30, modelRequested: 'code', resolvedProvider: 'openai', clientKey: 'alex' });
+
+        expect(repo.summaryTotals(DAY1, DAY2, { model: 'code' }).requests).toBe(2);
+        expect(repo.summaryTotals(DAY1, DAY2, { client: 'bob' }).requests).toBe(1);
+        expect(repo.summaryTotals(DAY1, DAY2, { provider: 'openai' }).requests).toBe(2);
+        expect(repo.summaryTotals(DAY1, DAY2, { model: 'code', client: 'alex', provider: 'nan' }).requests).toBe(1);
+    });
+
+    it('summaryTotals respects the inclusive [from, to] range', () => {
+        appendRow({ requestedAt: DAY1 });
+        appendRow({ requestedAt: DAY1 + 10 });
+        appendRow({ requestedAt: DAY2 });
+        expect(repo.summaryTotals(DAY1, DAY1 + 10, {}).requests).toBe(2);
+    });
+
+    it('summaryByDay groups by UTC day in ascending order', () => {
+        appendRow({ requestedAt: DAY1 + 10, status: 'ok', latencyMs: 1000, totalTokens: 100 });
+        appendRow({ requestedAt: DAY1 + 20, status: 'error', latencyMs: 2000 });
+        appendRow({ requestedAt: DAY2, status: 'ok', latencyMs: 4000, totalTokens: 400 });
+
+        const byDay = repo.summaryByDay(DAY1, DAY2, {});
+        expect(byDay).toEqual([
+            { day: '2026-09-21', requests: 2, ok: 1, errors: 1, circuitOpen: 0, totalTokens: 100, avgLatencyMs: 1500 },
+            { day: '2026-09-22', requests: 1, ok: 1, errors: 0, circuitOpen: 0, totalTokens: 400, avgLatencyMs: 4000 },
+        ]);
+    });
+
+    it('summaryByModel groups by model and orders by requests DESC', () => {
+        appendRow({ requestedAt: DAY1 + 10, modelRequested: 'code' });
+        appendRow({ requestedAt: DAY1 + 20, modelRequested: 'code' });
+        appendRow({ requestedAt: DAY1 + 30, modelRequested: 'chat' });
+
+        const byModel = repo.summaryByModel(DAY1, DAY2, {});
+        expect(byModel.map((m) => m.model)).toEqual(['code', 'chat']);
+        expect(byModel[0].requests).toBe(2);
+    });
+
+    it('summaryByClient groups by client_key and orders by requests DESC', () => {
+        appendRow({ requestedAt: DAY1 + 10, clientKey: 'bob' });
+        appendRow({ requestedAt: DAY1 + 20, clientKey: 'alex' });
+        appendRow({ requestedAt: DAY1 + 30, clientKey: 'alex' });
+
+        const byClient = repo.summaryByClient(DAY1, DAY2, {});
+        expect(byClient.map((c) => c.client)).toEqual(['alex', 'bob']);
+        expect(byClient[0].requests).toBe(2);
+    });
+
+    it('summaryByClient surfaces a NULL client_key as JSON null', () => {
+        appendRow({ requestedAt: DAY1 + 10, clientKey: null });
+
+        const byClient = repo.summaryByClient(DAY1, DAY2, {});
+        expect(byClient).toHaveLength(1);
+        expect(byClient[0].client).toBeNull();
+        expect(byClient[0].requests).toBe(1);
+    });
+});
+
+/**
+ * Best-effort synchronous GC trigger. better-sqlite3 registers a Node
+ * environment cleanup hook per `Database`; forcing a GC before the worker
+ * exits lets those native objects finalize while the environment is alive.
+ */
+function forceGc(): void {
+    try {
+        const v8 = require('node:v8') as typeof import('node:v8');
+        v8.setFlagsFromString('--expose-gc');
+        const gc = require('node:vm').runInNewContext('gc') as () => void;
+        gc();
+    } catch {
+        // GC is best-effort; skip when the runtime does not expose it.
+    }
+}
