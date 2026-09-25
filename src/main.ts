@@ -13,6 +13,8 @@ import {
 import fastifyMultipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { inyectEnv } from './app.enviroment.js';
 import { getEnv } from './config/env.schema';
 import { buildCorsHandler } from './config/cors.config';
@@ -63,6 +65,45 @@ async function msCoreOne() {
   // Swagger UI at /docs. DocumentBuilder in src/swagger.setup.ts
   // limits the spec to AdminModule only.
   setupSwagger(app);
+
+  // Admin dashboard SPA (Vue 3 + Vite, built into /dist-dashboard by
+  // `pnpm dashboard:build`). It is served under /dashboard/ so it coexists
+  // with /v1, /admin and /docs.
+  //
+  // `wildcard: false` makes @fastify/static register one exact route per
+  // emitted file (plus `/dashboard/` -> index.html) instead of its own
+  // catch-all route. That leaves GET /dashboard/* free for the SPA history
+  // fallback below, and `decorateReply: false` avoids re-decorating
+  // `reply.sendFile`, which the Swagger static registration above already did.
+  const dashboardRoot = join(__dirname, '..', 'dist-dashboard');
+  const dashboardIndexPath = join(dashboardRoot, 'index.html');
+  if (existsSync(dashboardIndexPath)) {
+    app.register(fastifyStatic as any, {
+      root: dashboardRoot,
+      prefix: '/dashboard/',
+      decorateReply: false,
+      wildcard: false,
+    });
+
+    // The SPA shell is immutable for the process lifetime; read it once.
+    const dashboardIndexHtml = readFileSync(dashboardIndexPath, 'utf8');
+    const fastify = app.getHttpAdapter().getInstance();
+
+    // History-mode fallback, scoped strictly to the /dashboard prefix: client
+    // routes such as /dashboard/overview have no file on disk and must resolve
+    // to the SPA shell. API 404s under /admin, /v1 and /docs are untouched
+    // because these handlers only match /dashboard.
+    fastify.get('/dashboard', (_request, reply) =>
+      reply.type('text/html; charset=utf-8').send(dashboardIndexHtml),
+    );
+    fastify.get('/dashboard/*', (_request, reply) =>
+      reply.type('text/html; charset=utf-8').send(dashboardIndexHtml),
+    );
+  } else {
+    console.warn(
+      `⚠️  Dashboard bundle not found at ${dashboardRoot}; /dashboard/ is disabled. Run \`pnpm dashboard:build\`.`,
+    );
+  }
 
   const logger = app.get(AppJsonLogger);
   app.useLogger(logger);
