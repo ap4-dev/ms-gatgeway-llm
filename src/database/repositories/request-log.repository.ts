@@ -263,7 +263,8 @@ export class RequestLogRepository {
             ORDER BY requested_at DESC, id DESC
             LIMIT ?
         `;
-        const rows = this.db.prepare(sql).all(...params, fetchLimit) as Array<{
+        const stmt = this.stmt(sql);
+        const rows = stmt.all(...params, fetchLimit) as Array<{
             id: number;
             requested_at: number;
             model_requested: string;
