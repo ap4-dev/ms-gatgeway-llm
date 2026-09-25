@@ -384,6 +384,17 @@ tbody tr:hover {
   flex: 0 0 auto;
 }
 
+.checkbox-field label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
 /* Panels + sections */
 
 .panel + .panel {
@@ -407,6 +418,35 @@ tbody tr:hover {
   font-size: 15px;
   font-weight: 600;
   color: var(--accent);
+}
+
+/* Pushes the per-provider actions to the right edge of the head row. */
+.spacer {
+  flex: 1 1 auto;
+}
+
+.provider-card + .provider-card {
+  margin-top: 18px;
+}
+
+.provider-models {
+  margin-top: 14px;
+}
+
+.inline-edit {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev-2);
+}
+
+.model-add {
+  margin-top: 12px;
+}
+
+.model-add .form-grid {
+  margin-top: 8px;
 }
 
 /* ── Aliases ───────────────────────────────────────────────────────────── */
@@ -493,6 +533,68 @@ tbody tr:hover {
   margin-bottom: 10px;
 }
 
+/* Ordered position chip on a chain step. */
+.step-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.weight-inline {
+  width: 58px;
+  padding: 3px 6px;
+  text-align: center;
+}
+
+.chain-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.inline-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chain-input {
+  width: 150px;
+}
+
+/* New-alias chain builder. */
+.chain-builder {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.chain-builder-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.chain-builder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* ── Clients ───────────────────────────────────────────────────────────── */
 
 .scopes {
@@ -544,6 +646,15 @@ tbody tr:hover {
 .modal-actions {
   display: flex;
   gap: 10px;
+}
+
+.modal-narrow {
+  max-width: 460px;
+}
+
+.confirm-message {
+  margin: 12px 0 18px;
+  color: var(--text);
 }
 
 /* ── Charts ────────────────────────────────────────────────────────────── */

@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router';
 import { hasApiKey, setUnauthorizedHandler } from './api/client';
 import LoginView from './views/LoginView.vue';
 import OverviewView from './views/OverviewView.vue';
+import ProvidersView from './views/ProvidersView.vue';
 import ModelsView from './views/ModelsView.vue';
 import ClientsView from './views/ClientsView.vue';
 import AliasesView from './views/AliasesView.vue';
@@ -28,10 +29,16 @@ export const router = createRouter({
       meta: { title: 'Overview' },
     },
     {
+      path: '/providers',
+      name: 'providers',
+      component: ProvidersView,
+      meta: { title: 'Providers' },
+    },
+    {
       path: '/models',
       name: 'models',
       component: ModelsView,
-      meta: { title: 'Models' },
+      meta: { title: 'Model catalog' },
     },
     {
       path: '/clients',

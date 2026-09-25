@@ -8,9 +8,10 @@ const router = useRouter();
 
 const navItems = [
   { name: 'overview', label: 'Overview' },
-  { name: 'models', label: 'Models' },
-  { name: 'clients', label: 'Clients' },
+  { name: 'providers', label: 'Providers' },
+  { name: 'models', label: 'Model catalog' },
   { name: 'aliases', label: 'Aliases' },
+  { name: 'clients', label: 'Clients' },
   { name: 'logs', label: 'Logs' },
 ] as const;
 

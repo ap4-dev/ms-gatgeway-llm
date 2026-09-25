@@ -9,7 +9,11 @@ import {
   revokeClient,
   rotateClient,
 } from '../api/client';
-import type { Client, ClientWithKey, CreateClientPayload, PatchClientPayload } from '../api/types';
+import type { Client, CreateClientPayload, PatchClientPayload } from '../api/types';
+import ConfirmDialog from '../components/ConfirmDialog.vue';
+import type { ConfirmOptions } from '../components/ConfirmDialog.vue';
+import KeyModal from '../components/KeyModal.vue';
+import type { KeyModalState } from '../components/KeyModal.vue';
 
 /**
  * Phase 4 Clients view: list, create (one-time key), inline edit, rotate,
@@ -33,12 +37,12 @@ const editForm = reactive({ name: '', scopes: '', rpm: '', tpm: '' });
 const rowBusy = ref<string | null>(null);
 const rowError = ref('');
 
-interface KeyModalState extends ClientWithKey {
-  kind: 'created' | 'rotated';
-}
-
 const keyModal = ref<KeyModalState | null>(null);
-const copied = ref(false);
+const confirmRef = ref<{ confirm: (o: ConfirmOptions) => Promise<boolean> } | null>(null);
+
+function askConfirm(options: ConfirmOptions): Promise<boolean> {
+  return confirmRef.value?.confirm(options) ?? Promise.resolve(false);
+}
 
 /** Comma-separated input -> trimmed, non-empty scope list. */
 function parseScopes(raw: string): string[] {
@@ -192,13 +196,12 @@ async function saveEdit(client: Client): Promise<void> {
 }
 
 async function onRotate(client: Client): Promise<void> {
-  if (
-    !window.confirm(
-      `Rotate the API key for "${client.name}"? The current key stops working immediately.`,
-    )
-  ) {
-    return;
-  }
+  const ok = await askConfirm({
+    title: 'Rotate API key',
+    message: `Rotate the API key for "${client.name}"? The current key stops working immediately.`,
+    confirmLabel: 'Rotate',
+  });
+  if (!ok) return;
   rowBusy.value = client.id;
   rowError.value = '';
   try {
@@ -213,7 +216,13 @@ async function onRotate(client: Client): Promise<void> {
 }
 
 async function onRevoke(client: Client): Promise<void> {
-  if (!window.confirm(`Revoke "${client.name}"? Its key stops working.`)) return;
+  const ok = await askConfirm({
+    title: 'Revoke client',
+    message: `Revoke "${client.name}"? Its key stops working.`,
+    confirmLabel: 'Revoke',
+    danger: true,
+  });
+  if (!ok) return;
   rowBusy.value = client.id;
   rowError.value = '';
   try {
@@ -227,13 +236,13 @@ async function onRevoke(client: Client): Promise<void> {
 }
 
 async function onDelete(client: Client): Promise<void> {
-  if (
-    !window.confirm(
-      `Permanently delete "${client.name}" (${client.id})? This cannot be undone.`,
-    )
-  ) {
-    return;
-  }
+  const ok = await askConfirm({
+    title: 'Delete client',
+    message: `Permanently delete "${client.name}" (${client.id})? This cannot be undone.`,
+    confirmLabel: 'Delete',
+    danger: true,
+  });
+  if (!ok) return;
   rowBusy.value = client.id;
   rowError.value = '';
   try {
@@ -246,23 +255,8 @@ async function onDelete(client: Client): Promise<void> {
   }
 }
 
-async function copyKey(): Promise<void> {
-  const modal = keyModal.value;
-  if (!modal) return;
-  try {
-    await navigator.clipboard.writeText(modal.plaintextApiKey);
-    copied.value = true;
-    window.setTimeout(() => {
-      copied.value = false;
-    }, 2000);
-  } catch {
-    copied.value = false;
-  }
-}
-
 function closeModal(): void {
   keyModal.value = null;
-  copied.value = false;
 }
 
 onMounted(() => {
@@ -415,25 +409,7 @@ onMounted(() => {
       </tbody>
     </table>
 
-    <div v-if="keyModal" class="modal-backdrop" @click.self="closeModal">
-      <div class="modal">
-        <h2 class="section-title">
-          {{ keyModal.kind === 'created' ? 'Client created' : 'Key rotated' }}
-        </h2>
-        <p class="warning">{{ keyModal.warning }}</p>
-        <p class="muted">
-          Client: <strong>{{ keyModal.name }}</strong> (<span class="mono">{{ keyModal.id }}</span>)
-        </p>
-        <div class="key-box">
-          <code class="key-value">{{ keyModal.plaintextApiKey }}</code>
-        </div>
-        <div class="modal-actions">
-          <button class="btn" type="button" @click="copyKey">
-            {{ copied ? 'Copied!' : 'Copy key' }}
-          </button>
-          <button class="btn btn-ghost" type="button" @click="closeModal">Done</button>
-        </div>
-      </div>
-    </div>
+    <KeyModal :state="keyModal" @close="closeModal" />
+    <ConfirmDialog ref="confirmRef" />
   </div>
 </template>

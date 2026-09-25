@@ -86,6 +86,78 @@ export interface AliasesResponse {
   aliases: Alias[];
 }
 
+/** `POST /admin/aliases` accepts an optional strategy (defaults to `primary`). */
+export interface CreateAliasPayload {
+  id: string;
+  /** Ordered routing chain, each entry is `providerId/modelKey`. */
+  chain: string[];
+  strategy?: AliasStrategy;
+}
+
+// ── /admin/providers ────────────────────────────────────────────────────────
+
+/**
+ * One model configured on a provider. `usedInAliases` lists the alias ids whose
+ * chain contains this exact `provider/model` entry — an empty array means the
+ * model can be deleted without a `409`.
+ */
+export interface ProviderModelView {
+  modelKey: string;
+  realName: string;
+  maxTokens: number | null;
+  supportsStream: boolean;
+  disableThinking: boolean;
+  usedInAliases: string[];
+}
+
+/**
+ * One provider. `apiKeyEnv` is the NAME of the environment variable holding the
+ * key; actual key material is never sent to or returned by the API.
+ */
+export interface ProviderView {
+  id: string;
+  apiKeyEnv: string;
+  baseUrl: string | null;
+  timeoutMs: number | null;
+  supportsSearch: boolean;
+  models: ProviderModelView[];
+}
+
+export interface ProvidersResponse {
+  providers: ProviderView[];
+}
+
+export interface CreateProviderPayload {
+  id: string;
+  apiKeyEnv: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+  supportsSearch?: boolean;
+}
+
+/** PATCH cannot clear nullable fields; omit a field to leave it unchanged. */
+export interface PatchProviderPayload {
+  apiKeyEnv?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+  supportsSearch?: boolean;
+}
+
+export interface CreateProviderModelPayload {
+  modelKey: string;
+  realName: string;
+  maxTokens?: number;
+  supportsStream?: boolean;
+  disableThinking?: boolean;
+}
+
+export interface PatchProviderModelPayload {
+  realName?: string;
+  maxTokens?: number;
+  supportsStream?: boolean;
+  disableThinking?: boolean;
+}
+
 // ── GET /admin/clients ──────────────────────────────────────────────────────
 
 export interface Client {

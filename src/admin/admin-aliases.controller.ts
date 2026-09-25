@@ -1,16 +1,22 @@
 import {
+    BadRequestException,
     Body,
+    ConflictException,
     Controller,
+    Delete,
     Get,
     HttpCode,
     NotFoundException,
     Param,
+    Post,
     Put,
     UseGuards,
 } from '@nestjs/common';
 import {
     ApiBadRequestResponse,
     ApiBearerAuth,
+    ApiConflictResponse,
+    ApiCreatedResponse,
     ApiForbiddenResponse,
     ApiNoContentResponse,
     ApiNotFoundResponse,
@@ -50,6 +56,30 @@ const PutPrioritiesSchema = z.object({
         z.coerce.number().int().min(0),
         z.number().int().min(0),
     ),
+});
+
+const AliasIdSchema = z
+    .string()
+    .max(64)
+    .regex(/^[a-z0-9][a-z0-9_-]*$/, {
+        message: 'id must be lowercase letters, digits, underscores or hyphens',
+    });
+
+/** A single chain entry in `providerId/modelKey` form. */
+const ChainEntrySchema = z
+    .string()
+    .regex(/^[^/\s]+\/[^/\s]+$/, {
+        message: 'entry must be "providerId/modelKey"',
+    });
+
+const CreateAliasSchema = z.object({
+    id: AliasIdSchema,
+    chain: z.array(ChainEntrySchema).min(1).max(64),
+    strategy: RoutingStrategySchema.optional(),
+});
+
+const AppendEntrySchema = z.object({
+    entry: ChainEntrySchema,
 });
 
 interface AliasView {
@@ -201,12 +231,142 @@ export class AdminAliasesController {
         this.replacePriorities(id, chain.length, body.priorities);
     }
 
+    @Post()
+    @ApiOperation({
+        summary: 'Create an alias chain.',
+        description:
+            'Every chain entry must reference an existing provider/model pair; the 409 guard is on the alias id.',
+    })
+    @ApiCreatedResponse({ description: 'Alias created; body is the new alias view.' })
+    @ApiBadRequestResponse({
+        description: 'Body failed zod validation, or a chain entry is not a configured provider/model.',
+    })
+    @ApiConflictResponse({ description: 'An alias with this id already exists.' })
+    create(
+        @Body(new ZodValidationPipe(CreateAliasSchema))
+        body: { id: string; chain: string[]; strategy?: RoutingStrategyKind },
+    ): AliasView {
+        if (this.registry.aliases[body.id]) {
+            throw new ConflictException(`Alias "${body.id}" already exists`);
+        }
+        this.assertChainModelsExist(body.chain);
+        this.registry.repository.createAlias(
+            body.id,
+            body.chain,
+            body.strategy ?? 'primary',
+        );
+        return this.toView(body.id, this.registry.aliases[body.id]!);
+    }
+
+    @Delete(':id')
+    @HttpCode(204)
+    @ApiOperation({
+        summary: 'Delete an alias.',
+        description: 'Removes the chain entries, the per-alias strategy and its weights.',
+    })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiNoContentResponse({ description: 'Alias deleted (no body).' })
+    @ApiNotFoundResponse({ description: 'Alias id unknown.' })
+    remove(@Param('id') id: string): void {
+        this.ensureAlias(id);
+        this.registry.repository.deleteAlias(id);
+    }
+
+    @Post(':id/entries')
+    @HttpCode(200)
+    @ApiOperation({
+        summary: 'Append one entry to an alias chain.',
+        description:
+            'Appends at the end (priority 0) and keeps alias_weights aligned; default weight for the new position is 1.',
+    })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiOkResponse({ description: 'Updated alias view.' })
+    @ApiBadRequestResponse({ description: 'Body invalid or the chain is already at 64 entries.' })
+    @ApiNotFoundResponse({ description: 'Alias, provider or model unknown.' })
+    appendEntry(
+        @Param('id') id: string,
+        @Body(new ZodValidationPipe(AppendEntrySchema)) body: { entry: string },
+    ): AliasView {
+        this.ensureAlias(id);
+        this.assertEntryExists(body.entry);
+        const chain = this.registry.aliases[id]!;
+        if (chain.length >= 64) {
+            throw new BadRequestException(
+                `Alias "${id}" already has the maximum of 64 chain entries`,
+            );
+        }
+        this.registry.repository.appendAliasEntry(id, body.entry);
+        return this.toView(id, this.registry.aliases[id]!);
+    }
+
+    @Delete(':id/entries/:position')
+    @ApiOperation({
+        summary: 'Remove one entry from an alias chain.',
+        description:
+            'Shifts later positions down and reindexes alias_weights. Refused with 400 when it would empty the chain.',
+    })
+    @ApiParam({ name: 'id', example: 'code' })
+    @ApiParam({ name: 'position', example: '1' })
+    @ApiOkResponse({ description: 'Updated alias view.' })
+    @ApiBadRequestResponse({ description: 'Removing this entry would leave the chain empty.' })
+    @ApiNotFoundResponse({ description: 'Alias id or chain position unknown.' })
+    removeEntry(
+        @Param('id') id: string,
+        @Param('position') position: string,
+    ): AliasView {
+        this.ensureAlias(id);
+        const chain = this.registry.aliases[id]!;
+        const index = Number(position);
+        if (!Number.isInteger(index) || index < 0 || index >= chain.length) {
+            throw new NotFoundException(
+                `Position ${position} is out of range for alias "${id}" (chain length ${chain.length})`,
+            );
+        }
+        if (chain.length <= 1) {
+            throw new BadRequestException(
+                `Alias "${id}" must keep at least one chain entry`,
+            );
+        }
+        this.registry.repository.removeAliasEntry(id, index);
+        return this.toView(id, this.registry.aliases[id]!);
+    }
+
     // --- internals -------------------------------------------------------
 
     private ensureAlias(id: string): void {
         if (!this.registry.aliases[id]) {
             throw new NotFoundException(`Alias "${id}" not found`);
         }
+    }
+
+    /**
+     * Reject a create when any chain entry does not resolve to a configured
+     * provider+model. Reports every offending entry, not just the first, so
+     * the operator can fix the payload in one pass.
+     */
+    private assertChainModelsExist(chain: string[]): void {
+        const missing = chain.filter((path) => !this.entryExists(path));
+        if (missing.length > 0) {
+            throw new BadRequestException(
+                `Alias chain references unknown entries: ${missing.join(', ')}`,
+            );
+        }
+    }
+
+    /** 404 for an append target that is not a configured provider+model. */
+    private assertEntryExists(entry: string): void {
+        if (!this.entryExists(entry)) {
+            throw new NotFoundException(
+                `Alias entry "${entry}" does not reference a configured provider/model`,
+            );
+        }
+    }
+
+    private entryExists(path: string): boolean {
+        const [providerId, modelKey] = path.split('/');
+        if (!providerId || !modelKey) return false;
+        if (!this.registry.has(providerId)) return false;
+        return this.registry.repository.modelExists(providerId, modelKey);
     }
 
     private toView(aliasKey: string, chain: string[]): AliasView {

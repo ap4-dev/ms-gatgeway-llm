@@ -15,13 +15,21 @@ import type {
   Client,
   ClientsResponse,
   ClientWithKey,
+  CreateAliasPayload,
   CreateClientPayload,
+  CreateProviderModelPayload,
+  CreateProviderPayload,
   DbQueryResponse,
   DbTablesResponse,
   ListLogsParams,
   LogsResponse,
   ModelsListResponse,
   PatchClientPayload,
+  PatchProviderModelPayload,
+  PatchProviderPayload,
+  ProviderModelView,
+  ProvidersResponse,
+  ProviderView,
   SummaryResponse,
 } from './types';
 
@@ -34,7 +42,10 @@ export type {
   Client,
   ClientsResponse,
   ClientWithKey,
+  CreateAliasPayload,
   CreateClientPayload,
+  CreateProviderModelPayload,
+  CreateProviderPayload,
   DbQueryResponse,
   DbTable,
   DbTablesResponse,
@@ -46,6 +57,11 @@ export type {
   ModelListItem,
   ModelsListResponse,
   PatchClientPayload,
+  PatchProviderModelPayload,
+  PatchProviderPayload,
+  ProviderModelView,
+  ProvidersResponse,
+  ProviderView,
   SummaryClientBucket,
   SummaryCountFields,
   SummaryDayBucket,
@@ -267,6 +283,92 @@ export function setAliasPriorities(
     method: 'PUT',
     body: JSON.stringify({ priorities }),
   });
+}
+
+export function createAlias(payload: CreateAliasPayload): Promise<Alias> {
+  return apiFetch<Alias>('/admin/aliases', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteAlias(id: string): Promise<void> {
+  return apiFetch<void>(`/admin/aliases/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+/** Appends one `provider/model` entry at the end of the chain (default weight 1). */
+export function appendAliasEntry(id: string, entry: string): Promise<Alias> {
+  return apiFetch<Alias>(`/admin/aliases/${encodeURIComponent(id)}/entries`, {
+    method: 'POST',
+    body: JSON.stringify({ entry }),
+  });
+}
+
+/** Removes the entry at `position`; later positions and weights are reindexed. */
+export function removeAliasEntry(id: string, position: number): Promise<Alias> {
+  return apiFetch<Alias>(
+    `/admin/aliases/${encodeURIComponent(id)}/entries/${position}`,
+    { method: 'DELETE' },
+  );
+}
+
+// ── /admin/providers ────────────────────────────────────────────────────────
+
+export function listProviders(): Promise<ProvidersResponse> {
+  return apiFetch<ProvidersResponse>('/admin/providers');
+}
+
+export function createProvider(payload: CreateProviderPayload): Promise<ProviderView> {
+  return apiFetch<ProviderView>('/admin/providers', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function patchProvider(
+  id: string,
+  payload: PatchProviderPayload,
+): Promise<ProviderView> {
+  return apiFetch<ProviderView>(`/admin/providers/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteProvider(id: string): Promise<void> {
+  return apiFetch<void>(`/admin/providers/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function createProviderModel(
+  providerId: string,
+  payload: CreateProviderModelPayload,
+): Promise<ProviderModelView> {
+  return apiFetch<ProviderModelView>(
+    `/admin/providers/${encodeURIComponent(providerId)}/models`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+}
+
+export function patchProviderModel(
+  providerId: string,
+  modelKey: string,
+  payload: PatchProviderModelPayload,
+): Promise<ProviderModelView> {
+  return apiFetch<ProviderModelView>(
+    `/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelKey)}`,
+    { method: 'PATCH', body: JSON.stringify(payload) },
+  );
+}
+
+export function deleteProviderModel(providerId: string, modelKey: string): Promise<void> {
+  return apiFetch<void>(
+    `/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelKey)}`,
+    { method: 'DELETE' },
+  );
 }
 
 // ── /admin/clients ──────────────────────────────────────────────────────────

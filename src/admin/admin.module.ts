@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AdminClientsController } from './admin-clients.controller';
 import { AdminAliasesController } from './admin-aliases.controller';
+import { AdminProvidersController } from './admin-providers.controller';
 import { AdminLogsController } from './admin-logs.controller';
 import { AdminStatsController } from './admin-stats.controller';
 import { SQLiteAdminController } from './sqlite-admin.controller';
@@ -19,6 +20,7 @@ import { ChatModule } from '../chat/chat.module';
     controllers: [
         AdminClientsController,
         AdminAliasesController,
+        AdminProvidersController,
         AdminLogsController,
         AdminStatsController,
         SQLiteAdminController,

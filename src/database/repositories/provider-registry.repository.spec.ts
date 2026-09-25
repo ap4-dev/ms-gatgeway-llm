@@ -298,4 +298,195 @@ describe('ProviderRegistryRepository', () => {
             expect(repo.getAliasEntries('nope')).toEqual([]);
         });
     });
+
+    describe('provider + model CRUD', () => {
+        it('findProvider returns the raw row for a known id', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider(
+                {
+                    id: 'nan',
+                    apiKeyEnv: 'NAN_API_KEY',
+                    baseURL: 'https://a.example',
+                    timeoutMs: 1000,
+                    supportsSearch: true,
+                },
+                { m1: { real: 'r1' } },
+            );
+            const row = repo.findProvider('nan');
+            expect(row?.id).toBe('nan');
+            expect(row?.api_key_env).toBe('NAN_API_KEY');
+            expect(row?.base_url).toBe('https://a.example');
+            expect(row?.timeout_ms).toBe(1000);
+            expect(row?.supports_search).toBe(1);
+        });
+
+        it('findProvider returns undefined for an unknown id', () => {
+            const repo = new ProviderRegistryRepository(db);
+            expect(repo.findProvider('nope')).toBeUndefined();
+        });
+
+        it('modelExists reflects the (provider_id, model_key) pair', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider({ id: 'a', apiKeyEnv: 'A' }, { m1: { real: 'r1' } });
+            expect(repo.modelExists('a', 'm1')).toBe(true);
+            expect(repo.modelExists('a', 'm2')).toBe(false);
+            expect(repo.modelExists('b', 'm1')).toBe(false);
+        });
+
+        it('createProvider inserts a provider without touching models', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createProvider({ id: 'fresh', apiKeyEnv: 'FRESH_API_KEY' });
+            expect(repo.findProvider('fresh')?.api_key_env).toBe('FRESH_API_KEY');
+            expect(repo.listProviders().fresh.models).toEqual({});
+        });
+
+        it('updateProvider merges only the provided fields and keeps models', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider(
+                { id: 'a', apiKeyEnv: 'A', baseURL: 'https://a.example', timeoutMs: 1000 },
+                { m1: { real: 'r1' } },
+            );
+            repo.updateProvider('a', { timeoutMs: 2000, supportsSearch: true });
+            const row = repo.findProvider('a')!;
+            expect(row.api_key_env).toBe('A');
+            expect(row.base_url).toBe('https://a.example');
+            expect(row.timeout_ms).toBe(2000);
+            expect(row.supports_search).toBe(1);
+            expect(repo.listProviders().a.models.m1.real).toBe('r1');
+        });
+
+        it('deleteProvider removes the provider and cascades its models', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider({ id: 'a', apiKeyEnv: 'A' }, { m1: { real: 'r1' } });
+            repo.deleteProvider('a');
+            expect(repo.findProvider('a')).toBeUndefined();
+            expect(repo.listProviders().a).toBeUndefined();
+            expect(repo.modelExists('a', 'm1')).toBe(false);
+        });
+
+        it('createModel inserts a model row', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createProvider({ id: 'a', apiKeyEnv: 'A' });
+            repo.createModel('a', 'm1', {
+                real: 'real-m1',
+                maxTokens: 4096,
+                supportsStream: false,
+                disableThinking: true,
+            });
+            const row = repo.getModelRow('a', 'm1')!;
+            expect(row.real_name).toBe('real-m1');
+            expect(row.max_tokens).toBe(4096);
+            expect(row.supports_stream).toBe(0);
+            expect(row.disable_thinking).toBe(1);
+        });
+
+        it('updateModel merges only the provided fields', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider({ id: 'a', apiKeyEnv: 'A' }, { m1: { real: 'r1' } });
+            repo.updateModel('a', 'm1', { realName: 'r1-new', disableThinking: true });
+            const row = repo.getModelRow('a', 'm1')!;
+            expect(row.real_name).toBe('r1-new');
+            expect(row.disable_thinking).toBe(1);
+            expect(row.supports_stream).toBe(1);
+        });
+
+        it('deleteModel removes only that model', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider(
+                { id: 'a', apiKeyEnv: 'A' },
+                { m1: { real: 'r1' }, m2: { real: 'r2' } },
+            );
+            repo.deleteModel('a', 'm1');
+            expect(repo.modelExists('a', 'm1')).toBe(false);
+            expect(repo.modelExists('a', 'm2')).toBe(true);
+        });
+
+        it('aliasesUsingProvider lists the alias names that reference it', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider({ id: 'a', apiKeyEnv: 'A' }, { m1: { real: 'r1' } });
+            repo.upsertProvider({ id: 'b', apiKeyEnv: 'B' }, { m1: { real: 'r1' } });
+            repo.replaceAliasEntry('fast', ['a/m1', 'b/m1']);
+            repo.replaceAliasEntry('coder', ['a/m1']);
+            expect(repo.aliasesUsingProvider('a')).toEqual(['coder', 'fast']);
+            expect(repo.aliasesUsingProvider('b')).toEqual(['fast']);
+            expect(repo.aliasesUsingProvider('nope')).toEqual([]);
+        });
+
+        it('aliasesUsingModel lists the alias names that reference provider+model', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.upsertProvider(
+                { id: 'a', apiKeyEnv: 'A' },
+                { m1: { real: 'r1' }, m2: { real: 'r2' } },
+            );
+            repo.replaceAliasEntry('fast', ['a/m1', 'a/m2']);
+            repo.replaceAliasEntry('coder', ['a/m1']);
+            expect(repo.aliasesUsingModel('a', 'm1')).toEqual(['coder', 'fast']);
+            expect(repo.aliasesUsingModel('a', 'm2')).toEqual(['fast']);
+            expect(repo.aliasesUsingModel('a', 'nope')).toEqual([]);
+        });
+    });
+
+    describe('alias CRUD', () => {
+        beforeEach(() => {
+            db.prepare('INSERT INTO providers (id, api_key_env) VALUES (?, ?)').run('a', 'A');
+            db.prepare('INSERT INTO providers (id, api_key_env) VALUES (?, ?)').run('b', 'B');
+            db.prepare(
+                'INSERT INTO model_configs (provider_id, model_key, real_name) VALUES (?, ?, ?)',
+            ).run('a', 'm1', 'a-m1');
+            db.prepare(
+                'INSERT INTO model_configs (provider_id, model_key, real_name) VALUES (?, ?, ?)',
+            ).run('a', 'm2', 'a-m2');
+            db.prepare(
+                'INSERT INTO model_configs (provider_id, model_key, real_name) VALUES (?, ?, ?)',
+            ).run('b', 'm3', 'b-m3');
+        });
+
+        it('createAlias inserts the chain in order with the requested strategy', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createAlias('fast', ['a/m1', 'b/m3'], 'round-robin');
+            expect(repo.listAliases().fast).toEqual(['a/m1', 'b/m3']);
+            expect(repo.getStrategy('fast')).toBe('round-robin');
+        });
+
+        it('deleteAlias removes entries, policy and weights', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createAlias('fast', ['a/m1'], 'weighted');
+            repo.upsertWeights('fast', [5]);
+            repo.deleteAlias('fast');
+            expect(repo.listAliases().fast).toBeUndefined();
+            expect(repo.getStrategy('fast')).toBe('primary');
+            expect(repo.getWeights('fast')).toEqual([]);
+        });
+
+        it('appendAliasEntry appends at the end and keeps explicit weights aligned', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createAlias('fast', ['a/m1'], 'weighted');
+            repo.upsertWeights('fast', [5]);
+            repo.appendAliasEntry('fast', 'b/m3');
+            expect(repo.listAliases().fast).toEqual(['a/m1', 'b/m3']);
+            expect(repo.getWeights('fast')).toEqual([
+                { position: 0, weight: 5 },
+                { position: 1, weight: 1 },
+            ]);
+        });
+
+        it('appendAliasEntry leaves weights empty when none were configured', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createAlias('fast', ['a/m1'], 'primary');
+            repo.appendAliasEntry('fast', 'b/m3');
+            expect(repo.getWeights('fast')).toEqual([]);
+        });
+
+        it('removeAliasEntry shifts positions and reindexes weights', () => {
+            const repo = new ProviderRegistryRepository(db);
+            repo.createAlias('fast', ['a/m1', 'b/m3', 'a/m2'], 'weighted');
+            repo.upsertWeights('fast', [5, 3, 2]);
+            repo.removeAliasEntry('fast', 1);
+            expect(repo.listAliases().fast).toEqual(['a/m1', 'a/m2']);
+            expect(repo.getWeights('fast')).toEqual([
+                { position: 0, weight: 5 },
+                { position: 1, weight: 2 },
+            ]);
+        });
+    });
 });
