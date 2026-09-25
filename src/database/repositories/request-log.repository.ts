@@ -129,6 +129,16 @@ interface SummaryAggRow {
 export class RequestLogRepository {
     private readonly appendStmt: Database.Statement;
     private readonly recentStmt: Database.Statement;
+    private readonly stmtCache = new Map<string, Database.Statement>();
+
+    private stmt(sql: string): Database.Statement {
+        let s = this.stmtCache.get(sql);
+        if (!s) {
+            s = this.db.prepare(sql);
+            this.stmtCache.set(sql, s);
+        }
+        return s;
+    }
 
     constructor(private readonly db: Database.Database) {
         this.appendStmt = this.db.prepare(`
@@ -292,8 +302,7 @@ export class RequestLogRepository {
         filters: SummaryFilters = {},
     ): SummaryTotals {
         const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
-        const row = this.db
-            .prepare(
+        const stmt = this.stmt(
                 `
             SELECT
                 COUNT(*) AS requests,
@@ -307,8 +316,8 @@ export class RequestLogRepository {
             FROM request_logs
             ${clause}
         `,
-            )
-            .get(...params) as SummaryAggRow & {
+            );
+        const row = stmt.get(...params) as SummaryAggRow & {
             prompt_tokens: number;
             completion_tokens: number;
         };
@@ -332,8 +341,7 @@ export class RequestLogRepository {
         filters: SummaryFilters = {},
     ): SummaryDayBucket[] {
         const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
-        const rows = this.db
-            .prepare(
+        const stmt = this.stmt(
                 `
             SELECT
                 strftime('%Y-%m-%d', datetime(requested_at, 'unixepoch')) AS day,
@@ -343,8 +351,8 @@ export class RequestLogRepository {
             GROUP BY day
             ORDER BY day ASC
         `,
-            )
-            .all(...params) as Array<SummaryAggRow & { day: string }>;
+            );
+        const rows = stmt.all(...params) as Array<SummaryAggRow & { day: string }>;
         return rows.map((r) => ({ day: r.day, ...toSummaryCounts(r) }));
     }
 
@@ -355,8 +363,7 @@ export class RequestLogRepository {
         filters: SummaryFilters = {},
     ): SummaryModelBucket[] {
         const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
-        const rows = this.db
-            .prepare(
+        const stmt = this.stmt(
                 `
             SELECT
                 model_requested AS model,
@@ -366,8 +373,8 @@ export class RequestLogRepository {
             GROUP BY model_requested
             ORDER BY requests DESC
         `,
-            )
-            .all(...params) as Array<SummaryAggRow & { model: string }>;
+            );
+        const rows = stmt.all(...params) as Array<SummaryAggRow & { model: string }>;
         return rows.map((r) => ({ model: r.model, ...toSummaryCounts(r) }));
     }
 
@@ -382,8 +389,7 @@ export class RequestLogRepository {
         filters: SummaryFilters = {},
     ): SummaryClientBucket[] {
         const { clause, params } = this.summaryWhere(fromTs, toTs, filters);
-        const rows = this.db
-            .prepare(
+        const stmt = this.stmt(
                 `
             SELECT
                 client_key AS client,
@@ -393,8 +399,8 @@ export class RequestLogRepository {
             GROUP BY client_key
             ORDER BY requests DESC
         `,
-            )
-            .all(...params) as Array<SummaryAggRow & { client: string | null }>;
+            );
+        const rows = stmt.all(...params) as Array<SummaryAggRow & { client: string | null }>;
         return rows.map((r) => ({ client: r.client, ...toSummaryCounts(r) }));
     }
 
