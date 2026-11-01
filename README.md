@@ -239,6 +239,56 @@ expuesto en la API admin (`POST /admin/clients`, `PATCH`, `/:id/rotate`,
 
 ---
 
+## Migraciones de base de datos (`pnpm db:migrate`)
+
+Aplica las migraciones SQL pendientes de `migrations/` a la base del gateway y
+reporta qué hizo. Usa el **mismo** `MigrationRunner` que el arranque del
+servidor, así que deja el mismo registro en `_migrations`: lo aplicado acá se
+saltea en el próximo boot y viceversa. No hay otra forma de aplicar DDL — si se
+aplicara por fuera, el servidor reintentaría el archivo y fallaría con
+`table already exists`.
+
+Corre el **`dist/` compilado**, así que primero hay que compilar (la migración
+que se aplica es la que el servidor compilado espera encontrar):
+
+```bash
+pnpm build
+
+# Aplicar lo pendiente (imprime la lista aplicada, la salteada y los ms totales)
+pnpm db:migrate
+
+# Ver qué está aplicado y qué falta, sin escribir nada
+pnpm db:migrate -- --status
+
+# Igual que --status pero redactado como "would apply"
+pnpm db:migrate -- --dry-run
+
+# Copia consistente de la DB antes de aplicar (VACUUM INTO)
+pnpm db:migrate -- --backup
+
+# Apuntar a otra base (por defecto toma DATABASE_PATH de .env)
+pnpm db:migrate -- --db ./data/otra.db
+```
+
+Cada corrida imprime la **ruta absoluta de la base y del directorio de
+migraciones** al empezar: este comando puede tocar un entorno real, así que no
+deja lugar a dudas sobre qué base se modificó.
+
+- `--backup` escribe `<db-sin-extensión>.backup-<timestamp-UTC>.db` con
+  `VACUUM INTO` (síncrono, copia consistente y compactada; requiere SQLite
+  3.27+, la versión se reporta en la salida). Nunca sobrescribe: si el nombre ya
+  existe agrega `-2`, `-3`, …
+- **Pará el gateway antes.** Las migraciones toman el lock de escritura de
+  SQLite; si la base está bloqueada el comando falla con `SQLITE_BUSY` (no
+  reintenta: solo espera el timeout por defecto de `better-sqlite3`, ~5 s) en
+  vez de quedarse colgado.
+- Si falla una migración, cada archivo corre en su propia transacción: se
+  revierte y la base queda como estaba. El error se imprime tal cual.
+- El servidor correría estas mismas migraciones al arrancar; el comando existe
+  para hacerlo **a propósito**, ver el estado y medir cuánto tarda.
+
+---
+
 ## Documentación
 
 | Documento | Contenido |
@@ -254,5 +304,5 @@ expuesto en la API admin (`POST /admin/clients`, `PATCH`, `/:id/rotate`,
 
 - **Logs de proceso:** stdout (pino/Nest logger) + NewRelic/Sentry según config.
 - **Shutdown:** señal `SIGTERM` → cierre graceful de Fastify.
-- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `migrations/` (raíz, `0001`–`0014`); seed de proveedores al primer boot.
+- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `migrations/` (raíz, `0001`–`0014`); seed de proveedores al primer boot. Aplicación deliberada y medible: `pnpm db:migrate` (ver arriba).
 - **Redis:** solo para cache de auth (TTL 5 min). Caída → fallback a SQLite.

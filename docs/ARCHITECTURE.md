@@ -220,6 +220,16 @@ Conexión singleton vía `DatabaseService` (`better-sqlite3`, síncrono). Path:
 migraciones (`migrations/`) y siembra el registro de proveedores
 (`migrations/seeds/0001_initial_providers.json`).
 
+> Aplicación **out-of-band**: `pnpm db:migrate` (CLI en
+> `src/database/migrations/migrate-cli.ts`, shim `scripts/db-migrate.js`) aplica
+> las migraciones pendientes a mano usando **el mismo `MigrationRunner`** y el
+> **mismo libro en `_migrations`** que el boot. No reimplementa nada: si el CLI
+> aplicara DDL por otra vía, el servidor reintentaría el archivo al arrancar y
+> fallaría con `table already exists`. Corre el `dist/` compilado (requiere
+> `pnpm build`) y soporta `--status`, `--dry-run` y `--backup` (`VACUUM INTO`).
+> El gateway debe estar detenido: las migraciones toman el lock de escritura y
+> el CLI falla con `SQLITE_BUSY` en vez de reintentar.
+
 Tablas (migraciones `0001`–`0014`):
 
 | Tabla | Contenido |
