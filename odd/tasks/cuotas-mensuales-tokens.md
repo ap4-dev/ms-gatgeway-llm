@@ -259,6 +259,35 @@ Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
   `resolveTarget` (integración con SQLite `:memory:`); 404 en alias inexistente.
 - **Commit:** `feat(admin): manage per-client alias quotas`
 
+### T7 — Observabilidad de la degradación
+- **Superficies:** `request-log.repository.ts`, `request-log.service.ts`,
+  `llm-logging.service.ts`, `chat.service.ts` (+ specs),
+  `admin-quota.controller.ts` (+spec), `admin-stats.controller.spec.ts`,
+  `admin-logs.controller.spec.ts`
+- **Hacer:** persistir `served_alias` en las filas de éxito, fallo e intento;
+  `servedAlias` + `quotaDivertedFrom` en el evento `chat.request` (el segundo sólo
+  cuando hubo desvío, para no alterar la forma del evento normal); hilar el target
+  resuelto por `recordSuccess` y `recordFailure`.
+- **Por qué T7 antes de T6:** la reconciliación lee `request_logs`. Sin
+  `served_alias` poblado, todo el tráfico desviado se imputaría a `codex` y el
+  recálculo consolidaría el error en vez de repararlo.
+- **Hallazgos cerrados:** R3-001 (si `recordSuccess` lanzaba dentro del handler del
+  stream, el tail sólo logueaba: no había fila ni incremento, y ese gasto quedaba
+  irrecuperable — ahora el tail acredita una estimación de prompt con un flag
+  explícito que impide el doble conteo) y R3-002 (la validación de alias por
+  truthiness dejaba pasar `constructor`, `toString`, `__proto__`).
+- **Deuda saldada de paso:** los dos specs de admin armaban el schema de
+  `request_logs` a mano; una columna nueva rompía 39 tests ajenos. Ahora usan la
+  cadena real de migraciones.
+- **Test:** desviado → `served_alias='slave'` con `model_requested='codex'` y
+  `quotaDivertedFrom` en el evento; no desviado → `served_alias='codex'` y la clave
+  `quotaDivertedFrom` **ausente** (no nula); desviado que falla al rutear → también
+  registra el alias servido; `recordSuccess` que lanza → acredita exactamente una
+  vez por el tail.
+- **Commit:** `023eeac` — `feat(quota): make silent degradation observable end to end`
+  (12 archivos, +648/−28; 656/656 tests, `tsc` exit 0; review `review-9b100c91fec0e368`
+  aprobado, 0 bloqueantes, 6 hallazgos informativos)
+
 ### T6 — Reconciliación y documentación
 - **Superficies:** `src/quota/quota-reconcile.service.ts` (+spec),
   `docs/API.md`, `docs/ARCHITECTURE.md`, `README.md`
@@ -283,8 +312,10 @@ Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
 ## 9. Orden
 
 ```
-T1 → T2 → T3 → T4 → T5 → T6
+T1 → T2 → T3 → T4 → T5 → T7 → T6
 ```
+
+T7 se adelantó a T6: la reconciliación depende de que `served_alias` esté poblado.
 Sin dependencias cruzadas con routing, circuit breaker ni el walk de fallback.
 
 ## 10. Fuera de alcance (cerrado)
