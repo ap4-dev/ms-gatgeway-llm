@@ -52,14 +52,7 @@ export class ChatController {
                 reply.raw.end();
             } catch (err: any) {
                 if (err instanceof QuotaExhaustedError) {
-                    // The reply is hijacked, but nothing has been flushed yet, so
-                    // Fastify still lets us set the status and headers on the raw
-                    // response. That window closes as soon as the first byte is
-                    // written — which is exactly why this must happen first.
-                    reply.raw.statusCode = 429;
-                    reply.raw.setHeader('Retry-After', String(quotaRetryAfterSeconds(err)));
-                    reply.raw.write(`data: ${JSON.stringify(openAiQuotaErrorBody(err))}\n\n`);
-                    reply.raw.end();
+                    this.writeQuotaErrorFrame(reply, err);
                 } else {
                     reply.raw.write(`data: ${JSON.stringify({ error: { message: err?.message || 'upstream error' } })}\n\n`);
                     reply.raw.end();
@@ -81,5 +74,32 @@ export class ChatController {
             }
             return reply.code(500).send({ error: { message: err?.message || 'upstream error' } });
         }
+    }
+
+    /**
+     * Emit the quota error frame on an already-hijacked SSE response.
+     *
+     * The 429 claim is only truthful while the status line is still unflushed:
+     * `reply.raw.statusCode` is applied when headers are written, so assigning
+     * it after the first byte is silently ignored and the client keeps the 200
+     * it already received. Hence the `headersSent` guard — once the bytes are
+     * gone the frame is the only channel left to explain the cut, and writing
+     * it unconditionally keeps that explanation coming.
+     */
+    private writeQuotaErrorFrame(
+        reply: FastifyReply,
+        err: QuotaExhaustedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 429;
+            reply.raw.setHeader(
+                'Retry-After',
+                String(quotaRetryAfterSeconds(err)),
+            );
+        }
+        reply.raw.write(
+            `data: ${JSON.stringify(openAiQuotaErrorBody(err))}\n\n`,
+        );
+        reply.raw.end();
     }
 }

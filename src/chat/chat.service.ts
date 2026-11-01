@@ -138,56 +138,77 @@ export class ChatService {
             // requestedAt to the last byte the client received.
             const messagesForEstimation = (body.messages ?? []) as unknown[];
             const { stream, logged } = teeStream(r.result);
+            // Two-argument `then`, NOT `then(...).catch(...)`: a single-argument
+            // chain also routes an exception thrown by OUR success handler into
+            // the rejected-stream handler, which would write a SECOND
+            // `request_logs` row and account the same request twice — the exact
+            // table reconciliation later trusts. The trailing `catch` therefore
+            // only ever sees a failure of our own post-processing.
             logged
-                .then((chunks) => {
-                    const tokens = extractStreamTokens(
-                        chunks,
-                        messagesForEstimation,
-                    );
-                    this.recordSuccess(
-                        requestedAt,
-                        body.model,
-                        r.providerId,
-                        resolvedModel,
-                        r.attempts.length,
-                        promptHash,
-                        clientId,
-                        tokens,
-                    );
-                    this.accountUsage(
-                        clientId,
-                        target,
-                        tokens?.totalTokens,
-                        requestedAt * 1000,
-                    );
-                })
-                .catch(() => {
-                    // Stream aborted mid-flight or threw before completing.
-                    // Log a best-effort partial row — `extractStreamTokens`
-                    // will fall back to the local estimator on whatever the
-                    // tap captured.
-                    this.recordSuccess(
-                        requestedAt,
-                        body.model,
-                        r.providerId,
-                        resolvedModel,
-                        r.attempts.length,
-                        promptHash,
-                        clientId,
-                        undefined,
-                    );
-                    // The request DID consume upstream prompt tokens even though
-                    // the stream died, and the tap lost its chunk buffer with the
-                    // rejection — so this is a PROMPT-ONLY estimate, produced by
-                    // the same local estimator the stream fallback uses
-                    // (`estimateTokens`), applied to an empty chunk list. Never
-                    // lose the spend (feature plan §5, risk R3).
-                    this.accountUsage(
-                        clientId,
-                        target,
-                        estimateTokens([], messagesForEstimation)
-                            .promptTokens,
-                        requestedAt * 1000,
+                .then(
+                    (chunks) => {
+                        const tokens = extractStreamTokens(
+                            chunks,
+                            messagesForEstimation,
+                        );
+                        this.recordSuccess(
+                            requestedAt,
+                            body.model,
+                            r.providerId,
+                            resolvedModel,
+                            r.attempts.length,
+                            promptHash,
+                            clientId,
+                            tokens,
+                        );
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            tokens?.totalTokens,
+                            requestedAt * 1000,
+                        );
+                    },
+                    () => {
+                        // Stream aborted mid-flight or threw before completing.
+                        // Log a best-effort partial row — `extractStreamTokens`
+                        // will fall back to the local estimator on whatever the
+                        // tap captured.
+                        this.recordSuccess(
+                            requestedAt,
+                            body.model,
+                            r.providerId,
+                            resolvedModel,
+                            r.attempts.length,
+                            promptHash,
+                            clientId,
+                            undefined,
+                        );
+                        // The request DID consume upstream prompt tokens even though
+                        // the stream died, and the tap lost its chunk buffer with the
+                        // rejection — so this is a PROMPT-ONLY estimate, produced by
+                        // the same local estimator the stream fallback uses
+                        // (`estimateTokens`), applied to an empty chunk list. Never
+                        // lose the spend (feature plan §5, risk R3).
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            estimateTokens([], messagesForEstimation)
+                                .promptTokens,
+                            requestedAt * 1000,
+                        );
+                    },
+                )
+                // Reachable ONLY when our own handler above threw: the derived
+                // promise rejected. Node 15+ terminates the process on an
+                // unhandled rejection, so this tail is mandatory, not defensive
+                // noise. The row is already written by `recordSuccess` (or its
+                // write is what threw); a missing count is repaired by
+                // reconciliation, a duplicated one is not.
+                .catch((err) => {
+                    this.logger.warn(
+                        `stream post-processing failed: ${
+                            err instanceof Error ? err.message : String(err)
+                        }`,
                     );
                 });
             return stream;

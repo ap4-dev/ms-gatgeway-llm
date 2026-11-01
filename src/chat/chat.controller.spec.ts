@@ -22,17 +22,20 @@ type FakeRaw = {
     headers: Record<string, string | number>;
     written: string[];
     ended: boolean;
+    /** Node flips this to `true` on the first flushed byte. */
+    headersSent: boolean;
     setHeader: (name: string, value: string | number) => void;
     write: (chunk: string) => boolean;
     end: () => void;
 };
 
-function makeReply() {
+function makeReply(opts: { headersSent?: boolean } = {}) {
     const raw: FakeRaw = {
         statusCode: 200,
         headers: {},
         written: [],
         ended: false,
+        headersSent: opts.headersSent ?? false,
         setHeader(name, value) {
             raw.headers[name] = value;
         },
@@ -134,6 +137,53 @@ describe('ChatController quota mapping', () => {
         const payload = JSON.parse(reply.raw.written[0].replace(/^data: /, '').trim());
         expect(payload.error.alias).toBe('codex');
         expect(payload.error.type).toBe('insufficient_quota');
+        expect(reply.raw.ended).toBe(true);
+    });
+
+    it('claims the 429 and Retry-After on a streamed quota error while no byte is flushed', async () => {
+        // R3-002: the claim is only truthful before the status line leaves.
+        const completions = jest.fn(async () => {
+            throw quotaError();
+        });
+        const { controller } = makeController(completions);
+        const reply = makeReply({ headersSent: false });
+
+        await controller.completions(
+            { model: 'codex', stream: true } as any,
+            makeRequest(),
+            reply as any,
+        );
+
+        expect(reply.raw.statusCode).toBe(429);
+        expect(reply.raw.headers['Retry-After']).toBe(String(15 * 86_400 + 43_200));
+        expect(reply.raw.written).toHaveLength(1);
+        expect(reply.raw.written[0]).toMatch(/^data: .*\n\n$/);
+        const payload = JSON.parse(reply.raw.written[0].replace(/^data: /, '').trim());
+        expect(payload.error.code).toBe('quota_exhausted');
+        expect(reply.raw.ended).toBe(true);
+    });
+
+    it('writes the quota frame but never rewrites status or headers once bytes are gone', async () => {
+        // The 200 is already on the wire: assigning 429 here would only
+        // pretend, so the client must learn the reason from the frame alone.
+        const completions = jest.fn(async () => {
+            throw quotaError();
+        });
+        const { controller } = makeController(completions);
+        const reply = makeReply({ headersSent: true });
+
+        await controller.completions(
+            { model: 'codex', stream: true } as any,
+            makeRequest(),
+            reply as any,
+        );
+
+        expect(reply.raw.statusCode).toBe(200);
+        expect(reply.raw.headers['Retry-After']).toBeUndefined();
+        expect(reply.raw.written).toHaveLength(1);
+        const payload = JSON.parse(reply.raw.written[0].replace(/^data: /, '').trim());
+        expect(payload.error.code).toBe('quota_exhausted');
+        expect(payload.error.alias).toBe('codex');
         expect(reply.raw.ended).toBe(true);
     });
 

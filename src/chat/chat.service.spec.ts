@@ -583,6 +583,46 @@ describe('ChatService quota gate', () => {
         expect(harness.recordSuccess.mock.calls[0][7]).toBeUndefined();
     });
 
+    it('does not fall back to the rejected-stream handler when the success handler throws', async () => {
+        // R3-001: `logged.then(f).catch(g)` also routes a throw from `f` into
+        // `g`, which writes a SECOND request_logs row + a second accounting
+        // entry for the same request. Force `f` to throw by making the row
+        // write inside `recordSuccess` blow up; the rejected-stream handler
+        // must stay unreachable.
+        const harness = makeQuotaHarness({ result: usageStream() });
+        harness.recordSuccess.mockImplementationOnce(() => {
+            throw new Error('sqlite write failed');
+        });
+        const warn = jest
+            .spyOn(Logger.prototype, 'warn')
+            .mockImplementation(() => undefined as any);
+
+        const result = await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES, stream: true } as any,
+            'client-1',
+        );
+
+        // The post-processing failure happens off the response path, so the
+        // consumer still drains the stream cleanly.
+        const chunks: any[] = [];
+        for await (const chunk of result as AsyncIterable<any>) {
+            chunks.push(chunk);
+        }
+        await flushAsync();
+
+        expect(chunks).toHaveLength(3);
+        // Exactly one attempt: a second call would be the rejected-stream
+        // branch re-recording the same request.
+        expect(harness.recordSuccess).toHaveBeenCalledTimes(1);
+        // The prompt-only estimate of the rejected-stream branch must not run
+        // either — it would double-count the spend.
+        expect(harness.recordUsage).not.toHaveBeenCalled();
+        // The derived rejection is swallowed and reported, never left dangling.
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('stream post-processing failed'),
+        );
+    });
+
     it('never turns a successful response into an error when accounting fails', async () => {
         const harness = makeQuotaHarness({ result: bufferedResult() });
         harness.recordUsage.mockImplementationOnce(() => {
