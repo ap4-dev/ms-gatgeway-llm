@@ -42,6 +42,27 @@ interface UsageDbRow {
 }
 
 /**
+ * One `(client, alias)` total recomputed from `request_logs` for a window.
+ *
+ * `aliasKey` is the alias ACTUALLY SERVED — `served_alias` when the row has
+ * one, `model_requested` only as the fallback for rows written before
+ * migration 0014. Requesting and serving are therefore separate facts, which
+ * is what keeps a diverted request attributed to its divert target.
+ */
+export interface RequestLogUsageAggregate {
+    clientId: string;
+    aliasKey: string;
+    tokens: number;
+    requests: number;
+}
+
+/** Unix-second half-open window `[fromTs, toTs)` over `requested_at`. */
+export interface RequestLogUsageRange {
+    fromTs: number;
+    toTs: number;
+}
+
+/**
  * SQLite-backed repository for the per-(client × alias) monthly token quota
  * (migration `0014_client_alias_quotas.sql`).
  *
@@ -63,8 +84,11 @@ export class QuotaRepository {
         listQuotasByClient: Database.Statement;
         getUsage: Database.Statement;
         addUsage: Database.Statement;
+        setUsage: Database.Statement;
         listUsageByPeriod: Database.Statement;
         listUsageByClientPeriod: Database.Statement;
+        listAllQuotas: Database.Statement;
+        aggregateRequestLogUsage: Database.Statement;
     };
 
     constructor(private readonly db: Database.Database) {
@@ -104,6 +128,52 @@ export class QuotaRepository {
             listUsageByClientPeriod: this.db.prepare(
                 'SELECT client_id, alias_key, period_key, tokens, requests, updated_at FROM client_alias_usage WHERE client_id = ? AND period_key = ? ORDER BY alias_key',
             ),
+            /**
+             * Absolute-value write, the reconciliation counterpart of
+             * `addUsage`: whatever the recomputation says the totals ARE, not a
+             * delta on top of them. That is what makes running reconcile twice
+             * a no-op instead of a double charge. `updated_at` is bumped either
+             * way so the row records when it was last repaired.
+             */
+            setUsage: this.db.prepare(`
+                INSERT INTO client_alias_usage (client_id, alias_key, period_key, tokens, requests, updated_at)
+                VALUES (?, ?, ?, ?, ?, unixepoch())
+                ON CONFLICT (client_id, alias_key, period_key)
+                DO UPDATE SET tokens     = excluded.tokens,
+                              requests   = excluded.requests,
+                              updated_at = unixepoch()
+            `),
+            listAllQuotas: this.db.prepare(
+                'SELECT client_id, alias_key, monthly_token_limit, divert_alias_key, created_at, updated_at FROM client_alias_quotas ORDER BY client_id, alias_key',
+            ),
+            /**
+             * Per-`(client, served alias)` totals rebuilt from `request_logs`.
+             *
+             * `COALESCE(served_alias, model_requested)` is the whole point: the
+             * alias that was ROUTED owns the tokens, so traffic diverted from
+             * `codex` to `slave` lands on `slave` and never contaminates the
+             * exhausted counter it was diverted away from. The fallback keeps
+             * rows written before migration 0014 attributable at all.
+             *
+             * NULL `client_key` rows are unattributable and dropped here, and
+             * the window is half-open `[from, to)` so two adjacent months can
+             * never count the same boundary row twice. `SUM` is coalesced per
+             * column because `total_tokens` is nullable (rows written before
+             * migration 0003 added the column, and failed attempts) while
+             * `COUNT(*)` is not.
+             */
+            aggregateRequestLogUsage: this.db.prepare(`
+                SELECT client_key                              AS client_id,
+                       COALESCE(served_alias, model_requested) AS alias_key,
+                       COUNT(*)                                AS requests,
+                       COALESCE(SUM(COALESCE(total_tokens, 0)), 0) AS tokens
+                FROM request_logs
+                WHERE requested_at >= ?
+                  AND requested_at < ?
+                  AND client_key IS NOT NULL
+                GROUP BY client_key, COALESCE(served_alias, model_requested)
+                ORDER BY client_id, alias_key
+            `),
         };
     }
 
@@ -148,6 +218,17 @@ export class QuotaRepository {
         return (this.stmts.listQuotasByClient.all(clientId) as QuotaDbRow[]).map(toQuota);
     }
 
+    /**
+     * Every quota row in the database, ordered by `client_id` then `alias_key`.
+     *
+     * Reconciliation needs the full set rather than a per-client read: it
+     * verifies any number of clients in one pass and must not issue N + 1
+     * queries to do it.
+     */
+    listAllQuotas(): ClientAliasQuota[] {
+        return (this.stmts.listAllQuotas.all() as QuotaDbRow[]).map(toQuota);
+    }
+
     // --- usage counters -------------------------------------------------
 
     /** `null` when nothing has been recorded for `(client, alias, period)` yet. */
@@ -183,6 +264,53 @@ export class QuotaRepository {
     /** Every usage counter for one period, ordered by client then alias. */
     listUsageByPeriod(periodKey: string): ClientAliasUsage[] {
         return (this.stmts.listUsageByPeriod.all(periodKey) as UsageDbRow[]).map(toUsage);
+    }
+
+    /**
+     * Overwrite the stored counter with the given totals (reconciliation only).
+     *
+     * Same row shape and same UPSERT as `addUsage`, but ABSOLUTE: the caller
+     * passes what the recomputation found, so re-running it is idempotent.
+     * `requests` is required, unlike `addUsage`'s implicit `+ 1`, because the
+     * recomputation counts rows rather than observing a single request.
+     */
+    setUsage(input: {
+        clientId: string;
+        aliasKey: string;
+        periodKey: string;
+        tokens: number;
+        requests: number;
+    }): void {
+        this.stmts.setUsage.run(
+            input.clientId,
+            input.aliasKey,
+            input.periodKey,
+            input.tokens,
+            input.requests,
+        );
+    }
+
+    /**
+     * Recompute `(client, served alias)` totals from `request_logs`.
+     *
+     * Read-only and repository-scoped: the quota domain owns the interpretation
+     * (which pairs actually count) while the SQL that projects `request_logs`
+     * stays here next to the usage statements it feeds.
+     */
+    aggregateRequestLogUsage(range: RequestLogUsageRange): RequestLogUsageAggregate[] {
+        const rows = this.stmts.aggregateRequestLogUsage.all(range.fromTs, range.toTs) as Array<{
+            client_id: string;
+            alias_key: string;
+            requests: number;
+            tokens: number;
+        }>;
+
+        return rows.map((r) => ({
+            clientId: r.client_id,
+            aliasKey: r.alias_key,
+            tokens: r.tokens,
+            requests: r.requests,
+        }));
     }
 
     /**

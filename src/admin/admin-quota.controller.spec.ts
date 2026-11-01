@@ -3,6 +3,10 @@ import { AdminQuotaController } from './admin-quota.controller';
 import type { ClientService } from '../auth/client.service';
 import type { ProviderRegistryService } from '../providers/provider.registry';
 import type { ClientQuotaView, QuotaService } from '../quota/quota.service';
+import type {
+    QuotaReconcileService,
+    ReconcileReport,
+} from '../quota/quota-reconcile.service';
 
 const PERIOD = '2026-11';
 /**
@@ -32,6 +36,18 @@ function makeView(overrides: Partial<ClientQuotaView> = {}): ClientQuotaView {
     };
 }
 
+function makeReport(overrides: Partial<ReconcileReport> = {}): ReconcileReport {
+    return {
+        periodKey: PERIOD,
+        dryRun: true,
+        rowsScanned: 0,
+        pairsConsidered: 0,
+        drift: [],
+        repaired: 0,
+        ...overrides,
+    };
+}
+
 function makeController(options: { views?: ClientQuotaView[] } = {}) {
     const views = options.views ?? [makeView()];
 
@@ -41,6 +57,10 @@ function makeController(options: { views?: ClientQuotaView[] } = {}) {
         removeQuota: jest.fn(() => true),
         periodKey: jest.fn(() => PERIOD),
         retryAfterSeconds: jest.fn(() => RETRY_AFTER),
+    };
+
+    const reconcile = {
+        reconcile: jest.fn((_options: unknown) => makeReport()),
     };
 
     const clients = {
@@ -61,9 +81,10 @@ function makeController(options: { views?: ClientQuotaView[] } = {}) {
         quota as unknown as QuotaService,
         clients as unknown as ClientService,
         registry as unknown as ProviderRegistryService,
+        reconcile as unknown as QuotaReconcileService,
     );
 
-    return { controller, quota, clients, registry };
+    return { controller, quota, clients, registry, reconcile };
 }
 
 describe('AdminQuotaController.listQuotas', () => {
@@ -325,5 +346,103 @@ describe('AdminQuotaController.deleteQuota', () => {
             NotFoundException,
         );
         expect(quota.removeQuota).not.toHaveBeenCalled();
+    });
+});
+
+describe('AdminQuotaController.reconcile', () => {
+    it('is a dry run by default', () => {
+        const { controller, reconcile } = makeController();
+        const report = makeReport({ rowsScanned: 12, pairsConsidered: 2 });
+        reconcile.reconcile.mockReturnValueOnce(report);
+
+        const out = controller.reconcile({});
+
+        // A destructive recompute must never be the accidental default.
+        expect(reconcile.reconcile).toHaveBeenCalledWith({
+            periodKey: undefined,
+            dryRun: true,
+        });
+        expect(out).toEqual(report);
+    });
+
+    it('passes an explicit periodKey through', () => {
+        const { controller, reconcile } = makeController();
+
+        controller.reconcile({ periodKey: '2026-10' });
+
+        expect(reconcile.reconcile).toHaveBeenCalledWith({
+            periodKey: '2026-10',
+            dryRun: true,
+        });
+    });
+
+    it.each(['false', '0'])('writes when dryRun is the string "%s"', (value) => {
+        const { controller, reconcile } = makeController();
+        reconcile.reconcile.mockReturnValueOnce(makeReport({ dryRun: false, repaired: 1 }));
+
+        const out = controller.reconcile({ dryRun: value });
+
+        expect(reconcile.reconcile).toHaveBeenCalledWith({
+            periodKey: undefined,
+            dryRun: false,
+        });
+        expect(out.dryRun).toBe(false);
+        expect(out.repaired).toBe(1);
+    });
+
+    it.each(['true', '1'])('stays read-only when dryRun is the string "%s"', (value) => {
+        const { controller, reconcile } = makeController();
+
+        controller.reconcile({ dryRun: value });
+
+        expect(reconcile.reconcile).toHaveBeenCalledWith({
+            periodKey: undefined,
+            dryRun: true,
+        });
+    });
+
+    it.each(['2026-13', '2026-00', '2026-1', '26-11', 'noviembre'])(
+        'rejects the malformed periodKey "%s" with 400 and reconciles nothing',
+        (periodKey) => {
+            const { controller, reconcile } = makeController();
+
+            let caught: unknown;
+            try {
+                controller.reconcile({ periodKey });
+            } catch (err) {
+                caught = err;
+            }
+
+            expect(caught).toBeInstanceOf(BadRequestException);
+            const response = (
+                caught as BadRequestException
+            ).getResponse() as {
+                error: { code: string; issues: Array<{ path: string }> };
+            };
+            expect(response.error.code).toBe('invalid_query');
+            expect(response.error.issues[0].path).toBe('periodKey');
+            expect(reconcile.reconcile).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each(['yes', '', 'TRUE', '2'])(
+        'rejects the non-boolean dryRun "%s" with 400 and reconciles nothing',
+        (dryRun) => {
+            const { controller, reconcile } = makeController();
+
+            const attempt = () => controller.reconcile({ dryRun });
+
+            expect(attempt).toThrow(BadRequestException);
+            expect(reconcile.reconcile).not.toHaveBeenCalled();
+        },
+    );
+
+    it('rejects an unknown query parameter with 400 and reconciles nothing', () => {
+        const { controller, reconcile } = makeController();
+
+        const attempt = () => controller.reconcile({ force: 'true' });
+
+        expect(attempt).toThrow(BadRequestException);
+        expect(reconcile.reconcile).not.toHaveBeenCalled();
     });
 });

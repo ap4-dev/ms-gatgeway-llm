@@ -6,7 +6,9 @@ import {
     Get,
     NotFoundException,
     Param,
+    Post,
     Put,
+    Query,
     UseGuards,
 } from '@nestjs/common';
 import {
@@ -17,6 +19,7 @@ import {
     ApiOkResponse,
     ApiOperation,
     ApiParam,
+    ApiQuery,
     ApiTags,
     ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
@@ -30,6 +33,8 @@ import { RequireScopes } from '../auth/require-scopes.decorator';
 import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import { ProviderRegistryService } from '../providers/provider.registry';
 import { QuotaService } from '../quota/quota.service';
+import { QuotaReconcileService } from '../quota/quota-reconcile.service';
+import type { ReconcileReport } from '../quota/quota-reconcile.service';
 import {
     describeClientQuotas,
     type ClientQuotasView,
@@ -65,6 +70,36 @@ type PutQuotasDto = z.infer<typeof PutQuotasSchema>;
  */
 const PutQuotasPipe = new ZodValidationPipe(PutQuotasSchema);
 
+/** `YYYY-MM` only — the same shape `QuotaReconcileService` validates. */
+const PERIOD_KEY_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/**
+ * `dryRun` arrives as a query STRING, and `z.coerce.boolean()` is unusable
+ * here: `Boolean('false')` is `true`, so `?dryRun=false` would silently
+ * dry-run the write the operator explicitly asked for. Only the literals below
+ * map to a boolean; anything else (`?dryRun=yes`, `?dryRun=`) is a 400.
+ */
+const DryRunQuerySchema = z
+    .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+    .transform((value) => value === true || value === 'true' || value === '1');
+
+/**
+ * Query schema for `POST /admin/quotas/reconcile`. Both parameters are
+ * optional: the month defaults to the one in progress and `dryRun` defaults to
+ * `true` in the handler (not here, so "absent" stays distinguishable).
+ */
+const ReconcileQuerySchema = z
+    .object({
+        periodKey: z
+            .string()
+            .regex(PERIOD_KEY_PATTERN, 'expected a UTC calendar month as YYYY-MM')
+            .optional(),
+        dryRun: DryRunQuerySchema.optional(),
+    })
+    .strict();
+
+type ReconcileQuery = z.infer<typeof ReconcileQuerySchema>;
+
 interface QuotaDeletedView {
     deleted: true;
     clientId: string;
@@ -82,8 +117,12 @@ interface QuotaDeletedView {
  * design — the registry checks cannot live in the service without dragging the
  * provider registry into the quota domain, and cannot live in zod because the
  * alias map is injected.
+ *
+ * `POST admin/quotas/reconcile` lives here too, but owns only query parsing: the
+ * recomputation itself (and the `dryRun` write rule) belongs to
+ * `QuotaReconcileService`, which is the only writer of absolute counters.
  */
-@Controller('admin/clients')
+@Controller()
 @UseGuards(ApiKeyAuthGuard, RequireScopesGuard, RateLimitGuard)
 @RequireScopes('admin')
 @ApiTags('admin · quota')
@@ -97,9 +136,17 @@ export class AdminQuotaController {
         private readonly quota: QuotaService,
         private readonly clients: ClientService,
         private readonly registry: ProviderRegistryService,
+        private readonly reconciler: QuotaReconcileService,
     ) {}
 
-    @Get(':id/quotas')
+    /*
+     * Paths are declared per method instead of on `@Controller(...)`: this file
+     * serves two prefixes (`/admin/clients/:id/quotas` and
+     * `/admin/quotas/reconcile`), and one class with explicit paths keeps both
+     * surfaces on the same guards, scope and Swagger tag.
+     */
+
+    @Get('admin/clients/:id/quotas')
     @ApiOperation({
         summary: 'List the monthly token quotas of one client.',
         description:
@@ -139,7 +186,7 @@ export class AdminQuotaController {
         return describeClientQuotas(this.quota, id);
     }
 
-    @Put(':id/quotas')
+    @Put('admin/clients/:id/quotas')
     @ApiOperation({
         summary: 'Upsert one or more monthly token quotas (idempotent).',
         description:
@@ -197,7 +244,7 @@ export class AdminQuotaController {
         return describeClientQuotas(this.quota, id);
     }
 
-    @Delete(':id/quotas/:aliasKey')
+    @Delete('admin/clients/:id/quotas/:aliasKey')
     @ApiOperation({
         summary: 'Remove one alias allowance; the alias becomes unlimited.',
         description: '404 when there was no quota row, so a typo is visible.',
@@ -228,6 +275,67 @@ export class AdminQuotaController {
         return { deleted: true, clientId: id, aliasKey };
     }
 
+    @Post('admin/quotas/reconcile')
+    @ApiOperation({
+        summary: 'Recompute alias usage for a month from `request_logs` (idempotent).',
+        description:
+            'Rebuilds `client_alias_usage` from the persisted request logs, the durable record of ' +
+            'what was actually served. `served_alias` decides who pays, so a request diverted from ' +
+            'an exhausted alias is charged to its divert target and never to the alias it was diverted ' +
+            'away from. Only pairs that OWN a quota row are reconciled — the same rule the live ' +
+            'accounting applies. Writes are absolute values, so running this twice is a no-op. ' +
+            '`dryRun` defaults to `true`: a destructive recompute should not be the accidental default.',
+    })
+    @ApiQuery({
+        name: 'periodKey',
+        required: false,
+        example: '2026-11',
+        description: 'UTC calendar month (`YYYY-MM`). Defaults to the month in progress.',
+    })
+    @ApiQuery({
+        name: 'dryRun',
+        required: false,
+        example: 'true',
+        description: '`true` (default) reports drift without writing; `false` repairs it.',
+    })
+    @ApiOkResponse({
+        description: 'Reconciliation report.',
+        schema: {
+            example: {
+                periodKey: '2026-11',
+                dryRun: true,
+                rowsScanned: 4_120,
+                pairsConsidered: 3,
+                drift: [
+                    {
+                        clientId: 'tenant-acme',
+                        aliasKey: 'codex',
+                        storedTokens: 19_999_000,
+                        computedTokens: 20_000_150,
+                        storedRequests: 120,
+                        computedRequests: 121,
+                    },
+                ],
+                repaired: 0,
+            },
+        },
+    })
+    @ApiBadRequestResponse({
+        description:
+            'Malformed query: `periodKey` is not `YYYY-MM`, `dryRun` is not a boolean, or an unknown parameter was sent.',
+    })
+    reconcile(@Query() raw: Record<string, string | boolean | undefined>): ReconcileReport {
+        const q = this.parseReconcileQuery(raw);
+
+        return this.reconciler.reconcile({
+            periodKey: q.periodKey,
+            // Absent means read-only. `dryRun` is already normalised above, so
+            // this default is the only place the "dry run unless told
+            // otherwise" rule lives.
+            dryRun: q.dryRun ?? true,
+        });
+    }
+
     // --- internals -------------------------------------------------------
 
     private mustFindClient(id: string): Client {
@@ -250,6 +358,33 @@ export class AdminQuotaController {
         const parsed = PutQuotasPipe.transform(body, { type: 'body' }) as PutQuotasDto;
         this.assertAliasesExist(parsed.quotas);
         return parsed.quotas;
+    }
+
+    /**
+     * Validate the reconcile query with the same envelope the other admin
+     * endpoints use (`invalid_query` + per-issue `path`/`message`), then hand the
+     * normalised values to the handler. Both parameters are optional, so an
+     * empty query is valid and means "current month, dry run".
+     */
+    private parseReconcileQuery(
+        raw: Record<string, string | boolean | undefined>,
+    ): ReconcileQuery {
+        const parsed = ReconcileQuerySchema.safeParse(raw);
+        if (!parsed.success) {
+            throw new BadRequestException({
+                error: {
+                    message: 'Invalid query parameters',
+                    type: 'invalid_request_error',
+                    code: 'invalid_query',
+                    issues: parsed.error.issues.map((issue) => ({
+                        path: issue.path.join('.'),
+                        message: issue.message,
+                    })),
+                },
+            });
+        }
+
+        return parsed.data;
     }
 
     private assertAliasesExist(quotas: PutQuotasDto['quotas']): void {

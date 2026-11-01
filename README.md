@@ -24,7 +24,8 @@ autenticación por cliente (API keys) y logging de requests — todo persistido 
 | Circuit breaker | Por proveedor: `closed` / `open` / `half-open`; fallback a la siguiente posición de la chain |
 | API keys por cliente | Formato `sk-` + 64 hex. Hash `HMAC-SHA256(pepper, plaintext)` en DB. Scopes, rotación, revocación |
 | Rate limiting | Por cliente: `rate_limit_rpm` (requests/min) y `rate_limit_tpm` (tokens/min) |
-| Request logs | SQLite `request_logs`: prompt hash, tokens, latencia, proveedor resuelto |
+| Request logs | SQLite `request_logs`: prompt hash, tokens, latencia, proveedor resuelto, alias servido |
+| Cuotas mensuales | Límite de tokens por **(cliente × alias)** con degradación silenciosa a un alias de respaldo (`divert_alias_key`) |
 | Métricas | `GET /v1/metrics/summary` — ventana `1h/24h/7d` por alias |
 | Health | `GET /v1/health` (proceso) y `GET /v1/health/llm` (por proveedor) |
 | Admin | CRUD de clientes, política de aliases, consulta de logs — scope `admin` |
@@ -109,6 +110,71 @@ la identidad real del upstream.
 
 ---
 
+## Cuotas mensuales de tokens por alias
+
+Un cliente puede tener un **límite mensual de tokens por alias**. La unidad es
+`(cliente × alias)`: sin fila en `client_alias_quotas` el alias es **ilimitado**
+(no se lee ni se escribe uso).
+
+```bash
+KEY="sk-<key-con-scope-admin>"
+
+# Ver las cuotas de un cliente con el uso del mes UTC en curso
+curl -s http://localhost:3000/admin/clients/tenant-acme/quotas \
+  -H "Authorization: Bearer $KEY"
+
+# Asignar (o cambiar) el límite: 20M tokens/mes en `codex` y, al agotarse,
+# rutear en silencio a `slave`
+curl -s -X PUT http://localhost:3000/admin/clients/tenant-acme/quotas \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"quotas":[{"aliasKey":"codex","monthlyTokenLimit":20000000,"divertAliasKey":"slave"}]}'
+
+# Quitar la cuota: el alias vuelve a ser ilimitado
+curl -s -X DELETE http://localhost:3000/admin/clients/tenant-acme/quotas/codex \
+  -H "Authorization: Bearer $KEY"
+```
+
+`aliasKey` y `divertAliasKey` deben existir ya en el registry de aliases (no se
+crean acá), y el límite tiene que ser un entero `> 0`. El `PUT` aplica **toda la
+lista** que manda; no es un reemplazo total del conjunto.
+
+**Qué observa el cliente cuando se agota:**
+
+- **Con `divertAliasKey`** (el caso normal): **nada**. El gateway rutea al alias
+de respaldo, responde `200` con el body de siempre y sin headers extra. El
+alias de respaldo tiene su propia chain principal+fallback.
+- **Sin `divertAliasKey`**: `429` con `code: "quota_exhausted"` y header
+  `Retry-After` hasta el 1º del mes UTC siguiente. En streaming el error llega
+  como frame SSE.
+- El consumo se imputa al alias **servido**, así que el tráfico degradado no
+  sigue gastando la cuota del alias agotado: su contador se congela.
+
+**Subir el límite a mitad de mes** (el caso típico de fin de mes) aplica en la
+**request siguiente**, sin cache ni invalidación: apenas `tokens < límite` otra
+vez, el cliente vuelve a recibir el alias que pidió.
+
+El cliente puede consultar su propio saldo con `GET /v1/quota` (sólo su API key,
+sin scope).
+
+**Si un contador perdió escrituras**, se reconstruye desde `request_logs` (que
+es el registro durable de lo servido):
+
+```bash
+# Primero en seco: reporta el drift sin escribir nada (dryRun=true por defecto)
+curl -s -X POST "http://localhost:3000/admin/quotas/reconcile?periodKey=2026-11" \
+  -H "Authorization: Bearer $KEY"
+
+# Reparar de verdad
+curl -s -X POST "http://localhost:3000/admin/quotas/reconcile?periodKey=2026-11&dryRun=false" \
+  -H "Authorization: Bearer $KEY"
+```
+
+La reconciliación imputa cada request al alias servido, sólo toca pares que
+tienen fila de cuota y escribe valores absolutos: correrla dos veces no cambia
+nada. Detalle de endpoints: [`docs/API.md`](docs/API.md) → `POST /admin/quotas/reconcile`.
+
+---
+
 ## Modificar la estrategia de balanceo
 
 La política de ruteo es **por alias** y se cambia en caliente vía API admin
@@ -188,5 +254,5 @@ expuesto en la API admin (`POST /admin/clients`, `PATCH`, `/:id/rotate`,
 
 - **Logs de proceso:** stdout (pino/Nest logger) + NewRelic/Sentry según config.
 - **Shutdown:** señal `SIGTERM` → cierre graceful de Fastify.
-- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `migrations/` (raíz, `0001`–`0011`); seed de proveedores al primer boot.
+- **DB:** `data/ms-gateway.db` (SQLite). Migraciones en `migrations/` (raíz, `0001`–`0014`); seed de proveedores al primer boot.
 - **Redis:** solo para cache de auth (TTL 5 min). Caída → fallback a SQLite.

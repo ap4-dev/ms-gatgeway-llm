@@ -24,6 +24,39 @@ function makeDb(): Database.Database {
     return db;
 }
 
+/** Unix seconds of the half-open November 2026 window the aggregations use. */
+const NOV_START_S = Date.UTC(2026, 10, 1) / 1000;
+const DEC_START_S = Date.UTC(2026, 11, 1) / 1000;
+
+/**
+ * Minimal `request_logs` insert: only the columns reconciliation reads plus the
+ * NOT NULL ones. `served_alias` is left out when the caller passes `undefined`
+ * so the column stays NULL — that is the older-rows shape the `COALESCE`
+ * fallback exists for.
+ */
+function insertLog(
+    db: Database.Database,
+    row: {
+        requestedAt: number;
+        modelRequested: string;
+        servedAlias?: string | null;
+        clientKey?: string | null;
+        totalTokens?: number | null;
+    },
+): void {
+    db.prepare(
+        `INSERT INTO request_logs (
+            requested_at, model_requested, served_alias, status, client_key, total_tokens
+        ) VALUES (?, ?, ?, 'ok', ?, ?)`,
+    ).run(
+        row.requestedAt,
+        row.modelRequested,
+        row.servedAlias ?? null,
+        row.clientKey ?? null,
+        row.totalTokens === undefined ? 1_000 : row.totalTokens,
+    );
+}
+
 describe('QuotaRepository', () => {
     let db: Database.Database;
     let repo: QuotaRepository;
@@ -272,6 +305,251 @@ describe('QuotaRepository', () => {
                     tokens: -1,
                 }),
             ).toThrow(/CHECK constraint failed/i);
+        });
+    });
+
+    describe('setUsage', () => {
+        it('writes the given totals instead of adding to them', () => {
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'codex', periodKey: '2026-11', tokens: 1_000 });
+
+            repo.setUsage({
+                clientId: 'client-1',
+                aliasKey: 'codex',
+                periodKey: '2026-11',
+                tokens: 7_000,
+                requests: 4,
+            });
+
+            // Absolute, not a delta: 1_000 + 7_000 would be 8_000.
+            expect(repo.getUsage('client-1', 'codex', '2026-11')).toEqual({
+                clientId: 'client-1',
+                aliasKey: 'codex',
+                periodKey: '2026-11',
+                tokens: 7_000,
+                requests: 4,
+                updatedAt: expect.any(Number),
+            });
+        });
+
+        it('creates the row when nothing was stored for the period yet', () => {
+            repo.setUsage({
+                clientId: 'client-1',
+                aliasKey: 'codex',
+                periodKey: '2026-11',
+                tokens: 123,
+                requests: 2,
+            });
+
+            expect(repo.getUsage('client-1', 'codex', '2026-11')).toMatchObject({
+                tokens: 123,
+                requests: 2,
+            });
+        });
+
+        it('is idempotent: the same input twice leaves exactly the same totals', () => {
+            const input = {
+                clientId: 'client-1',
+                aliasKey: 'codex',
+                periodKey: '2026-11',
+                tokens: 5_000,
+                requests: 3,
+            };
+
+            repo.setUsage(input);
+            repo.setUsage(input);
+
+            expect(repo.getUsage('client-1', 'codex', '2026-11')!.tokens).toBe(5_000);
+            expect(repo.getUsage('client-1', 'codex', '2026-11')!.requests).toBe(3);
+        });
+
+        it('touches only the targeted (client, alias, period)', () => {
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'slave', periodKey: '2026-11', tokens: 11 });
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'codex', periodKey: '2026-12', tokens: 12 });
+
+            repo.setUsage({
+                clientId: 'client-1',
+                aliasKey: 'codex',
+                periodKey: '2026-11',
+                tokens: 13,
+                requests: 1,
+            });
+
+            expect(repo.getUsage('client-1', 'slave', '2026-11')!.tokens).toBe(11);
+            expect(repo.getUsage('client-1', 'codex', '2026-12')!.tokens).toBe(12);
+            expect(repo.getUsage('client-1', 'codex', '2026-11')!.tokens).toBe(13);
+        });
+
+        it('rejects negative totals through the CHECKs', () => {
+            expect(() =>
+                repo.setUsage({
+                    clientId: 'client-1',
+                    aliasKey: 'codex',
+                    periodKey: '2026-11',
+                    tokens: -1,
+                    requests: 1,
+                }),
+            ).toThrow(/CHECK constraint failed/i);
+            expect(() =>
+                repo.setUsage({
+                    clientId: 'client-1',
+                    aliasKey: 'codex',
+                    periodKey: '2026-11',
+                    tokens: 1,
+                    requests: -1,
+                }),
+            ).toThrow(/CHECK constraint failed/i);
+        });
+    });
+
+    describe('listAllQuotas', () => {
+        it('returns every pair of every client, ordered by client then alias', () => {
+            repo.upsertQuota({ clientId: 'client-2', aliasKey: 'codex', monthlyTokenLimit: 5 });
+            repo.upsertQuota({ clientId: 'client-1', aliasKey: 'slave', monthlyTokenLimit: 6 });
+            repo.upsertQuota({ clientId: 'client-1', aliasKey: 'codex', monthlyTokenLimit: 7 });
+
+            const rows = repo.listAllQuotas();
+
+            expect(rows.map((r) => `${r.clientId}/${r.aliasKey}`)).toEqual([
+                'client-1/codex',
+                'client-1/slave',
+                'client-2/codex',
+            ]);
+        });
+
+        it('returns an empty array when no quota exists', () => {
+            expect(repo.listAllQuotas()).toEqual([]);
+        });
+    });
+
+    describe('aggregateRequestLogUsage', () => {
+        it('charges the served alias and groups by client', () => {
+            insertLog(db, {
+                requestedAt: NOV_START_S + 60,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                clientKey: 'client-1',
+                totalTokens: 400,
+            });
+            insertLog(db, {
+                requestedAt: NOV_START_S + 61,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                clientKey: 'client-1',
+                totalTokens: 600,
+            });
+            insertLog(db, {
+                requestedAt: NOV_START_S + 62,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-2',
+                totalTokens: 700,
+            });
+
+            const rows = repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S });
+
+            expect(rows.map((r) => `${r.clientId}/${r.aliasKey}/${r.tokens}/${r.requests}`)).toEqual([
+                'client-1/slave/1000/2',
+                'client-2/codex/700/1',
+            ]);
+        });
+
+        it('falls back to model_requested for rows without a served alias', () => {
+            // Older rows predate `served_alias` (migration 0014).
+            insertLog(db, {
+                requestedAt: NOV_START_S + 60,
+                modelRequested: 'codex',
+                servedAlias: null,
+                clientKey: 'client-1',
+                totalTokens: 10,
+            });
+
+            const rows = repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S });
+
+            expect(rows).toEqual([
+                { clientId: 'client-1', aliasKey: 'codex', tokens: 10, requests: 1 },
+            ]);
+        });
+
+        it('skips rows with a NULL client_key', () => {
+            insertLog(db, {
+                requestedAt: NOV_START_S + 60,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: null,
+                totalTokens: 500,
+            });
+            insertLog(db, {
+                requestedAt: NOV_START_S + 61,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: 20,
+            });
+
+            const rows = repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S });
+
+            expect(rows).toEqual([
+                { clientId: 'client-1', aliasKey: 'codex', tokens: 20, requests: 1 },
+            ]);
+        });
+
+        it('treats NULL total_tokens as zero', () => {
+            insertLog(db, {
+                requestedAt: NOV_START_S + 60,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: null,
+            });
+            insertLog(db, {
+                requestedAt: NOV_START_S + 61,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: 30,
+            });
+
+            const rows = repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S });
+
+            expect(rows).toEqual([
+                { clientId: 'client-1', aliasKey: 'codex', tokens: 30, requests: 2 },
+            ]);
+        });
+
+        it('uses a half-open [fromTs, toTs) window', () => {
+            insertLog(db, {
+                requestedAt: NOV_START_S - 1,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: 100,
+            });
+            insertLog(db, {
+                requestedAt: NOV_START_S,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: 200,
+            });
+            insertLog(db, {
+                requestedAt: DEC_START_S,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                clientKey: 'client-1',
+                totalTokens: 300,
+            });
+
+            const rows = repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S });
+
+            // The first instant of the window is IN, the first instant of the
+            // next month is OUT.
+            expect(rows).toEqual([
+                { clientId: 'client-1', aliasKey: 'codex', tokens: 200, requests: 1 },
+            ]);
+        });
+
+        it('returns an empty array when the window has no attributable traffic', () => {
+            expect(repo.aggregateRequestLogUsage({ fromTs: NOV_START_S, toTs: DEC_START_S })).toEqual([]);
         });
     });
 });

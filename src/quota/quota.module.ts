@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { QuotaRepository } from '../database/repositories/quota.repository';
 import { DatabaseService } from '../database/database.service';
 import { QUOTA_CLOCK, QuotaService } from './quota.service';
+import { QuotaReconcileService } from './quota-reconcile.service';
 import { QuotaController } from './quota.controller';
 
 /**
@@ -17,7 +18,9 @@ import { QuotaController } from './quota.controller';
  * to make month rollover and `retryAfter` deterministic.
  *
  * `QuotaService` is exported because the chat pipeline and the admin quota
- * surface are its consumers.
+ * surface are its consumers. `QuotaReconcileService` is exported for the same
+ * admin surface (`POST /admin/quotas/reconcile`), which reaches it through the
+ * `QuotaModule` already imported by `AdminModule`.
  */
 @Module({
     controllers: [QuotaController],
@@ -29,7 +32,8 @@ import { QuotaController } from './quota.controller';
         },
         { provide: QUOTA_CLOCK, useValue: Date.now },
         QuotaService,
+        QuotaReconcileService,
     ],
-    exports: [QuotaService],
+    exports: [QuotaService, QuotaReconcileService],
 })
 export class QuotaModule {}

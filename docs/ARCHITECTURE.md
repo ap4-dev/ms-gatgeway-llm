@@ -220,7 +220,7 @@ Conexión singleton vía `DatabaseService` (`better-sqlite3`, síncrono). Path:
 migraciones (`migrations/`) y siembra el registro de proveedores
 (`migrations/seeds/0001_initial_providers.json`).
 
-Tablas (migraciones `0001`–`0011`):
+Tablas (migraciones `0001`–`0014`):
 
 | Tabla | Contenido |
 |---|---|
@@ -231,7 +231,9 @@ Tablas (migraciones `0001`–`0011`):
 | `alias_weights` | pesos por posición (estrategia `weighted`) |
 | `routing_policy` | knobs globales del breaker/fallback |
 | `clients` | `id`, `name`, `api_key_hash`, `api_key_prefix`, `scopes`, `rate_limit_rpm`, `rate_limit_tpm`, `revoked_at`, `last_used_at` |
-| `request_logs` | `requested_at`, `client_key`, `model_requested`, `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `attempt_details` (+ índices en `0009`) |
+| `request_logs` | `requested_at`, `client_key`, `model_requested`, `served_alias` (0014), `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `attempt_details` (+ índices en `0009`) |
+| `client_alias_quotas` | `client_id`, `alias_key`, `monthly_token_limit`, `divert_alias_key` — una fila = el alias está gateado (0014) |
+| `client_alias_usage` | `client_id`, `alias_key` (alias **servido**), `period_key` (`YYYY-MM` UTC), `tokens`, `requests` (0014) |
 
 > Migraciones `0010` (attempt_details) y `0011` (disable_thinking) — ver
 > `migrations/0010_request_logs_attempts.sql` y `migrations/0011_model_disable_thinking.sql`.
@@ -247,6 +249,61 @@ Tablas (migraciones `0001`–`0011`):
 > alcanza SQLite; si escala, la tabla pasa a Postgres sin cambiar la forma de
 > la respuesta (`GET /admin/logs`).
 
+> Migración `0014` (`migrations/0014_client_alias_quotas.sql`): agrega las dos
+tablas de cuotas y la columna `request_logs.served_alias`. Igual que
+`request_logs.client_key`, **no** hay foreign key a `clients`: la integridad se
+valida en la capa de aplicación y el historial de uso debe sobrevivir al borrado
+de un cliente.
+
+### Cuotas mensuales de tokens por (cliente × alias)
+
+El límite es **por (cliente × alias)**, no por modelo ni por posición dentro de
+una chain. **No tener fila en `client_alias_quotas` significa ilimitado**: el
+gateway no lee ni escribe uso para ese alias, así que un alias abierto (p. ej.
+`slave`) cuesta cero I/O extra por request. Asignar una fila enciende el gate;
+borrarla lo apaga.
+
+- **Sin cache, a propósito.** El requisito es que subir el límite a mitad de mes
+  se vea en la **request siguiente**. Un cache con TTL deja una ventana donde el
+  límite nuevo ya está guardado pero el cliente sigue degradado — exactamente el
+  bug que el diseño evita. Dos lookups por PK en SQLite síncrono son
+  microsegundos: el cache no compra nada y agrega un modo de falla
+  (invalidación/staleness).
+- **Mes calendario UTC.** `period_key` es `YYYY-MM` derivado del timestamp de la
+  request. No hay cron de reset: un mes nuevo es simplemente una clave nueva, y
+  el `Retry-After` de un `429` apunta al 1º del mes UTC siguiente.
+- **Degradar vs. fallar.** Si la fila tiene `divert_alias_key`, al agotarse el
+  alias el gateway **rutea en silencio** a ese alias (sin headers, sin mutar el
+  body): el cliente nunca se entera. Si no lo tiene, responde `429
+  quota_exhausted` con `Retry-After`. Un `divert_alias_key` roto se valida en la
+  API admin; si igual falla en runtime se loguea y se degrada a `429` — nunca se
+  sirve el alias agotado. No hay recursión: el alias de desvío sigue su propia
+  chain principal+fallback.
+- **La contabilidad se imputa al alias SERVIDO**, no al pedido
+  (`client_alias_usage.alias_key`). Así el tráfico degradado **no** consume la
+  cuota del alias agotado: su contador se congela, y subir el límite restaura el
+  acceso en la request siguiente sin tocar ningún estado.
+- **`served_alias` vs. `model_requested` es la señal de degradación.**
+  `model_requested` conserva lo que pidió el cliente; `served_alias` guarda el
+  alias que realmente se ruteó. `WHERE served_alias <> model_requested`
+  identifica las requests degradadas, que de otro modo serían indistinguibles de
+  una llamada normal (D1: degradación silenciosa). El evento estructurado
+  `chat.request` agrega `servedAlias` y, sólo cuando hubo desvío,
+  `quotaDivertedFrom`.
+- **La reconciliación es el camino de reparación.**
+  `POST /admin/quotas/reconcile` (`QuotaReconcileService`) recalcula
+  `client_alias_usage` desde `request_logs` para un mes UTC. Imputa con
+  `COALESCE(served_alias, model_requested)` (así una request desviada de `codex`
+  a `slave` se cobra a `slave`), y sólo reconcilia pares que **tienen** fila de
+  cuota — la misma regla que aplica la contabilidad en vivo, para no inventar
+  filas que el runtime nunca crea. Escribe **valores absolutos** (no deltas), por
+  lo que correrlo dos veces es idempotente, y `dryRun` viene en `true` por
+  defecto: un recálculo destructivo no debe ser el default accidental.
+- **Overshoot aceptado.** El gate es pre-flight y la contabilidad post-hoc: un
+  cliente con 19,9M que pide una request de 3M la recibe y queda en 22,9M; la
+  siguiente ya se degrada. Es el comportamiento estándar de cuota post-paga y
+  evita reservar tokens que el modelo puede no usar.
+
 ---
 
 ## 9. Observabilidad
@@ -255,7 +312,7 @@ Tablas (migraciones `0001`–`0011`):
 |---|---|
 | Logs de proceso | Nest logger / Pino vía Fastify (`bufferLogs`), formato JSON (`AppJsonLogger`) |
 | Logs estructurados de LLM | `LlmLoggingService` — evento `chat.request` a stdout: model, resolvedProvider, promptHash, latency, tokens, status, clientKey |
-| Request logs persistidos | `request_logs` (SQLite) — consultables por `GET /admin/logs` |
+| Request logs persistidos | `request_logs` (SQLite) — consultables por `GET /admin/logs`; `served_alias` distingue requests degradadas (`served_alias <> model_requested`) |
 | Métricas agregadas | `GET /v1/metrics/summary` (ventana 1h/24h/7d, por alias) — `MetricsService` |
 | Health | `GET /v1/health` (memoria), `GET /v1/health/llm` (circuit breakers) |
 | APM / errores | NewRelic (import en `main.ts`) + Sentry (`sentry.instrument.ts`, `APP_FILTER`) |
@@ -270,8 +327,12 @@ scope `admin`.
 ## 10. Superficie admin y Swagger
 
 - **Rutas:** `GET/POST/PATCH/DELETE /admin/clients…`, `GET/PUT
-  /admin/aliases…`, `GET /admin/logs`. Auth: key válida + scope `admin` +
-  rate limit.
+  /admin/aliases…`, `GET/PUT/DELETE /admin/clients/:id/quotas…`,
+  `POST /admin/quotas/reconcile`, `GET /admin/logs`. Auth: key válida + scope
+  `admin` + rate limit.
+- **Saldo propio:** `GET /v1/quota` vive en la superficie pública y **no** está
+  en Swagger. Sólo key válida + rate limit, sin scope: el cliente lee únicamente
+  su propio saldo porque el `client_id` sale de la request autenticada.
 - **Swagger:** `/docs` (UI) y `/docs-json` (spec) — solo documenta el
   AdminModule, fuera del prefijo `/v1`.
 
