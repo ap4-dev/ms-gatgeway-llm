@@ -113,4 +113,67 @@ describe('RequestLogService', () => {
             expect(warnSpy).toHaveBeenCalledTimes(1);
         });
     });
+
+    describe('served alias (0014)', () => {
+        it('forwards servedAlias on a success row', () => {
+            const repo = makeRepo();
+            new RequestLogService(repo).recordSuccess({
+                requestedAt: 1_700_000_000,
+                // Client asked for `codex`, quota diverted to `slave`.
+                requestedModel: 'codex',
+                servedAlias: 'slave',
+                resolvedProvider: 'nan',
+                resolvedModel: 'deepseek-v4-flash',
+                attempts: 1,
+                latencyMs: 250,
+            });
+
+            expect(repo.getLastRow()).toMatchObject({
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                status: 'ok',
+            });
+        });
+
+        it('forwards servedAlias on a failure row (the diversion was decided first)', () => {
+            const repo = makeRepo();
+            new RequestLogService(repo).recordFailure({
+                requestedAt: 1_700_000_000,
+                requestedModel: 'codex',
+                servedAlias: 'slave',
+                attempts: 1,
+                latencyMs: 5_000,
+                error: new Error('all providers failed'),
+            });
+
+            expect(repo.getLastRow()).toMatchObject({
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                status: 'error',
+            });
+        });
+
+        it('stores NULL when no servedAlias is supplied', () => {
+            const repo = makeRepo();
+            const svc = new RequestLogService(repo);
+
+            svc.recordSuccess({
+                requestedAt: 1_700_000_000,
+                requestedModel: 'codex',
+                resolvedProvider: 'nan',
+                resolvedModel: 'qwen3.6',
+                attempts: 1,
+                latencyMs: 250,
+            });
+            expect(repo.getLastRow()?.servedAlias).toBeNull();
+
+            svc.recordFailure({
+                requestedAt: 1_700_000_000,
+                requestedModel: 'codex',
+                attempts: 0,
+                latencyMs: 1,
+            });
+            expect(repo.getLastRow()?.servedAlias).toBeNull();
+        });
+    });
 });

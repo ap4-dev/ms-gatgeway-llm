@@ -182,6 +182,59 @@ describe('AdminQuotaController.upsertQuotas', () => {
         expect(quota.describeQuotas).not.toHaveBeenCalled();
     });
 
+    it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+        'rejects the Object.prototype key "%s" as an alias with 400 and writes nothing',
+        (aliasKey) => {
+            // R3-002: a truthiness lookup on a plain object also matches
+            // inherited keys, so `aliases['constructor']` is truthy even though
+            // no such alias exists. Only an own-property check can tell.
+            const { controller, quota } = makeController();
+
+            const attempt = () =>
+                controller.upsertQuotas(CLIENT_ID, {
+                    quotas: [{ aliasKey, monthlyTokenLimit: 1_000 }],
+                });
+
+            expect(attempt).toThrow(BadRequestException);
+            expect(attempt).toThrow(/quotas\[0\]\.aliasKey/);
+            expect(quota.upsertQuota).not.toHaveBeenCalled();
+            expect(quota.describeQuotas).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each(['constructor', 'toString', '__proto__'])(
+        'rejects the Object.prototype key "%s" as a divertAliasKey with 400 and writes nothing',
+        (divertAliasKey) => {
+            const { controller, quota } = makeController();
+
+            const attempt = () =>
+                controller.upsertQuotas(CLIENT_ID, {
+                    quotas: [
+                        { aliasKey: 'codex', monthlyTokenLimit: 1_000, divertAliasKey },
+                    ],
+                });
+
+            expect(attempt).toThrow(BadRequestException);
+            expect(attempt).toThrow(/quotas\[0\]\.divertAliasKey/);
+            expect(quota.upsertQuota).not.toHaveBeenCalled();
+        },
+    );
+
+    it('rejects an entry whose own value is not an alias chain', () => {
+        // `aliases['toString']` is a function, not a chain: a lookup that only
+        // checked truthiness would hand the router a non-array.
+        const { controller, quota, registry } = makeController();
+        (registry.aliases as Record<string, unknown>).ghostChain = 'not-an-array';
+
+        const attempt = () =>
+            controller.upsertQuotas(CLIENT_ID, {
+                quotas: [{ aliasKey: 'ghostChain', monthlyTokenLimit: 1_000 }],
+            });
+
+        expect(attempt).toThrow(BadRequestException);
+        expect(quota.upsertQuota).not.toHaveBeenCalled();
+    });
+
     it('rejects divertAliasKey equal to aliasKey with 400 and writes nothing', () => {
         const { controller, quota } = makeController();
 

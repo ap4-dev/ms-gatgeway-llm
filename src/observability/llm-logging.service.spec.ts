@@ -81,6 +81,45 @@ describe('LlmLoggingService', () => {
         expect(JSON.parse(warnSpy.mock.calls[0][0]).status).toBe('circuit_open');
     });
 
+    it('carries servedAlias plus quotaDivertedFrom so a silent downgrade is auditable', () => {
+        svc.logRequest({
+            event: 'chat.request',
+            ts: 1_700_000_000,
+            model: 'codex',
+            servedAlias: 'slave',
+            quotaDivertedFrom: 'codex',
+            resolvedProvider: 'nan',
+            resolvedModel: 'deepseek-v4-flash',
+            promptHash: 'abc123',
+            latencyMs: 250,
+            attempts: 1,
+            status: 'ok',
+        });
+        expect(logSpy).toHaveBeenCalledTimes(1);
+        const payload = JSON.parse(logSpy.mock.calls[0][0]);
+        expect(payload.servedAlias).toBe('slave');
+        expect(payload.quotaDivertedFrom).toBe('codex');
+    });
+
+    it('omits quotaDivertedFrom when the request was not diverted', () => {
+        svc.logRequest({
+            event: 'chat.request',
+            ts: 1_700_000_000,
+            model: 'codex',
+            servedAlias: 'codex',
+            resolvedProvider: 'nan',
+            resolvedModel: 'qwen3.6',
+            promptHash: 'abc123',
+            latencyMs: 250,
+            attempts: 1,
+            status: 'ok',
+        });
+        const payload = JSON.parse(logSpy.mock.calls[0][0]);
+        expect(payload.servedAlias).toBe('codex');
+        // Absent, not `null`: the non-diverted event shape is unchanged.
+        expect(payload).not.toHaveProperty('quotaDivertedFrom');
+    });
+
     it('never throws even when the logger would', () => {
         logSpy.mockImplementation(() => {
             throw new Error('log boom');

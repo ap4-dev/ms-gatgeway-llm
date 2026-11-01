@@ -16,6 +16,9 @@ function makeDb(): Database.Database {
     db.exec(
         readFileSync(join(process.cwd(), 'migrations/0013_request_params.sql'), 'utf-8'),
     );
+    // 0014 also creates the quota tables; only its request_logs change matters
+    // here, so the column is added directly instead of loading the whole file.
+    db.exec('ALTER TABLE request_logs ADD COLUMN served_alias TEXT');
     return db;
 }
 
@@ -208,6 +211,68 @@ describe('RequestLogRepository', () => {
             });
             const page = repo.list({ limit: 10 });
             expect(page.items[0].requestParams).toBe('{"model":"fast"}');
+        });
+    });
+
+    describe('served_alias (0014)', () => {
+        it('round-trips servedAlias through append + recent', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 7_000_000,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                resolvedProvider: 'nan',
+                resolvedModel: 'deepseek-v4-flash',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'ok',
+            });
+
+            const [row] = repo.recent(10);
+            // The degraded pair: what was asked for vs what actually served it.
+            expect(row.modelRequested).toBe('codex');
+            expect(row.servedAlias).toBe('slave');
+        });
+
+        it('round-trips servedAlias through append + list', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 7_000_001,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                resolvedProvider: 'nan',
+                resolvedModel: 'deepseek-v4-flash',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'ok',
+                clientKey: 'tenant-acme',
+            });
+
+            const page = repo.list({ limit: 10 });
+            expect(page.items[0].servedAlias).toBe('slave');
+            expect(page.items[0].modelRequested).toBe('codex');
+        });
+
+        it('stores NULL served_alias when no diversion happened', () => {
+            const repo = new RequestLogRepository(db);
+            repo.append({
+                requestedAt: 7_000_002,
+                modelRequested: 'codex',
+                resolvedProvider: 'nan',
+                resolvedModel: 'qwen3.6',
+                attempts: 1,
+                latencyMs: 12,
+                status: 'ok',
+            });
+
+            const raw = db
+                .prepare('SELECT model_requested, served_alias FROM request_logs ORDER BY id DESC LIMIT 1')
+                .get() as Record<string, unknown>;
+            expect(raw.model_requested).toBe('codex');
+            expect(raw.served_alias).toBeNull();
+            // Read-back mapping normalises SQL NULL to `null`, never `undefined`.
+            expect(repo.list({ limit: 1 }).items[0].servedAlias).toBeNull();
+            expect(repo.recent(1)[0].servedAlias).toBeNull();
         });
     });
 

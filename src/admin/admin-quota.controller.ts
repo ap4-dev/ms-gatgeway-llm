@@ -255,8 +255,17 @@ export class AdminQuotaController {
     private assertAliasesExist(quotas: PutQuotasDto['quotas']): void {
         const aliases = this.registry.aliases;
 
+        // R3-002: `aliases[key]` is a truthiness lookup on a plain object, so it
+        // also matches everything inherited from `Object.prototype` — an alias
+        // named `constructor`, `toString` or `__proto__` would sail through and
+        // hand the router a function instead of a chain. Only an OWN property
+        // that actually is an array counts as an alias.
+        const aliasExists = (key: string): boolean =>
+            Object.prototype.hasOwnProperty.call(aliases, key) &&
+            Array.isArray(aliases[key]);
+
         quotas.forEach((entry, index) => {
-            if (!aliases[entry.aliasKey]) {
+            if (!aliasExists(entry.aliasKey)) {
                 throw new BadRequestException(
                     `quotas[${index}].aliasKey: alias "${entry.aliasKey}" is not in the alias registry`,
                 );
@@ -266,7 +275,7 @@ export class AdminQuotaController {
                 return;
             }
 
-            if (!aliases[entry.divertAliasKey]) {
+            if (!aliasExists(entry.divertAliasKey)) {
                 throw new BadRequestException(
                     `quotas[${index}].divertAliasKey: alias "${entry.divertAliasKey}" is not in the alias registry`,
                 );

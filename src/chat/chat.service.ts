@@ -80,6 +80,15 @@ export class ChatService {
             (body.messages ?? []) as any,
             body.model,
         );
+        // Declared OUTSIDE the `try` so the FAILURE path can attribute the alias
+        // that was routed too: a diverted request that then fails is still a
+        // diverted request, and without this its failure row would read as if the
+        // client had asked for `slave`. Left undefined when the gate itself
+        // throws (`QuotaExhaustedError`): nothing was served, so there is no
+        // served alias to record.
+        let quotaOutcome:
+            | { servedAlias: string; divertedFrom: string | null }
+            | undefined;
         try {
             // Monthly quota gate (feature plan §4). Deliberately the FIRST
             // statement inside the `try`: a `QuotaExhaustedError` still has to
@@ -90,6 +99,12 @@ export class ChatService {
             // `model` with the resolved upstream model, so the diversion only
             // needs to reach `route()`'s first argument.
             const target = this.quota.resolveTarget(clientId, body.model);
+            // Computed once, here, because it is the same answer for every
+            // accounting call site below: `null` means "served exactly what was
+            // asked for", a value means a silent quota diversion. Without it
+            // `request_logs` cannot tell a downgraded request from a normal one.
+            const divertedFrom = target === body.model ? null : body.model;
+            quotaOutcome = { servedAlias: target, divertedFrom };
             const r = await this.router.route(target, body, (resolved, signal) =>
                 this.callUpstream(resolved, body, signal),
             );
@@ -120,6 +135,7 @@ export class ChatService {
                     promptHash,
                     clientId,
                     tokens,
+                    quotaOutcome,
                 );
                 this.accountUsage(
                     clientId,
@@ -137,6 +153,10 @@ export class ChatService {
             // finishes iterating. Latency is measured end-to-end — from
             // requestedAt to the last byte the client received.
             const messagesForEstimation = (body.messages ?? []) as unknown[];
+            // Set the instant BOTH halves of the accounting have run. The tail
+            // below reads it to decide whether the quota counter still has to
+            // move; see R3-001 there.
+            let accounted = false;
             const { stream, logged } = teeStream(r.result);
             // Two-argument `then`, NOT `then(...).catch(...)`: a single-argument
             // chain also routes an exception thrown by OUR success handler into
@@ -160,6 +180,7 @@ export class ChatService {
                             promptHash,
                             clientId,
                             tokens,
+                            quotaOutcome,
                         );
                         this.accountUsage(
                             clientId,
@@ -167,6 +188,7 @@ export class ChatService {
                             tokens?.totalTokens,
                             requestedAt * 1000,
                         );
+                        accounted = true;
                     },
                     () => {
                         // Stream aborted mid-flight or threw before completing.
@@ -182,6 +204,7 @@ export class ChatService {
                             promptHash,
                             clientId,
                             undefined,
+                            quotaOutcome,
                         );
                         // The request DID consume upstream prompt tokens even though
                         // the stream died, and the tap lost its chunk buffer with the
@@ -196,15 +219,30 @@ export class ChatService {
                                 .promptTokens,
                             requestedAt * 1000,
                         );
+                        accounted = true;
                     },
                 )
                 // Reachable ONLY when our own handler above threw: the derived
                 // promise rejected. Node 15+ terminates the process on an
                 // unhandled rejection, so this tail is mandatory, not defensive
-                // noise. The row is already written by `recordSuccess` (or its
-                // write is what threw); a missing count is repaired by
-                // reconciliation, a duplicated one is not.
+                // noise. A throw out of `recordSuccess` happens BEFORE the
+                // `accountUsage` call that follows it, so neither half ran: the
+                // log row is lost, and the quota counter still has to move or
+                // that spend becomes unrecoverable (reconciliation can only
+                // repair under-counting when a row exists). `accountUsage`
+                // swallows its own failures, so this fallback cannot re-enter
+                // the tail. `accounted` — never call ordering — is what keeps a
+                // request that already accounted from being charged twice.
                 .catch((err) => {
+                    if (!accounted) {
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            estimateTokens([], messagesForEstimation)
+                                .promptTokens,
+                            requestedAt * 1000,
+                        );
+                    }
                     this.logger.warn(
                         `stream post-processing failed: ${
                             err instanceof Error ? err.message : String(err)
@@ -213,7 +251,17 @@ export class ChatService {
                 });
             return stream;
         } catch (err) {
-            this.recordFailure(err, body, requestedAt, promptHash, clientId);
+            // Same outcome object as the success path, so a diverted-then-failed
+            // request still records `served_alias` alongside the alias the client
+            // asked for (`model_requested` stays `body.model`).
+            this.recordFailure(
+                err,
+                body,
+                requestedAt,
+                promptHash,
+                clientId,
+                quotaOutcome,
+            );
             throw err;
         }
     }
@@ -255,7 +303,12 @@ export class ChatService {
 
     /** Build the success-log row + structured event from captured token
      *  data. Shared between the sync (non-streaming) and async (streaming)
-     *  paths so the columns and the JSON shape stay aligned. */
+     *  paths so the columns and the JSON shape stay aligned.
+     *
+     *  `quota` is a single TRAILING argument on purpose: the positional
+     *  signature is historical and every existing call site keeps reading the
+     *  same way. It carries the alias actually routed plus, when a silent
+     *  diversion happened, the alias the client asked for. */
     private recordSuccess(
         requestedAt: number,
         requestedModel: string,
@@ -265,12 +318,14 @@ export class ChatService {
         promptHash: string,
         clientId: string | null,
         tokens: ReturnType<typeof extractTokens>,
+        quota?: { servedAlias: string; divertedFrom: string | null },
     ): void {
         const latencyMs = nowSeconds() - requestedAt;
         const body = { model: requestedModel } as ChatCompletionCreateParams;
         this.requestLog.recordSuccess({
             requestedAt,
             requestedModel,
+            servedAlias: quota?.servedAlias,
             resolvedProvider: providerId,
             resolvedModel,
             attempts,
@@ -291,16 +346,33 @@ export class ChatService {
                 status: 'ok',
                 tokens,
                 clientKey: clientId,
+                servedAlias: quota?.servedAlias,
+                // Spread only on an actual diversion: a non-diverted row must
+                // not gain the field, not even as `null`.
+                ...(quota?.divertedFrom
+                    ? { quotaDivertedFrom: quota.divertedFrom }
+                    : {}),
             }),
         );
     }
 
+    /** Build the failure-log row + structured event.
+     *
+     *  `quota` is the same trailing optional object the success path takes, for
+     *  the same reason: the divert decision happens BEFORE the attempt, so a
+     *  request that was silently downgraded and then failed must still be
+     *  attributable to the alias that actually served it. It is absent entirely
+     *  when the gate threw before routing (`QuotaExhaustedError`) — nothing was
+     *  served, so there is nothing to attribute. `quotaDivertedFrom` keeps the
+     *  same absent-not-null rule as the success path: the field only appears on
+     *  real diversions, never as `null`. */
     private recordFailure(
         err: unknown,
         body: ChatCompletionCreateParams,
         requestedAt: number,
         promptHash: string,
         clientId: string | null,
+        quota?: { servedAlias: string; divertedFrom: string | null },
     ): void {
         const argsBase = {
             requestedAt,
@@ -316,6 +388,7 @@ export class ChatService {
             this.requestLog.recordFailure({
                 ...argsBase,
                 requestedModel: err.requestedModel,
+                servedAlias: quota?.servedAlias,
                 attempts: err.attempts.length,
                 error: err,
                 attemptDetails: details,
@@ -348,6 +421,10 @@ export class ChatService {
                     tokens: undefined,
                     errorMessage,
                     attemptDetails: details,
+                    servedAlias: quota?.servedAlias,
+                    ...(quota?.divertedFrom
+                        ? { quotaDivertedFrom: quota.divertedFrom }
+                        : {}),
                 }),
             );
             return;
@@ -355,6 +432,7 @@ export class ChatService {
         this.requestLog.recordFailure({
             ...argsBase,
             requestedModel: body.model,
+            servedAlias: quota?.servedAlias,
             attempts: 0,
             error: err,
             requestParams,
@@ -370,6 +448,10 @@ export class ChatService {
                 tokens: undefined,
                 errorMessage:
                     err instanceof Error ? err.message : String(err),
+                servedAlias: quota?.servedAlias,
+                ...(quota?.divertedFrom
+                    ? { quotaDivertedFrom: quota.divertedFrom }
+                    : {}),
             }),
         );
     }
@@ -828,6 +910,10 @@ interface BuildEventArgs {
     errorMessage?: string;
     attemptDetails?: string | null;
     clientKey: string | null;
+    /** Alias actually routed; only the success path knows it today. */
+    servedAlias?: string;
+    /** Set only when a quota diversion served the request. */
+    quotaDivertedFrom?: string;
 }
 
 function buildEvent(a: BuildEventArgs): RequestLogEvent {
@@ -835,6 +921,10 @@ function buildEvent(a: BuildEventArgs): RequestLogEvent {
         event: 'chat.request',
         ts: a.requestedAt,
         model: a.body.model,
+        ...(a.servedAlias ? { servedAlias: a.servedAlias } : {}),
+        ...(a.quotaDivertedFrom
+            ? { quotaDivertedFrom: a.quotaDivertedFrom }
+            : {}),
         resolvedProvider: a.resolvedProvider,
         resolvedModel: a.resolvedModel,
         promptHash: a.promptHash,

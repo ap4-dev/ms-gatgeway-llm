@@ -7,6 +7,13 @@ export interface RequestLogRow {
     requestedAt: number;
     /** The model id the client sent (alias or `provider/model` path). */
     modelRequested: string;
+    /**
+     * The alias that was actually ROUTED for this request, while
+     * `modelRequested` keeps what the client asked for. A row where
+     * `servedAlias <> modelRequested` identifies a quota-degraded request —
+     * without it a silent diversion is indistinguishable from a normal call.
+     */
+    servedAlias?: string | null;
     /** Resolved upstream provider, or null when resolution/route failed before any attempt. */
     resolvedProvider: string | null;
     resolvedModel: string | null;
@@ -146,11 +153,11 @@ export class RequestLogRepository {
                 requested_at, model_requested, resolved_provider, resolved_model,
                 attempts, latency_ms, status, error, client_key,
                 prompt_hash, prompt_tokens, completion_tokens, total_tokens,
-                attempt_details, request_params
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                attempt_details, request_params, served_alias
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.recentStmt = this.db.prepare(
-            'SELECT id, requested_at, model_requested, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens, attempt_details FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
+            'SELECT id, requested_at, model_requested, served_alias, resolved_provider, resolved_model, attempts, latency_ms, status, error, client_key, prompt_hash, prompt_tokens, completion_tokens, total_tokens, attempt_details FROM request_logs ORDER BY requested_at DESC, id DESC LIMIT ?',
         );
     }
 
@@ -171,6 +178,7 @@ export class RequestLogRepository {
             row.totalTokens ?? null,
             row.attemptDetails ?? null,
             row.requestParams ?? null,
+            row.servedAlias ?? null,
         );
         return Number(info.lastInsertRowid);
     }
@@ -180,6 +188,7 @@ export class RequestLogRepository {
             id: number;
             requested_at: number;
             model_requested: string;
+            served_alias: string | null;
             resolved_provider: string | null;
             resolved_model: string | null;
             attempts: number;
@@ -196,6 +205,7 @@ export class RequestLogRepository {
         return rows.map((r) => ({
             requestedAt: r.requested_at,
             modelRequested: r.model_requested,
+            servedAlias: r.served_alias ?? null,
             resolvedProvider: r.resolved_provider,
             resolvedModel: r.resolved_model,
             attempts: r.attempts,
@@ -254,10 +264,11 @@ export class RequestLogRepository {
         const fetchLimit = opts.limit + 1;
 
         const sql = `
-            SELECT id, requested_at, model_requested, resolved_provider,
-                   resolved_model, attempts, latency_ms, status, error,
-                   client_key, prompt_hash, prompt_tokens, completion_tokens,
-                   total_tokens, attempt_details, request_params
+            SELECT id, requested_at, model_requested, served_alias,
+                   resolved_provider, resolved_model, attempts, latency_ms,
+                   status, error, client_key, prompt_hash, prompt_tokens,
+                   completion_tokens, total_tokens, attempt_details,
+                   request_params
             FROM request_logs
             ${whereClause}
             ORDER BY requested_at DESC, id DESC
@@ -268,6 +279,7 @@ export class RequestLogRepository {
             id: number;
             requested_at: number;
             model_requested: string;
+            served_alias: string | null;
             resolved_provider: string | null;
             resolved_model: string | null;
             attempts: number;
@@ -448,6 +460,7 @@ function toRow(r: {
     id: number;
     requested_at: number;
     model_requested: string;
+    served_alias: string | null;
     resolved_provider: string | null;
     resolved_model: string | null;
     attempts: number;
@@ -465,6 +478,7 @@ function toRow(r: {
     return {
         requestedAt: r.requested_at,
         modelRequested: r.model_requested,
+        servedAlias: r.served_alias ?? null,
         resolvedProvider: r.resolved_provider,
         resolvedModel: r.resolved_model,
         attempts: r.attempts,

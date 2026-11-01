@@ -1,17 +1,30 @@
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BadRequestException } from '@nestjs/common';
 import { AdminLogsController } from './admin-logs.controller';
 import { RequestLogRepository } from '../database/repositories/request-log.repository';
 
+const MIGRATIONS_DIR = join(process.cwd(), 'migrations');
+
+/**
+ * Full migration chain, applied into a fresh `:memory:` DB — the same pattern
+ * as `quota.repository.spec.ts`.
+ *
+ * The hand-rolled subset this replaced hard-coded `0002` + `0003` + an inline
+ * `ALTER ... attempt_details` + `0013`, so it lagged production every time a
+ * column was added (`request_logs.served_alias` in 0014 among them). The real
+ * chain keeps the fixture shaped exactly like the deployed schema.
+ */
 function makeDb(): Database.Database {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
-    db.exec(readFileSync(join(process.cwd(), 'migrations/0002_request_logs.sql'), 'utf-8'));
-    db.exec(readFileSync(join(process.cwd(), 'migrations/0003_request_logs_tokens.sql'), 'utf-8'));
-    db.exec('ALTER TABLE request_logs ADD COLUMN attempt_details TEXT');
-        db.exec(readFileSync(join(process.cwd(), 'migrations/0013_request_params.sql'), 'utf-8'));
+    const files = readdirSync(MIGRATIONS_DIR)
+        .filter((name) => /^\d{4}_.*\.sql$/.test(name))
+        .sort();
+    for (const file of files) {
+        db.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf-8'));
+    }
     return db;
 }
 

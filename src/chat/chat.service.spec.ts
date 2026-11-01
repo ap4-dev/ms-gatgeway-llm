@@ -12,6 +12,7 @@ import {
 import type { ChatMessage } from './chat.service';
 import { QuotaExhaustedError } from '../quota/quota.errors';
 import type { QuotaService } from '../quota/quota.service';
+import { RoutingFailedError } from '../routing/routing.service';
 
 describe('clampMaxTokens', () => {
     it('leaves requests without max_tokens untouched', () => {
@@ -389,6 +390,7 @@ interface QuotaHarness {
     recordUsage: jest.Mock;
     recordSuccess: jest.Mock;
     recordFailure: jest.Mock;
+    structuredLog: { logRequest: jest.Mock };
 }
 
 function makeQuotaHarness(opts: {
@@ -433,7 +435,7 @@ function makeQuotaHarness(opts: {
         structuredLog,
         quota,
     );
-    return { service, route, resolveTarget, recordUsage, recordSuccess, recordFailure };
+    return { service, route, resolveTarget, recordUsage, recordSuccess, recordFailure, structuredLog };
 }
 
 describe('ChatService quota gate', () => {
@@ -614,12 +616,164 @@ describe('ChatService quota gate', () => {
         // Exactly one attempt: a second call would be the rejected-stream
         // branch re-recording the same request.
         expect(harness.recordSuccess).toHaveBeenCalledTimes(1);
-        // The prompt-only estimate of the rejected-stream branch must not run
-        // either — it would double-count the spend.
-        expect(harness.recordUsage).not.toHaveBeenCalled();
+        // R3-001: a throw out of `recordSuccess` means NEITHER half of the
+        // accounting ran, so the tail has to move the quota counter even though
+        // the log row is lost. Exactly once — reconciliation can repair
+        // under-counting, a double count is unrecoverable.
+        const expectedPromptTokens = Math.max(
+            1,
+            Math.ceil(JSON.stringify(QUOTA_MESSAGES).length / 4),
+        );
+        expect(harness.recordUsage).toHaveBeenCalledTimes(1);
+        expect(harness.recordUsage).toHaveBeenCalledWith(
+            'client-1',
+            'codex',
+            expectedPromptTokens,
+            REQUESTED_AT_MS,
+        );
         // The derived rejection is swallowed and reported, never left dangling.
         expect(warn).toHaveBeenCalledWith(
             expect.stringContaining('stream post-processing failed'),
+        );
+    });
+
+    it('charges the SERVED alias when a throwing recordSuccess loses the log row', async () => {
+        // Same R3-001 recovery, on a diverted request: the fallback accounting
+        // must charge `slave`, never the exhausted `codex`.
+        const harness = makeQuotaHarness({
+            result: usageStream(),
+            resolveTarget: (_clientId, alias) =>
+                alias === 'codex' ? 'slave' : alias,
+        });
+        harness.recordSuccess.mockImplementationOnce(() => {
+            throw new Error('sqlite write failed');
+        });
+        jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined as any);
+
+        const result = await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES, stream: true } as any,
+            'client-1',
+        );
+        for await (const _chunk of result as AsyncIterable<any>) {
+            // drain
+        }
+        await flushAsync();
+
+        expect(harness.recordUsage).toHaveBeenCalledTimes(1);
+        expect(harness.recordUsage.mock.calls[0][1]).toBe('slave');
+    });
+
+    it('does not double-account a stream whose handler already accounted', async () => {
+        const harness = makeQuotaHarness({ result: usageStream() });
+
+        const result = await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES, stream: true } as any,
+            'client-1',
+        );
+        for await (const _chunk of result as AsyncIterable<any>) {
+            // drain
+        }
+        await flushAsync();
+
+        // The handler accounted once; the `accounted` flag keeps the tail from
+        // charging the prompt-only estimate on top of it.
+        expect(harness.recordSuccess).toHaveBeenCalledTimes(1);
+        expect(harness.recordUsage).toHaveBeenCalledTimes(1);
+        expect(harness.recordUsage).toHaveBeenCalledWith(
+            'client-1',
+            'codex',
+            TOTAL_TOKENS,
+            REQUESTED_AT_MS,
+        );
+    });
+
+    it('records the served alias beside the requested one when quota diverted the request', async () => {
+        const harness = makeQuotaHarness({
+            result: bufferedResult(),
+            resolveTarget: (_clientId, alias) =>
+                alias === 'codex' ? 'slave' : alias,
+        });
+
+        await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES } as any,
+            'client-1',
+        );
+
+        // request_logs: what the client ASKED for plus what actually SERVED it,
+        // so `served_alias <> model_requested` identifies the degradation.
+        expect(harness.recordSuccess).toHaveBeenCalledWith(
+            expect.objectContaining({
+                // `requestedModel` is the record-service arg name; it lands in
+                // `request_logs.model_requested`.
+                requestedModel: 'codex',
+                servedAlias: 'slave',
+            }),
+        );
+        // Structured event: the audit trail of the silent downgrade.
+        expect(harness.structuredLog.logRequest).toHaveBeenCalledWith(
+            expect.objectContaining({
+                model: 'codex',
+                servedAlias: 'slave',
+                quotaDivertedFrom: 'codex',
+            }),
+        );
+    });
+
+    it('records the requested alias as served and no diversion field when nothing was diverted', async () => {
+        const harness = makeQuotaHarness({ result: bufferedResult() });
+
+        await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES } as any,
+            'client-1',
+        );
+
+        expect(harness.recordSuccess).toHaveBeenCalledWith(
+            expect.objectContaining({
+                requestedModel: 'codex',
+                servedAlias: 'codex',
+            }),
+        );
+        const event = harness.structuredLog.logRequest.mock.calls[0][0];
+        expect(event.servedAlias).toBe('codex');
+        // Absent, not null: the non-diverted event shape is unchanged.
+        expect(event).not.toHaveProperty('quotaDivertedFrom');
+    });
+
+    it('records the served alias on the streamed and the rejected-stream paths too', async () => {
+        const divert = (_clientId: string | null, alias: string) =>
+            alias === 'codex' ? 'slave' : alias;
+
+        const streamed = makeQuotaHarness({ result: usageStream(), resolveTarget: divert });
+        const ok = await streamed.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES, stream: true } as any,
+            'client-1',
+        );
+        for await (const _chunk of ok as AsyncIterable<any>) {
+            // drain
+        }
+        await flushAsync();
+        expect(streamed.recordSuccess).toHaveBeenCalledWith(
+            expect.objectContaining({ requestedModel: 'codex', servedAlias: 'slave' }),
+        );
+        expect(streamed.structuredLog.logRequest).toHaveBeenCalledWith(
+            expect.objectContaining({ servedAlias: 'slave', quotaDivertedFrom: 'codex' }),
+        );
+
+        const drowned = makeQuotaHarness({ result: failingStream(), resolveTarget: divert });
+        const bad = await drowned.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES, stream: true } as any,
+            'client-1',
+        );
+        await expect(
+            (async () => {
+                for await (const _chunk of bad as AsyncIterable<any>) {
+                    // drain until the upstream throws
+                }
+            })(),
+        ).rejects.toThrow('upstream died mid-stream');
+        await flushAsync();
+        expect(drowned.recordSuccess).toHaveBeenCalledWith(
+            expect.objectContaining({ requestedModel: 'codex', servedAlias: 'slave' }),
         );
     });
 
@@ -639,5 +793,82 @@ describe('ChatService quota gate', () => {
 
         expect(result).toMatchObject({ id: 'cmpl-quota' });
         expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the served alias when a diverted request fails to route', async () => {
+        // A diverted request that then fails is still a diverted request: the
+        // failure row must show what the client asked for ('codex') AND what was
+        // actually routed ('slave'), otherwise a downgraded failure is
+        // indistinguishable from the client asking for 'slave' directly.
+        const harness = makeQuotaHarness({
+            result: bufferedResult(),
+            resolveTarget: (_clientId, alias) =>
+                alias === 'codex' ? 'slave' : alias,
+        });
+        harness.route.mockRejectedValueOnce(
+            new RoutingFailedError('codex', [
+                {
+                    providerId: 'provider-a',
+                    upstreamModel: 'qwen-3.6',
+                    ok: false,
+                    circuitOpen: false,
+                    error: new Error('upstream 500'),
+                    durationMs: 3,
+                },
+            ]),
+        );
+
+        await expect(
+            harness.service.completions(
+                { model: 'codex', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).rejects.toBeInstanceOf(RoutingFailedError);
+
+        expect(harness.recordFailure).toHaveBeenCalledTimes(1);
+        expect(harness.recordFailure.mock.calls[0][0]).toMatchObject({
+            requestedModel: 'codex',
+            servedAlias: 'slave',
+        });
+        expect(harness.structuredLog.logRequest.mock.calls[0][0]).toMatchObject(
+            {
+                model: 'codex',
+                servedAlias: 'slave',
+                quotaDivertedFrom: 'codex',
+                status: 'error',
+            },
+        );
+    });
+
+    it('omits quotaDivertedFrom from a failure event when nothing was diverted', async () => {
+        const harness = makeQuotaHarness({ result: bufferedResult() });
+        harness.route.mockRejectedValueOnce(
+            new RoutingFailedError('codex', [
+                {
+                    providerId: 'provider-a',
+                    upstreamModel: 'qwen-3.6',
+                    ok: false,
+                    circuitOpen: false,
+                    error: new Error('upstream 500'),
+                    durationMs: 3,
+                },
+            ]),
+        );
+
+        await expect(
+            harness.service.completions(
+                { model: 'codex', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).rejects.toBeInstanceOf(RoutingFailedError);
+
+        expect(harness.recordFailure.mock.calls[0][0]).toMatchObject({
+            requestedModel: 'codex',
+            servedAlias: 'codex',
+        });
+        const event = harness.structuredLog.logRequest.mock.calls[0][0];
+        expect(event.servedAlias).toBe('codex');
+        // Absent, never `null` — non-diverted events keep their old shape.
+        expect('quotaDivertedFrom' in event).toBe(false);
     });
 });
