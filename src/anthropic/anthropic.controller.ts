@@ -16,6 +16,11 @@ import { ApiKeyAuthGuard } from '../auth/api-key.guard';
 import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 import type { Client } from '../auth/client.repository';
 import type { AnthropicStreamEvent } from './types';
+import { QuotaExhaustedError } from '../quota/quota.errors';
+import {
+    anthropicQuotaErrorBody,
+    quotaRetryAfterSeconds,
+} from '../quota/quota-http';
 
 @Controller('v1/messages')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -71,17 +76,29 @@ export class AnthropicController {
                 }
                 reply.raw.end();
             } catch (err: any) {
-                reply.raw.write(`event: error\n`);
-                reply.raw.write(
-                    `data: ${JSON.stringify({
-                        type: 'error',
-                        error: {
-                            type: 'api_error',
-                            message: err?.message || 'upstream error',
-                        },
-                    })}\n\n`,
-                );
-                reply.raw.end();
+                if (err instanceof QuotaExhaustedError) {
+                    // The reply is hijacked, but nothing has been flushed yet, so
+                    // Fastify still lets us set the status and headers on the raw
+                    // response. That window closes as soon as the first byte is
+                    // written — which is exactly why this must happen first.
+                    reply.raw.statusCode = 429;
+                    reply.raw.setHeader('Retry-After', String(quotaRetryAfterSeconds(err)));
+                    reply.raw.write(`event: error\n`);
+                    reply.raw.write(`data: ${JSON.stringify(anthropicQuotaErrorBody(err))}\n\n`);
+                    reply.raw.end();
+                } else {
+                    reply.raw.write(`event: error\n`);
+                    reply.raw.write(
+                        `data: ${JSON.stringify({
+                            type: 'error',
+                            error: {
+                                type: 'api_error',
+                                message: err?.message || 'upstream error',
+                            },
+                        })}\n\n`,
+                    );
+                    reply.raw.end();
+                }
             }
             return reply;
         }
@@ -90,6 +107,12 @@ export class AnthropicController {
             const result = await this.anthropic.messages(body, clientId);
             return reply.send(result);
         } catch (err: any) {
+            if (err instanceof QuotaExhaustedError) {
+                return reply
+                    .code(429)
+                    .header('Retry-After', String(quotaRetryAfterSeconds(err)))
+                    .send(anthropicQuotaErrorBody(err));
+            }
             return reply.code(500).send({
                 type: 'error',
                 error: {
