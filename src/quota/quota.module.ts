@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { QuotaRepository } from '../database/repositories/quota.repository';
 import { DatabaseService } from '../database/database.service';
 import { QUOTA_CLOCK, QuotaService } from './quota.service';
+import { QuotaController } from './quota.controller';
 
 /**
  * Per-client alias quota feature module.
@@ -15,9 +16,11 @@ import { QUOTA_CLOCK, QuotaService } from './quota.service';
  * `QUOTA_CLOCK` binds the real wall clock in production; only specs override it
  * to make month rollover and `retryAfter` deterministic.
  *
- * `QuotaService` is exported because the chat pipeline is its consumer.
+ * `QuotaService` is exported because the chat pipeline and the admin quota
+ * surface are its consumers.
  */
 @Module({
+    controllers: [QuotaController],
     providers: [
         {
             provide: QuotaRepository,

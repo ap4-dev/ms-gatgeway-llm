@@ -1,11 +1,13 @@
 import { Module } from '@nestjs/common';
 import { AdminClientsController } from './admin-clients.controller';
 import { AdminAliasesController } from './admin-aliases.controller';
+import { AdminQuotaController } from './admin-quota.controller';
 import { AdminProvidersController } from './admin-providers.controller';
 import { AdminLogsController } from './admin-logs.controller';
 import { AdminStatsController } from './admin-stats.controller';
 import { SQLiteAdminController } from './sqlite-admin.controller';
 import { ChatModule } from '../chat/chat.module';
+import { QuotaModule } from '../quota/quota.module';
 
 /**
  * Phase 5.5+ admin module. Imports {@link ChatModule} only because the
@@ -14,12 +16,16 @@ import { ChatModule } from '../chat/chat.module';
  * through CoreModule's @Global()). Guard + decorator wiring lives on
  * each controller — `@UseGuards(ApiKeyAuthGuard, RequireScopesGuard,
  * RateLimitGuard)` + `@RequireScopes('admin')`.
+ *
+ * {@link QuotaModule} is imported explicitly because `AdminQuotaController`
+ * needs `QuotaService` and `ChatModule` does not re-export it.
  */
 @Module({
-    imports: [ChatModule],
+    imports: [ChatModule, QuotaModule],
     controllers: [
         AdminClientsController,
         AdminAliasesController,
+        AdminQuotaController,
         AdminProvidersController,
         AdminLogsController,
         AdminStatsController,
