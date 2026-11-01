@@ -297,7 +297,44 @@ Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
   endpoints, y actualizar la tabla de migraciones en `docs/ARCHITECTURE.md` §8.
 - **Test:** drift cero con datos consistentes; drift detectado y corregido;
   las requests degradadas no contaminan el contador de `codex`.
-- **Commit:** `feat(quota): reconcile alias usage from request logs`
+- **Implementado:** `QuotaReconcileService.reconcile({periodKey, dryRun})` +
+  `POST /admin/quotas/reconcile` (`dryRun` default `true`). Tres sentencias nuevas
+  en `QuotaRepository`: `setUsage` (upsert por valor absoluto, idempotente),
+  `listAllQuotas`, `aggregateRequestLogUsage`.
+- **Regla de correctitud (parece omisión a propósito):** se itera sobre los pares
+  con fila en `client_alias_quotas`, no sobre los agregados. `recordUsage` retorna
+  temprano cuando el alias servido no tiene cuota, así que atribuir todo alias
+  visible en `request_logs` fabricaría contadores que el camino vivo nunca crea y
+  reportaría drift fantasma en cada pasada. Misma razón por la que se valida
+  `periodKey` también en el servicio: `2026-13` barrería una ventana vacía y
+  "repararía" al cliente a cero.
+- **Commit:** `c38ff5b` — `feat(quota): reconcile alias usage from request logs`
+  (9 archivos + 2 nuevos, +1173/−14; 711/711 tests, `tsc` exit 0)
+
+### T8 — Superficie de operador en el dashboard
+- **Estado:** pendiente (descubierto al cerrar T6)
+- **Superficies:** `dashboard/src/api/client.ts`, `dashboard/src/router.ts`,
+  `dashboard/src/App.vue`, `dashboard/src/views/QuotasView.vue` (nueva),
+  `dashboard/src/components/LogsTable.vue`, `dashboard/src/views/ClientsView.vue`,
+  `src/admin/admin-logs.controller.ts` (+spec)
+- **Problema:** la feature está completa en backend pero **no es operable desde la
+  UI**. `dashboard/` (SPA Vue 3, 7 vistas, 2791 líneas) no menciona "quota" ni una
+  vez, y peor: `toView()` en `admin-logs.controller.ts` no mapea `served_alias`, así
+  que la degradación que T7 hizo auditable **no se puede ver en la vista de Logs**.
+  La decisión D1 (diversión silenciosa) se justificó diciendo que el operador puede
+  auditarla; hoy eso exige abrir sqlite a mano.
+- **Hacer:**
+  1. `servedAlias` en `LogItemView` y columna "Served" en `LogsTable.vue`, con
+     marca visual cuando `servedAlias !== modelRequested`.  ← **mínimo indispensable**
+  2. `QuotasView` + item de nav: alta/baja de cuota por cliente × alias, límite
+     mensual, alias de desvío, y uso del mes en curso contra el límite.
+  3. Panel de cuotas dentro de `ClientsView` (donde el operador ya está parado).
+  4. Botón de reconcile con dry-run y vista previa del drift antes de escribir.
+- **Test:** el front no tiene runner configurado; verificación manual vía
+  `pnpm dashboard:dev` contra el gateway, más specs del `admin-logs.controller`
+  para el nuevo campo.
+- **Nota:** `dist-dashboard` no existe en el repo; la SPA sólo se sirve tras
+  `pnpm dashboard:build`. El `build` ya encadena `nest build && pnpm dashboard:build`.
 
 ## 8. Riesgos
 
@@ -312,10 +349,12 @@ Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
 ## 9. Orden
 
 ```
-T1 → T2 → T3 → T4 → T5 → T7 → T6
+T1 → T2 → T3 → T4 → T5 → T7 → T6 → T8
 ```
 
 T7 se adelantó a T6: la reconciliación depende de que `served_alias` esté poblado.
+T8 salió de una pregunta del operador al cerrar T6: el backend quedó completo pero
+sin superficie de UI, y `served_alias` ni siquiera llega a la vista de Logs.
 Sin dependencias cruzadas con routing, circuit breaker ni el walk de fallback.
 
 ## 10. Fuera de alcance (cerrado)
