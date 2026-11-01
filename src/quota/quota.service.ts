@@ -1,6 +1,10 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
-import { QuotaRepository } from '../database/repositories/quota.repository';
-import { QuotaExhaustedError } from './quota.errors';
+import {
+    QuotaRepository,
+    type ClientAliasQuota,
+    type ClientAliasUsage,
+} from '../database/repositories/quota.repository';
+import { QuotaExhaustedError, secondsUntilInstant } from './quota.errors';
 
 /**
  * Injection token for the wall clock. Production binds `Date.now`; specs bind a
@@ -10,6 +14,30 @@ import { QuotaExhaustedError } from './quota.errors';
 export const QUOTA_CLOCK = 'QUOTA_CLOCK';
 
 const MS_PER_SECOND = 1000;
+
+/**
+ * One `(client, alias)` quota as an administrative read model: the stored
+ * allowance joined with the usage of the period in progress.
+ *
+ * `exhausted` is `tokens >= monthlyTokenLimit` — the SAME strict rule
+ * `resolveTarget` applies — so an admin listing can never claim a client is
+ * fine while the gate is already diverting it. `remaining` is clamped at 0
+ * because the post-hoc accounting accepts overshoot (plan §5 R2) and a
+ * negative allowance would be meaningless in the UI.
+ */
+export interface ClientQuotaView {
+    aliasKey: string;
+    monthlyTokenLimit: number;
+    divertAliasKey: string | null;
+    periodKey: string;
+    tokens: number;
+    requests: number;
+    remaining: number;
+    exhausted: boolean;
+    /** Unix SECONDS of the next UTC month start, matching the error detail. */
+    resetsAt: number;
+    retryAfterSeconds: number;
+}
 
 /**
  * Monthly token quota gate, keyed by `(client, alias)`.
@@ -151,13 +179,115 @@ export class QuotaService {
     /**
      * Seconds a client should wait before the quota can reset, for `Retry-After`.
      *
-     * Floored at 1 because `Retry-After: 0` reads as "retry now" and a negative
-     * value is meaningless: the next month start is always strictly in the
-     * future, so the clamp is purely defensive against a skewed clock.
+     * Delegates to `secondsUntilInstant` — the single formula shared with the
+     * HTTP 429 mapping — applied to the next UTC month start, the only instant
+     * the counter can reset since there is no cron job.
      */
     retryAfterSeconds(nowMs: number = this.now()): number {
-        const deltaMs = nextUtcMonthStart(nowMs) - nowMs;
-        return Math.max(1, Math.ceil(deltaMs / MS_PER_SECOND));
+        return secondsUntilInstant(Math.floor(nextUtcMonthStart(nowMs) / MS_PER_SECOND), nowMs);
+    }
+
+    /**
+     * Every quota of one client joined with the usage of the period in progress.
+     *
+     * Exactly two queries regardless of how many aliases the client has
+     * (`listQuotasByClient` + `listUsageByClientPeriod`), joined in memory by
+     * `aliasKey`; a per-alias usage lookup would turn the admin listing into
+     * N + 1. Cache-free like everything else here, so an admin limit change is
+     * visible on the very next call.
+     *
+     * A quota with no usage row yet simply reports zeroes, and usage from other
+     * months is invisible because the period key comes from ONE clock read.
+     * Ordering follows the repository: by `alias_key`.
+     */
+    describeQuotas(clientId: string, nowMs: number = this.now()): ClientQuotaView[] {
+        const periodKey = this.periodKey(nowMs);
+        const usageByAlias = new Map<string, ClientAliasUsage>(
+            this.quotas
+                .listUsageByClientPeriod(clientId, periodKey)
+                .map((usage) => [usage.aliasKey, usage]),
+        );
+
+        return this.quotas
+            .listQuotasByClient(clientId)
+            .map((quota) => this.toView(quota, usageByAlias.get(quota.aliasKey), periodKey, nowMs));
+    }
+
+    /**
+     * Persist one `(client, alias)` allowance and return the resulting view.
+     *
+     * Deliberately dumb about semantics: alias existence and the `divert_alias_key`
+     * registry check are the admin layer's job, and the `monthly_token_limit > 0`
+     * / `divert_alias_key <> alias_key` rules are DB CHECKs — the same split the
+     * repository `upsertQuota` documents. The service only writes and projects.
+     *
+     * The returned view reuses `toView`, so the numbers an admin sees after a
+     * write cannot drift from what `describeQuotas` reports afterwards.
+     */
+    upsertQuota(
+        clientId: string,
+        input: { aliasKey: string; monthlyTokenLimit: number; divertAliasKey?: string | null },
+        nowMs: number = this.now(),
+    ): ClientQuotaView {
+        this.quotas.upsertQuota({
+            clientId,
+            aliasKey: input.aliasKey,
+            monthlyTokenLimit: input.monthlyTokenLimit,
+            divertAliasKey: input.divertAliasKey ?? null,
+        });
+
+        const periodKey = this.periodKey(nowMs);
+        // Only the usage needs reading: the stored allowance is exactly the input
+        // just written (the DB stores it verbatim). Projected through the same
+        // helper `describeQuotas` uses, so the numbers cannot drift.
+        const usage = this.quotas.getUsage(clientId, input.aliasKey, periodKey);
+
+        return this.toView(
+            {
+                aliasKey: input.aliasKey,
+                monthlyTokenLimit: input.monthlyTokenLimit,
+                divertAliasKey: input.divertAliasKey ?? null,
+            },
+            usage ?? undefined,
+            periodKey,
+            nowMs,
+        );
+    }
+
+    /** Remove one `(client, alias)` allowance; `true` only when a row existed. */
+    removeQuota(clientId: string, aliasKey: string): boolean {
+        return this.quotas.deleteQuota(clientId, aliasKey);
+    }
+
+    /**
+     * The single projection from stored rows to the administrative read model.
+     *
+     * One place on purpose: `describeQuotas` and `upsertQuota` must never be able
+     * to disagree about `remaining`/`exhausted`/`resetsAt` for the same state.
+     * `usage` is absent when the client has not spent anything in the period.
+     */
+    private toView(
+        quota: Pick<ClientAliasQuota, 'aliasKey' | 'monthlyTokenLimit' | 'divertAliasKey'>,
+        usage: ClientAliasUsage | undefined,
+        periodKey: string,
+        nowMs: number,
+    ): ClientQuotaView {
+        const tokens = usage?.tokens ?? 0;
+
+        return {
+            aliasKey: quota.aliasKey,
+            monthlyTokenLimit: quota.monthlyTokenLimit,
+            divertAliasKey: quota.divertAliasKey,
+            periodKey,
+            tokens,
+            requests: usage?.requests ?? 0,
+            remaining: Math.max(0, quota.monthlyTokenLimit - tokens),
+            // Strict `>=`, identical to `resolveTarget`: exactly on the limit is
+            // already exhausted.
+            exhausted: tokens >= quota.monthlyTokenLimit,
+            resetsAt: nextUtcMonthStart(nowMs) / MS_PER_SECOND,
+            retryAfterSeconds: this.retryAfterSeconds(nowMs),
+        };
     }
 }
 

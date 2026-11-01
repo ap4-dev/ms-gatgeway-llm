@@ -1,4 +1,4 @@
-import type { QuotaExhaustedError } from './quota.errors';
+import { secondsUntilInstant, type QuotaExhaustedError } from './quota.errors';
 
 const MS_PER_SECOND = 1000;
 
@@ -14,16 +14,17 @@ const MS_PER_SECOND = 1000;
 /**
  * Seconds until the quota resets, for `Retry-After`.
  *
- * Floor-clamped at 1 because `Retry-After: 0` reads as "retry now" and a
- * negative value is meaningless. `resetsAt` is unix SECONDS (matching the error
- * detail), and the current instant is floored to whole seconds so the answer is
- * always an integer.
+ * A thin delegation to `secondsUntilInstant` — the single formula for this
+ * quantity — reading the reset instant off the error detail (`resetsAt`, unix
+ * seconds). The shared helper owns the whole-second flooring and the clamp at
+ * 1, so the OpenAI and Anthropic transports cannot round differently from the
+ * service.
  */
 export function quotaRetryAfterSeconds(
     err: QuotaExhaustedError,
     nowMs: number = Date.now(),
 ): number {
-    return Math.max(1, err.detail.resetsAt - Math.floor(nowMs / MS_PER_SECOND));
+    return secondsUntilInstant(err.detail.resetsAt, nowMs);
 }
 
 /**

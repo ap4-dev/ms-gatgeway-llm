@@ -237,6 +237,32 @@ describe('QuotaRepository', () => {
             ]);
         });
 
+        it('lists one client\'s usage for one period, ordered by alias', () => {
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'slave', periodKey: '2026-11', tokens: 6 });
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'codex', periodKey: '2026-11', tokens: 7 });
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'atlas', periodKey: '2026-11', tokens: 8 });
+            // Same client, other period: must not leak into the November view.
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'codex', periodKey: '2026-12', tokens: 9 });
+            // Other client, same period: must not leak either.
+            repo.addUsage({ clientId: 'client-2', aliasKey: 'codex', periodKey: '2026-11', tokens: 10 });
+
+            const rows = repo.listUsageByClientPeriod('client-1', '2026-11');
+
+            expect(rows.map((r) => `${r.clientId}/${r.aliasKey}/${r.periodKey}/${r.tokens}`)).toEqual([
+                'client-1/atlas/2026-11/8',
+                'client-1/codex/2026-11/7',
+                'client-1/slave/2026-11/6',
+            ]);
+            expect(rows.every((r) => r.requests === 1)).toBe(true);
+        });
+
+        it('returns an empty array when the client has no usage for that period', () => {
+            expect(repo.listUsageByClientPeriod('client-1', '2026-11')).toEqual([]);
+
+            repo.addUsage({ clientId: 'client-1', aliasKey: 'codex', periodKey: '2026-12', tokens: 5 });
+            expect(repo.listUsageByClientPeriod('client-1', '2026-11')).toEqual([]);
+        });
+
         it('rejects negative tokens through the CHECK', () => {
             expect(() =>
                 repo.addUsage({

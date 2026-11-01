@@ -64,6 +64,7 @@ export class QuotaRepository {
         getUsage: Database.Statement;
         addUsage: Database.Statement;
         listUsageByPeriod: Database.Statement;
+        listUsageByClientPeriod: Database.Statement;
     };
 
     constructor(private readonly db: Database.Database) {
@@ -99,6 +100,9 @@ export class QuotaRepository {
             `),
             listUsageByPeriod: this.db.prepare(
                 'SELECT client_id, alias_key, period_key, tokens, requests, updated_at FROM client_alias_usage WHERE period_key = ? ORDER BY client_id, alias_key',
+            ),
+            listUsageByClientPeriod: this.db.prepare(
+                'SELECT client_id, alias_key, period_key, tokens, requests, updated_at FROM client_alias_usage WHERE client_id = ? AND period_key = ? ORDER BY alias_key',
             ),
         };
     }
@@ -179,6 +183,20 @@ export class QuotaRepository {
     /** Every usage counter for one period, ordered by client then alias. */
     listUsageByPeriod(periodKey: string): ClientAliasUsage[] {
         return (this.stmts.listUsageByPeriod.all(periodKey) as UsageDbRow[]).map(toUsage);
+    }
+
+    /**
+     * One client's usage counters for one period, ordered by `alias_key`.
+     *
+     * This is the read the admin quota listing and the client balance endpoint
+     * need: one query for the whole period instead of a per-alias lookup, so a
+     * client with N quotas still costs exactly two queries total (quotas +
+     * usage) rather than N + 1.
+     */
+    listUsageByClientPeriod(clientId: string, periodKey: string): ClientAliasUsage[] {
+        return (
+            this.stmts.listUsageByClientPeriod.all(clientId, periodKey) as UsageDbRow[]
+        ).map(toUsage);
     }
 }
 

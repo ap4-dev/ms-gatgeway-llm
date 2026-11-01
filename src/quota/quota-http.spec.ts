@@ -1,4 +1,4 @@
-import { QuotaExhaustedError } from './quota.errors';
+import { QuotaExhaustedError, secondsUntilInstant } from './quota.errors';
 import {
     anthropicQuotaErrorBody,
     openAiQuotaErrorBody,
@@ -23,13 +23,39 @@ function makeError(
     });
 }
 
+const NOV_MIDDAY = Date.UTC(2026, 10, 15, 12, 0, 0); // 2026-11-15T12:00:00Z
+
+describe('secondsUntilInstant', () => {
+    it('counts the whole next month from an exact month start', () => {
+        // 2026-12-01T00:00:00Z → 2027-01-01T00:00:00Z; December has 31 days.
+        expect(secondsUntilInstant(JAN_2027 / SECONDS, DEC_2026)).toBe(31 * 86_400);
+    });
+
+    it('counts the seconds left mid-month', () => {
+        // 2026-11-15T12:00:00Z → 2026-12-01T00:00:00Z = 15d 12h.
+        expect(secondsUntilInstant(DEC_2026 / SECONDS, NOV_MIDDAY)).toBe(15 * 86_400 + 43_200);
+    });
+
+    it('never returns zero or a negative value for an instant in the past', () => {
+        // `Retry-After: 0` (or a negative value) reads as "retry now".
+        expect(secondsUntilInstant(DEC_2026 / SECONDS - 3_600, DEC_2026)).toBe(1);
+        expect(secondsUntilInstant(0, DEC_2026)).toBe(1);
+    });
+
+    it('floors the current instant in milliseconds to whole seconds', () => {
+        // 500 ms before the reset still yields a whole second, not zero.
+        expect(secondsUntilInstant(DEC_2026 / SECONDS, DEC_2026 - 500)).toBe(1);
+        expect(secondsUntilInstant(DEC_2026 / SECONDS, NOV_MIDDAY + 999)).toBe(
+            DEC_2026 / SECONDS - Math.floor((NOV_MIDDAY + 999) / SECONDS),
+        );
+    });
+});
+
 describe('quotaRetryAfterSeconds', () => {
     it('returns the remaining seconds mid-month', () => {
         const err = makeError();
-        // 2026-11-15T12:00:00Z → 2026-12-01T00:00:00Z = 15d 12h.
-        const nowMs = Date.UTC(2026, 10, 15, 12, 0, 0);
 
-        expect(quotaRetryAfterSeconds(err, nowMs)).toBe(15 * 86_400 + 43_200);
+        expect(quotaRetryAfterSeconds(err, NOV_MIDDAY)).toBe(15 * 86_400 + 43_200);
     });
 
     it('returns a full month of seconds at an exact month start', () => {
@@ -44,7 +70,6 @@ describe('quotaRetryAfterSeconds', () => {
         const nowMs = DEC_2026;
         const err = makeError({ resetsAt: nowMs / SECONDS - 3_600 });
 
-        // `Retry-After: 0` (or a negative value) reads as "retry now".
         expect(quotaRetryAfterSeconds(err, nowMs)).toBe(1);
     });
 
@@ -53,6 +78,17 @@ describe('quotaRetryAfterSeconds', () => {
 
         // 500 ms before the reset still yields a whole second, not zero.
         expect(quotaRetryAfterSeconds(err, DEC_2026 - 500)).toBe(1);
+    });
+
+    it('delegates to the single shared formula, so the two transports cannot drift', () => {
+        const err = makeError();
+
+        expect(quotaRetryAfterSeconds(err, NOV_MIDDAY)).toBe(
+            secondsUntilInstant(err.detail.resetsAt, NOV_MIDDAY),
+        );
+        expect(quotaRetryAfterSeconds(err, DEC_2026)).toBe(
+            secondsUntilInstant(err.detail.resetsAt, DEC_2026),
+        );
     });
 });
 

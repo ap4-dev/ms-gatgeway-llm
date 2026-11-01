@@ -30,3 +30,23 @@ export class QuotaExhaustedError extends Error {
         this.name = 'QuotaExhaustedError';
     }
 }
+
+const MS_PER_SECOND = 1000;
+
+/**
+ * Seconds between `nowMs` and `instantSeconds`, for `Retry-After`.
+ *
+ * This is the ONE formula for "how long until that instant" in the quota
+ * domain; every caller delegates here so the 429 transports and the service
+ * can never drift apart on rounding. `instantSeconds` is unix SECONDS (what
+ * `Retry-After` and `unixepoch()` speak) and `nowMs` is floored to whole
+ * seconds, so the result is always an integer.
+ *
+ * The clamp at 1 exists because `Retry-After: 0` reads to clients as "retry
+ * now" — which is the exact opposite of what a quota error means — and a
+ * negative value is meaningless. A sub-second remainder or a clock skewed past
+ * the reset instant therefore degrades to "1 second", never to 0 or below.
+ */
+export function secondsUntilInstant(instantSeconds: number, nowMs: number = Date.now()): number {
+    return Math.max(1, instantSeconds - Math.floor(nowMs / MS_PER_SECOND));
+}
