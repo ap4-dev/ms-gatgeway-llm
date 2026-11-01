@@ -335,6 +335,20 @@ Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
   para el nuevo campo.
 - **Nota:** `dist-dashboard` no existe en el repo; la SPA sólo se sirve tras
   `pnpm dashboard:build`. El `build` ya encadena `nest build && pnpm dashboard:build`.
+- **Implementado (1 y 2):** `GET /admin/logs` proyecta `servedAlias` (4 specs
+  nuevos, incluido el caso de dos filas con **idéntico** `resolvedModel` donde
+  sólo `servedAlias` las distingue) y `LogsTable` gana columna "Served" con
+  badge cuando `servedAlias !== modelRequested`. `QuotasView` nueva (535 líneas):
+  selector de cliente, tabla de cuotas con uso/restante/agotada, alta con
+  selects del registry (no texto libre), preview humanizado del límite
+  (`20000000` → `20.0M`), borrado con `ConfirmDialog` cuyo texto dice que el
+  alias queda ilimitado, y recarga desde el servidor tras cada mutación.
+- **Pendiente:** el panel dentro de `ClientsView` (3) y el botón de reconcile (4).
+- **Commit:** `c269477` — `feat(dashboard): assign per-client alias quotas and
+  show the served alias` (9 archivos + 1 nuevo, +421/−2; 715/715 tests, `tsc`,
+  `vue-tsc` y `dashboard:build` exit 0)
+- **Deuda saldada de paso:** `docs/API.md` afirmaba que `PUT` aplicaba "the whole
+  list"; el handler hace upsert de lo listado y no borra nada. Corregido.
 
 ## 8. Riesgos
 
