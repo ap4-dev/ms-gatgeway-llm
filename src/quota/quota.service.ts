@@ -104,6 +104,16 @@ export class QuotaService {
     /**
      * Account one served request, called after the response (feature plan §5).
      *
+     * `atMs` is the instant the REQUEST STARTED, passed by the caller, and it
+     * exists for one reason: the gate (`resolveTarget`) and the accounting must
+     * resolve the SAME period. A request that enters at 23:59:59 on the last day
+     * of a month and finishes after midnight would otherwise be admitted
+     * against November and billed to December — silently refunding the previous
+     * month's counter and spending the fresh one. Only the caller knows when the
+     * request began, so the caller owns the instant; defaulting to `this.now()`
+     * keeps direct callers (admin tooling, reconciliation) working. See review
+     * finding R3-001.
+     *
      * Usage is recorded against the alias ACTUALLY served. That is what freezes
      * the exhausted alias's counter during degradation and lets a mid-month
      * limit raise restore access without touching any state: gated traffic
@@ -115,7 +125,12 @@ export class QuotaService {
      * violate the `tokens >= 0` CHECK and blow up mid-request on a path that has
      * already sent the response — so clamping is safer than trusting the caller.
      */
-    recordUsage(clientId: string | null, servedAlias: string, tokens: number): void {
+    recordUsage(
+        clientId: string | null,
+        servedAlias: string,
+        tokens: number,
+        atMs: number = this.now(),
+    ): void {
         if (!clientId) {
             return;
         }
@@ -127,7 +142,8 @@ export class QuotaService {
         this.quotas.addUsage({
             clientId,
             aliasKey: servedAlias,
-            periodKey: this.periodKey(),
+            // Period of the request start, never of the write time.
+            periodKey: this.periodKey(atMs),
             tokens: normaliseTokens(tokens),
         });
     }

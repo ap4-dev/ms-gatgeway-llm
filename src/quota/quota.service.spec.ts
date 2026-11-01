@@ -288,6 +288,65 @@ describe('QuotaService', () => {
 
             expect(repo.getUsage('client-1', 'codex', NOV_2026)).toBeNull();
         });
+
+        it('writes to the period of the request instant, not of the injected clock', () => {
+            // Review finding R3-001: the gate decided against November, so the
+            // accounting must too even though the row is written in December.
+            trackedQuota();
+            clockMs = Date.parse('2026-12-15T12:00:00Z');
+
+            service.recordUsage(
+                'client-1',
+                'codex',
+                140,
+                Date.UTC(2026, 10, 30, 23, 59, 59),
+            );
+
+            expect(repo.getUsage('client-1', 'codex', NOV_2026)).toMatchObject({
+                tokens: 140,
+                requests: 1,
+            });
+            expect(repo.getUsage('client-1', 'codex', DEC_2026)).toBeNull();
+        });
+
+        it('records the same request started in two different months as independent rows', () => {
+            trackedQuota();
+
+            service.recordUsage(
+                'client-1',
+                'codex',
+                100,
+                Date.UTC(2026, 10, 30, 23, 59, 59),
+            );
+            service.recordUsage(
+                'client-1',
+                'codex',
+                250,
+                Date.UTC(2026, 11, 1, 0, 0, 0),
+            );
+
+            expect(repo.getUsage('client-1', 'codex', NOV_2026)).toMatchObject({
+                tokens: 100,
+                requests: 1,
+            });
+            expect(repo.getUsage('client-1', 'codex', DEC_2026)).toMatchObject({
+                tokens: 250,
+                requests: 1,
+            });
+        });
+
+        it('defaults to the injected clock when the caller omits the instant', () => {
+            trackedQuota();
+            clockMs = Date.parse('2026-12-05T00:00:00Z');
+
+            service.recordUsage('client-1', 'codex', 60);
+
+            expect(repo.getUsage('client-1', 'codex', DEC_2026)).toMatchObject({
+                tokens: 60,
+                requests: 1,
+            });
+            expect(repo.getUsage('client-1', 'codex', NOV_2026)).toBeNull();
+        });
     });
 
     describe('retryAfterSeconds', () => {

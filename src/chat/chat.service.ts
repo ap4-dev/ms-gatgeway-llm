@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import type {
     ChatCompletion,
     ChatCompletionChunk,
@@ -16,6 +16,7 @@ import {
     type RequestLogEvent,
 } from '../observability/llm-logging.service';
 import { hashPrompt } from '../observability/prompt-hash.util';
+import { QuotaService } from '../quota/quota.service';
 
 export type ChatMessage = {
     role: string;
@@ -42,12 +43,19 @@ export type CompletionResult =
  */
 @Injectable()
 export class ChatService {
+    private readonly logger = new Logger(ChatService.name);
+
     constructor(
         @Inject(ENV_CONFIG) private readonly env: Env,
         private readonly providers: ProviderService,
         private readonly router: RoutingService,
         private readonly requestLog: RequestLogService,
         private readonly structuredLog: LlmLoggingService,
+        /**
+         * Monthly quota gate for frontier aliases: resolves the alias that
+         * actually serves a request and accounts its usage afterwards.
+         */
+        private readonly quota: QuotaService,
     ) {}
 
     /**
@@ -73,7 +81,16 @@ export class ChatService {
             body.model,
         );
         try {
-            const r = await this.router.route(body.model, body, (resolved, signal) =>
+            // Monthly quota gate (feature plan §4). Deliberately the FIRST
+            // statement inside the `try`: a `QuotaExhaustedError` still has to
+            // leave a failure row in `request_logs` before it propagates. The
+            // prompt hash above keeps using `body.model` — the alias the client
+            // ASKED for is client intent and must survive a silent diversion.
+            // `body` itself is never mutated: `applyResolved` already overwrites
+            // `model` with the resolved upstream model, so the diversion only
+            // needs to reach `route()`'s first argument.
+            const target = this.quota.resolveTarget(clientId, body.model);
+            const r = await this.router.route(target, body, (resolved, signal) =>
                 this.callUpstream(resolved, body, signal),
             );
             const resolvedModel = r.attempts.at(-1)?.upstreamModel ?? 'unknown';
@@ -104,6 +121,12 @@ export class ChatService {
                     clientId,
                     tokens,
                 );
+                this.accountUsage(
+                    clientId,
+                    target,
+                    tokens?.totalTokens,
+                    requestedAt * 1000,
+                );
                 return r.result;
             }
 
@@ -131,6 +154,12 @@ export class ChatService {
                         clientId,
                         tokens,
                     );
+                    this.accountUsage(
+                        clientId,
+                        target,
+                        tokens?.totalTokens,
+                        requestedAt * 1000,
+                    );
                 })
                 .catch(() => {
                     // Stream aborted mid-flight or threw before completing.
@@ -147,11 +176,59 @@ export class ChatService {
                         clientId,
                         undefined,
                     );
+                    // The request DID consume upstream prompt tokens even though
+                    // the stream died, and the tap lost its chunk buffer with the
+                    // rejection — so this is a PROMPT-ONLY estimate, produced by
+                    // the same local estimator the stream fallback uses
+                    // (`estimateTokens`), applied to an empty chunk list. Never
+                    // lose the spend (feature plan §5, risk R3).
+                    this.accountUsage(
+                        clientId,
+                        target,
+                        estimateTokens([], messagesForEstimation)
+                            .promptTokens,
+                        requestedAt * 1000,
+                    );
                 });
             return stream;
         } catch (err) {
             this.recordFailure(err, body, requestedAt, promptHash, clientId);
             throw err;
+        }
+    }
+
+    /**
+     * Account one completed request against the alias that actually served it.
+     *
+     * `requestedAtMs` is the instant the request STARTED (unix ms) so the gate
+     * and the accounting always resolve the same UTC month, even for a request
+     * that crosses a month boundary in flight (review finding R3-001).
+     *
+     * Wrapped in `try/catch` on purpose: accounting runs AFTER the response has
+     * been produced, so a DB failure must never turn a successful request into
+     * an error. Under-counting is repaired later by reconciliation (T6); a
+     * broken response is not recoverable. `tokens ?? 0` keeps the request
+     * counted when the upstream surfaced no `usage` at all.
+     */
+    private accountUsage(
+        clientId: string | null,
+        servedAlias: string,
+        tokens: number | undefined,
+        requestedAtMs: number,
+    ): void {
+        try {
+            this.quota.recordUsage(
+                clientId,
+                servedAlias,
+                tokens ?? 0,
+                requestedAtMs,
+            );
+        } catch (err) {
+            this.logger.warn(
+                `quota accounting failed for client ${clientId ?? 'anonymous'} on alias ${servedAlias}: ${
+                    err instanceof Error ? err.message : String(err)
+                }`,
+            );
         }
     }
 
