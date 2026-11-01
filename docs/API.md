@@ -465,7 +465,7 @@ Upsert one or more `(client, alias)` allowances. **Idempotent.**
 
 | Field | Required | Notes |
 |---|---|---|
-| `quotas` | yes | The **whole list** is applied, entry by entry, in the order given. |
+| `quotas` | yes | Array of **upserts**: every listed entry is written (inserted or updated), and quotas **not** present in the list are left untouched. Removing an allowance is `DELETE`, not omission. |
 | `quotas[].aliasKey` | yes | Must already exist in the alias registry — aliases are **not** created here. |
 | `quotas[].monthlyTokenLimit` | yes | Integer `> 0` (numeric string accepted). |
 | `quotas[].divertAliasKey` | no | Alias served once the limit is reached. Must exist in the registry and must differ from `aliasKey`. Omit or send `null` to make an exhausted alias answer `429` instead of degrading. |
@@ -655,6 +655,7 @@ Query parameters (all optional, AND-combined):
     {
       "requestedAt": 1783353000,
       "modelRequested": "code",
+      "servedAlias": "code",
       "resolvedProvider": "nan",
       "resolvedModel": "qwen3-coder",
       "attempts": 1,
@@ -675,6 +676,8 @@ Query parameters (all optional, AND-combined):
 }
 ```
 
+- `modelRequested` is the alias the client **asked for**; `servedAlias` is the alias the request was actually **routed to**. `servedAlias !== modelRequested` means a quota diversion happened: the client's monthly token quota for the requested alias was exhausted and the request was silently served by its `divertAliasKey` (no header, no body change). `servedAlias` is `null` for rows written before migration `0014`.
+- **Read `servedAlias`, not `resolvedModel`, when checking whether a client was degraded by quota.** `resolvedModel` alone cannot prove a diversion: an alias's own fallback chain can produce the same upstream model as the divert target's primary, so two rows can share `resolvedModel` while only one of them was diverted. Only the alias pair is evidence.
 - Newest first, ordered by `(requestedAt DESC, id DESC)`.
 - `attemptDetails` (JSON string): per-attempt metadata — provider, model, duration, error, circuit-open flag. Populated when a fallback chain had >1 attempt; `null` otherwise. Each failed attempt is also its own `status: "error"` row.
 - `hasMore: true` means at least one row matched beyond `items`.

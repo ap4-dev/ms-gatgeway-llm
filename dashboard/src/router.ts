@@ -5,6 +5,7 @@ import OverviewView from './views/OverviewView.vue';
 import ProvidersView from './views/ProvidersView.vue';
 import ModelsView from './views/ModelsView.vue';
 import ClientsView from './views/ClientsView.vue';
+import QuotasView from './views/QuotasView.vue';
 import AliasesView from './views/AliasesView.vue';
 import LogsView from './views/LogsView.vue';
 
@@ -51,6 +52,12 @@ export const router = createRouter({
       name: 'aliases',
       component: AliasesView,
       meta: { title: 'Aliases' },
+    },
+    {
+      path: '/quotas',
+      name: 'quotas',
+      component: QuotasView,
+      meta: { title: 'Quotas' },
     },
     {
       path: '/logs',

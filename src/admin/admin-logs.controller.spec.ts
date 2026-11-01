@@ -250,6 +250,111 @@ describe('AdminLogsController', () => {
         });
     });
 
+    /**
+     * `servedAlias` is what makes a silent quota diversion auditable: the
+     * client asked for `codex`, the gate routed `slave`, and `modelRequested`
+     * alone cannot show that. The column already exists and is already
+     * populated by the chat path (migration 0014 / T7); the controller simply
+     * has to project it.
+     */
+    describe('served alias (quota degradation)', () => {
+        it('projects servedAlias as null when the stored column is NULL', () => {
+            const out = controller.list({});
+            for (const item of out.items) {
+                expect(item).toHaveProperty('servedAlias');
+                expect(item.servedAlias).toBeNull();
+            }
+        });
+
+        it('reports the alias actually served on a diverted row', () => {
+            repo.append({
+                requestedAt: 1_700_004_000,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                resolvedProvider: 'qwen',
+                resolvedModel: 'qwen-3.6',
+                attempts: 1,
+                latencyMs: 900,
+                status: 'ok',
+                clientKey: 'tenant-acme',
+            });
+
+            const out = controller.list({});
+            expect(out.items[0]).toMatchObject({
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                resolvedModel: 'qwen-3.6',
+            });
+            // Diverted rows are exactly the ones where the two aliases disagree.
+            expect(out.items[0].servedAlias).not.toBe(out.items[0].modelRequested);
+        });
+
+        it('reports the requested alias as servedAlias on a normal row', () => {
+            repo.append({
+                requestedAt: 1_700_004_500,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                resolvedProvider: 'deepseek',
+                resolvedModel: 'deepseek-v4-flash',
+                attempts: 1,
+                latencyMs: 1_200,
+                status: 'ok',
+                clientKey: 'tenant-acme',
+            });
+
+            const out = controller.list({});
+            expect(out.items[0]).toMatchObject({
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+            });
+            expect(out.items[0].servedAlias).toBe(out.items[0].modelRequested);
+        });
+
+        /**
+         * The trap this field exists to close: an alias's OWN fallback chain can
+         * land on the same upstream model as the divert target's primary, so
+         * `resolvedModel` equality proves nothing. Only the alias pair does.
+         */
+        it('distinguishes a diversion from a same-upstream fallback', () => {
+            repo.append({
+                // Diverted: codex exhausted -> slave -> its primary qwen-3.6.
+                requestedAt: 1_700_005_000,
+                modelRequested: 'codex',
+                servedAlias: 'slave',
+                resolvedProvider: 'qwen',
+                resolvedModel: 'qwen-3.6',
+                attempts: 1,
+                latencyMs: 800,
+                status: 'ok',
+                clientKey: 'tenant-acme',
+            });
+            repo.append({
+                // Not diverted: codex served, its own fallback also qwen-3.6.
+                requestedAt: 1_700_005_500,
+                modelRequested: 'codex',
+                servedAlias: 'codex',
+                resolvedProvider: 'qwen',
+                resolvedModel: 'qwen-3.6',
+                attempts: 2,
+                latencyMs: 2_400,
+                status: 'ok',
+                clientKey: 'tenant-acme',
+            });
+
+            const out = controller.list({});
+            const diverted = out.items.find((r) => r.servedAlias === 'slave');
+            const normal = out.items.find(
+                (r) => r.servedAlias === 'codex' && r.resolvedModel === 'qwen-3.6',
+            );
+            expect(diverted).toBeDefined();
+            expect(normal).toBeDefined();
+            // Same upstream model, different served alias: resolvedModel alone
+            // cannot tell them apart, servedAlias can.
+            expect(diverted?.resolvedModel).toBe(normal?.resolvedModel);
+            expect(diverted?.servedAlias).not.toBe(normal?.servedAlias);
+        });
+    });
+
     describe('unknown query parameters', () => {
         it('rejects unknown keys (strict schema)', () => {
             expect(() =>

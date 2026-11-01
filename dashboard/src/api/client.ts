@@ -413,6 +413,89 @@ export function deleteClient(id: string): Promise<void> {
   });
 }
 
+// ── /admin/clients/:id/quotas ───────────────────────────────────────────────
+
+/**
+ * One `(client, alias)` monthly token allowance joined with the usage of the UTC
+ * month in progress. Mirrors `ClientQuotaView` in `src/quota/quota.service.ts`
+ * field for field; `exhausted` uses the same strict `tokens >= limit` rule as
+ * the request gate, so a row marked `exhausted` is already being diverted.
+ */
+export interface ClientQuota {
+  aliasKey: string;
+  monthlyTokenLimit: number;
+  divertAliasKey: string | null;
+  /** UTC calendar month (`YYYY-MM`) these counters belong to. */
+  periodKey: string;
+  tokens: number;
+  requests: number;
+  /** Clamped at 0: the post-hoc accounting accepts one request of overshoot. */
+  remaining: number;
+  exhausted: boolean;
+  /** Unix SECONDS of the next UTC month start, matching the 429 detail. */
+  resetsAt: number;
+  retryAfterSeconds: number;
+}
+
+/**
+ * Shared envelope of `GET`/`PUT /admin/clients/:id/quotas` (and `/v1/quota`).
+ * The period fields are hoisted here because every row in a response belongs to
+ * the same month.
+ */
+export interface ClientQuotasResponse {
+  clientId: string;
+  periodKey: string;
+  resetsAt: number;
+  retryAfterSeconds: number;
+  quotas: ClientQuota[];
+}
+
+/**
+ * One entry of the `PUT` body. The API upserts these and deletes nothing: an
+ * alias absent from the array keeps its stored allowance, so removing one is a
+ * `DELETE`, never an omission.
+ */
+export interface ClientQuotaEntry {
+  aliasKey: string;
+  monthlyTokenLimit: number;
+  /** `null` means an exhausted alias answers `429` instead of degrading. */
+  divertAliasKey: string | null;
+}
+
+/** `DELETE /admin/clients/:id/quotas/:aliasKey` response. */
+export interface ClientQuotaDeletedResponse {
+  deleted: true;
+  clientId: string;
+  aliasKey: string;
+}
+
+export function listClientQuotas(clientId: string): Promise<ClientQuotasResponse> {
+  return apiFetch<ClientQuotasResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas`,
+  );
+}
+
+export function putClientQuotas(
+  clientId: string,
+  quotas: ClientQuotaEntry[],
+): Promise<ClientQuotasResponse> {
+  return apiFetch<ClientQuotasResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas`,
+    { method: 'PUT', body: JSON.stringify({ quotas }) },
+  );
+}
+
+/** Removing the row makes the alias unlimited again (`404` if it was already gone). */
+export function deleteClientQuota(
+  clientId: string,
+  aliasKey: string,
+): Promise<ClientQuotaDeletedResponse> {
+  return apiFetch<ClientQuotaDeletedResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas/${encodeURIComponent(aliasKey)}`,
+    { method: 'DELETE' },
+  );
+}
+
 // ── GET /admin/logs ─────────────────────────────────────────────────────────
 
 export function listLogs(params: ListLogsParams = {}): Promise<LogsResponse> {

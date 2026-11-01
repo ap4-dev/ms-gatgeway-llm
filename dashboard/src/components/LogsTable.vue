@@ -47,6 +47,16 @@ function formatTime(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleString();
 }
 
+/**
+ * True when the quota gate diverted the request: the client asked for one alias
+ * and a different one served it. This is the only client-independent evidence of
+ * a degradation — `resolvedModel` cannot prove it, because an alias's own
+ * fallback chain can reach the same upstream model as the divert target's primary.
+ */
+function isDiverted(item: LogItem): boolean {
+  return item.servedAlias !== null && item.servedAlias !== item.modelRequested;
+}
+
 function statusClass(status: LogItem['status']): string {
   if (status === 'ok') return 'badge badge-ok';
   if (status === 'error') return 'badge badge-error';
@@ -61,6 +71,7 @@ function statusClass(status: LogItem['status']): string {
         <th>Time</th>
         <th>Status</th>
         <th>Model</th>
+        <th>Served</th>
         <th>Provider</th>
         <th>Attempts</th>
         <th>Latency</th>
@@ -82,6 +93,22 @@ function statusClass(status: LogItem['status']): string {
               <span class="muted"> → {{ item.resolvedModel }}</span>
             </template>
           </td>
+          <td>
+            <template v-if="item.servedAlias === null">
+              <span class="muted">—</span>
+            </template>
+            <template v-else-if="isDiverted(item)">
+              <span
+                class="badge badge-warn"
+                title="Quota diverted: the requested alias was exhausted, so a divert alias served this request"
+              >
+                {{ item.servedAlias }}
+              </span>
+            </template>
+            <template v-else>
+              <span class="mono">{{ item.servedAlias }}</span>
+            </template>
+          </td>
           <td>{{ item.resolvedProvider ?? '—' }}</td>
           <td>{{ item.attempts }}</td>
           <td>{{ item.latencyMs.toLocaleString('en-US') }} ms</td>
@@ -90,7 +117,7 @@ function statusClass(status: LogItem['status']): string {
           <td class="mono">{{ item.promptHash ?? '—' }}</td>
         </tr>
         <tr v-if="expanded === index" class="detail-row">
-          <td colspan="9">
+          <td colspan="10">
             <p v-if="item.error" class="error">{{ item.error }}</p>
 
             <template v-if="attemptDetails(item).length > 0">
