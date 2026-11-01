@@ -1,337 +1,293 @@
-# Feature: Cuotas mensuales de tokens por cliente con degradación silenciosa
+# Feature: Cuota mensual de tokens por (cliente × alias) con degradación silenciosa
 
 > Estado: **planificado** (ninguna línea de código escrita todavía).
 > Rama: `feature/cuotas-mensuales-tokens`.
 
-## 0. Problema de negocio
+## 0. Alcance real (acotado el 2026-11-01)
 
-El gateway corre sobre **proveedores con capacidad mensual finita de modelos
-frontera**. Hoy un cliente puede consumir toda la cuota del proveedor y dejar sin
-acceso a los demás. Al mismo tiempo existen **modelos ilimitados** que nunca deben
-contarse ni frenarse.
+Un cliente tiene un **límite mensual de tokens por alias**. Si lo supera, el
+gateway lo **rutea en silencio** a un alias de respaldo que tiene su propio
+comportamiento principal+fallback.
 
-Objetivo: asignar a cada cliente una **capacidad mensual** sobre los aliases
-frontera, y cuando la agote, **degradarlo silenciosamente** a un alias de respaldo
-sin romper la sesión agéntica del cliente.
+```
+Alias codex  → principal: deepseek-v4-flash   fallback: qwen-3.6   (frontera)
+Alias slave  → principal: qwen                fallback: gemma      (ilimitado)
 
-## 1. Decisiones cerradas
+Cliente 1 → codex: 20M/mes
+Cliente 2 → codex: 30M/mes
+Cliente 3 → codex: 50M/mes
 
-| ID | Decisión | Valor | Consecuencia |
-|----|----------|-------|--------------|
-| D1 | Aviso de desvío | **C — silencioso** (solo log interno) | Sin headers ni mutación del body. |
-| D2 | Sin desvío disponible | **A — `429 quota_exhausted` + `Retry-After`** | Último recurso: sólo cuando no hay ningún alias de respaldo sano. |
-| D3 | Anti-bypass | **A — allowlist de aliases por cliente** | Tabla `client_alias_access`. Sin filas = sin restricción. |
-| D4 | Corte de período | **A — mes calendario UTC** (`'YYYY-MM'`) | `period_key` calculado, sin cron de reset. |
-| D5 | Agrupación del presupuesto | **Ver §3 — resuelto por `quota_scopes`** | Soporta presupuesto por alias y presupuesto único compartido sin código distinto. |
+Cliente 1 pide codex, uso < 20M  → deepseek. Si deepseek falla → qwen.   (comportamiento actual)
+Cliente 1 pide codex, uso ≥ 20M  → se rutea a slave → qwen. Si falla → gemma.
+Cliente 2 pide slave cuando quiera → sin cuota, sin control, como hoy.
+```
 
-### 1.1 Reglas de negocio confirmadas
+### Lo que queda explícitamente FUERA
 
-1. **Alias ilimitado ⇒ cero I/O de cuota.** Un alias sin `quota_scopes` no se lee,
-   no se escribe, no se evalúa. No es "límite infinito": es **ausencia de
-   participación**. Cero costo por request.
-2. Los aliases ilimitados **pueden tener fallback** y siguen usando el walk normal
-   del router (circuit breaker incluido).
-3. La degradación es **silenciosa** para cualquier modelo que tenga cuota.
-4. La cuota se asigna al **cliente** sobre **aliases frontera**, y el cliente está
-   preparado para llegar a fin de mes con ella (formato agéntico, sin reintentos
-   infinitos).
+| Descartado | Por qué |
+|---|---|
+| Control de la capacidad del proveedor (100M) | El usuario compra más o recibe promociones. **No se gestiona acá.** |
+| Allowlist de aliases por cliente | `slave` es **abierto a propósito**: "el cliente puede pegarle a slave sin problemas si así lo desea siempre". No hay bypass que evitar. |
+| Cuota por modelo dentro de una chain | La unidad de cuota es el **alias**, no la posición. |
+| Cache de cuota en memoria | Ver §5 — subir el límite debe tener efecto inmediato. |
+| Unidades normalizadas de costo | Todos los tokens se asumen equivalentes por ahora. |
 
-### Tradeoff aceptado (R1)
+## 1. Decisiones
 
-Silencioso (D1) + 429 duro (D2) es asimétrico: el cliente no percibe la degradación
-hasta que se queda sin respaldo. Mitigación: `quotaDiverted: true` + `servedModel`
-en el evento estructurado `chat.request` (`LlmLoggingService`), y una tabla de
-"degrada­ciones por cliente" en `/admin/logs`.
+| ID | Decisión | Valor |
+|----|----------|-------|
+| D1 | Aviso al cliente al degradar | **Silencioso.** Sin headers, sin mutación del body. |
+| D2 | Cuota agotada y sin alias de respaldo | `429 quota_exhausted` + `Retry-After` hasta el 1° del mes UTC |
+| D3 | ~~Allowlist~~ | **Descartada** (ver §0) |
+| D4 | Corte de período | Mes calendario **UTC** (`'YYYY-MM'`) |
+| D5 | Unidad de cuota | **(cliente × alias)**, fila explícita; sin fila = ilimitado |
+| D6 | Asignación | Admin API: alias + límite por cliente, editable en cualquier momento |
 
-## 2. Alcance
+## 2. Por qué el cambio es chico
 
-**Dentro:** cuotas mensuales de tokens por `(cliente × budget)`; budgets agrupando
-uno o varios aliases/modelos; degradación en dos niveles (pre-walk + por posición);
-desvío a alias alternativo sin recursión; contabilidad exacta buffered/streaming/abort;
-allowlist de aliases por cliente; admin API y consulta de saldo.
+Tres hechos verificados en el código actual:
 
-**Fuera:** unidades normalizadas de costo (`unit` queda reservada); reserva
-pre-flight anti-overshoot; cuotas distribuidas en Redis; push/PR/merge.
+1. **`RoutingService.route()` ignora `body`** (`_body`, `routing.service.ts:70`). La
+   decisión de qué alias rutear es sólo el primer argumento.
+2. **`applyResolved()` siempre sobreescribe `model` con `resolved.upstreamModel`**
+   (`chat.service.ts:333-338`). Rutear `slave` no contamina el request upstream:
+   el proveedor recibe el modelo real de `slave`.
+3. El fallback **dentro** de `slave` (qwen → gemma) ya funciona: es el walk que
+   existe. No hay que tocarlo.
+
+Conclusión: el gate es **una sustitución del primer argumento de `route()`**.
+`RoutingService` no se modifica. El walk no se modifica. El circuit breaker no se
+toca.
+
+```ts
+// src/chat/chat.service.ts — antes de route()
+const target = this.quota.resolveTarget(clientId, body.model);
+const r = await this.router.route(target, body, (resolved, signal) =>
+    this.callUpstream(resolved, body, signal),
+);
+
+// después de la respuesta
+this.quota.recordUsage(clientId, target, tokens.totalTokens);
+```
 
 ## 3. Modelo de datos
 
-La pieza que resuelve D5: se separa **el presupuesto** (`quota_budgets`) de **qué
-lo consume** (`quota_scopes`).
-
-- Budget con **un** scope → cuota por alias.
-- Budget con **N** scopes → presupuesto único compartido entre todos los aliases
-  frontera del cliente ("tenés 500k tokens/mes de modelos frontera").
-
-Mismo código, distinta configuración. No hay que elegir ahora.
+Dos tablas nuevas + una columna.
 
 ```sql
--- migrations/0014_quota_budgets.sql
+-- migrations/0014_client_alias_quotas.sql
 
-CREATE TABLE quota_budgets (
-  id               TEXT PRIMARY KEY,              -- 'frontera-mensual'
-  token_limit      INTEGER NOT NULL CHECK (token_limit > 0),  -- capacidad default
-  period           TEXT NOT NULL DEFAULT 'monthly' CHECK (period IN ('monthly')),
-  unit             TEXT NOT NULL DEFAULT 'tokens'  CHECK (unit IN ('tokens')),
-  divert_alias_key TEXT,                          -- alias de respaldo (NULL = 429)
-  enabled          INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+CREATE TABLE client_alias_quotas (
+  client_id        TEXT    NOT NULL,
+  alias_key        TEXT    NOT NULL,              -- 'codex'
+  monthly_token_limit INTEGER NOT NULL CHECK (monthly_token_limit > 0),
+  divert_alias_key TEXT    CHECK (divert_alias_key IS NULL OR divert_alias_key <> alias_key),
   created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at       INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (client_id, alias_key)
 );
 
--- Qué aliases/modelos consumen este presupuesto. AUSENCIA = ILIMITADO.
-CREATE TABLE quota_scopes (
-  budget_id  TEXT NOT NULL,
-  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('alias','model')),
-  scope_key  TEXT NOT NULL,                       -- 'coder' | 'nan/qwen3-premium'
-  PRIMARY KEY (budget_id, scope_kind, scope_key),
-  FOREIGN KEY (budget_id) REFERENCES quota_budgets(id) ON DELETE CASCADE
-);
-
--- Quién tiene presupuesto. Sin fila = ILIMITADO.
-CREATE TABLE quota_bindings (
-  client_id   TEXT NOT NULL,
-  budget_id   TEXT NOT NULL,
-  token_limit INTEGER CHECK (token_limit IS NULL OR token_limit > 0), -- override
-  PRIMARY KEY (client_id, budget_id),
-  FOREIGN KEY (budget_id) REFERENCES quota_budgets(id) ON DELETE CASCADE
-);
-
--- Contadores. Una fila por (cliente, budget, mes UTC).
-CREATE TABLE quota_usage (
+CREATE TABLE client_alias_usage (
   client_id  TEXT    NOT NULL,
-  budget_id  TEXT    NOT NULL,
-  period_key TEXT    NOT NULL,                    -- '2026-02'
+  alias_key  TEXT    NOT NULL,                    -- alias EFECTIVAMENTE servido
+  period_key TEXT    NOT NULL,                    -- 'YYYY-MM' (UTC)
   tokens     INTEGER NOT NULL DEFAULT 0 CHECK (tokens >= 0),
   requests   INTEGER NOT NULL DEFAULT 0 CHECK (requests >= 0),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  PRIMARY KEY (client_id, budget_id, period_key),
-  FOREIGN KEY (budget_id) REFERENCES quota_budgets(id) ON DELETE CASCADE
+  PRIMARY KEY (client_id, alias_key, period_key)
 );
 
-CREATE INDEX idx_quota_usage_client_period ON quota_usage (client_id, period_key);
-CREATE INDEX idx_quota_scopes_key ON quota_scopes (scope_kind, scope_key);
-```
+CREATE INDEX idx_client_alias_usage_period ON client_alias_usage (period_key);
 
-```sql
--- migrations/0015_client_alias_access.sql  (T8)
-
-CREATE TABLE client_alias_access (
-  client_id TEXT NOT NULL,
-  alias_key TEXT NOT NULL,
-  PRIMARY KEY (client_id, alias_key)
-);
-CREATE INDEX idx_client_alias_access_client ON client_alias_access (client_id);
+-- Observabilidad: qué pidió el cliente vs qué se le sirvió.
+-- Sin esta columna no se puede reconciliar ni medir degradaciones (ver §6).
+ALTER TABLE request_logs ADD COLUMN served_alias TEXT;
+CREATE INDEX idx_request_logs_served_alias ON request_logs (served_alias);
 ```
 
 ### Invariantes
 
-1. **Ilimitado = no está en `quota_scopes` y no tiene binding.** Jamás `token_limit = 0`.
-2. Cliente sin filas en `quota_bindings` → ningún budget se le aplica.
-3. Cliente sin filas en `client_alias_access` → sin restricción de aliases (retrocompat).
-4. `quota_usage` sin FK a `clients` (mismo criterio que `request_logs.client_key`,
-   `migrations/0004_clients.sql`): el histórico sobrevive al borrado del cliente.
-5. `period_key` = `YYYY-MM` **UTC** derivado de `requestedAt`.
-6. Límite efectivo = `COALESCE(binding.token_limit, budget.token_limit)`.
+1. **Sin fila en `client_alias_quotas` = ilimitado.** No se lee uso, no se escribe
+   uso. Cero costo por request. Aplica a `slave`.
+2. `service` cuenta contra el alias **servido**, no el pedido. Si se degradó a
+   `slave`, no se suma a `codex` (ver §5).
+3. `period_key` = `YYYY-MM` UTC derivado de `requestedAt`. Sin cron de reset.
+4. Cambiar `monthly_token_limit` aplica en la request siguiente, en ambas
+   direcciones (subir y bajar).
 
-## 4. Semántica de enforcement
+## 4. Semántica del gate
 
-### 4.1 Nivel A — gate pre-walk (alias)
-
-Antes de `resolveChain(model)`:
-
-```
-budgets = quota.budgetsFor(clientId, 'alias', model)   // [] si el alias es ilimitado
-if budgets has any exhausted budget:
-    if budget.divert_alias_key → route(divert, ctx{diverted:true})   // 1 nivel
-    else                       → QuotaExhaustedError → 429
-```
-
-Costo para un alias ilimitado: **una lectura de `quota_scopes`** (cacheada), cero
-escrituras. Nada más.
-
-### 4.2 Nivel B — gate por posición (modelo)
-
-Dentro del walk (`src/routing/routing.service.ts:90-130`), antes de
-`breaker.canRequest`:
-
-```
-if (quota.isExhaustedFor(clientId, 'model', `${providerId}/${upstreamModel}`)) {
-    attempts.push({ providerId, upstreamModel, ok: false, quotaExhausted: true });
-    continue;   // ← el fallback a la siguiente posición es gratis
-}
+```ts
+resolveTarget(clientId, requestedAlias):
+    if requestedAlias no es alias            → requestedAlias        // paths y modelos: sin cuota
+    row = quota(clientId, requestedAlias)
+    if !row                                  → requestedAlias        // ILIMITADO, cero I/O de uso
+    used = usage(clientId, requestedAlias, periodKey(now))
+    if used < row.monthly_token_limit        → requestedAlias
+    if row.divert_alias_key                  → row.divert_alias_key  // degradación silenciosa
+    else                                     → QuotaExhaustedError → 429
 ```
 
-Esto habilita limitar un modelo caro puntual dentro de un alias sin limitar el alias.
+Detalles que importan:
 
-### 4.3 Anidamiento del desvío
+- **`used === limit` cuenta como agotado.** Un cliente exactamente en 20M ya no
+  entra a `codex`.
+- **No hay cache.** Dos lookups por PK de SQLite (microsegundos). Ver §5.
+- **Un `divert_alias_key` inexistente o roto** se valida al escribir la fila
+  (admin API) y, si igual falla en runtime, se loguea y se degrada a
+  `QuotaExhaustedError`. Nunca se sirve el alias agotado.
+- **Anidamiento:** no hay recursión. `slave` no tiene fila de cuota → su walk es
+  el de siempre (`qwen` → `gemma`).
 
-- El desvío se aplica **una sola vez** (`ctx.diverted = true`). Sin recursión.
-- En la cadena de desvío, el nivel B sigue activo: si el respaldo también tiene
-  cuota agotada → 429.
-- Un desvío **no** requiere que el alias esté en la allowlist del cliente (D3):
-  es decisión del gateway, no del cliente.
+## 5. Contabilidad y el requisito de subir la cuota
 
-### 4.4 Regla de error
+El caso que manda el diseño: *"si vemos que se acerca cierre de mes, subirle de
+20M a 30M y que lo dejen pasar sin fallback"*.
 
-| Situación | Resultado |
-|-----------|-----------|
-| Todas las posiciones salteadas por cuota, sin fallas técnicas | `QuotaExhaustedError` → **429** |
-| Al menos una posición falló técnicamente | `RoutingFailedError` (comportamiento actual) |
-| Desvío aplicado y servido | 200 silencioso (D1) |
+Si los tokens servidos por `slave` se siguieran contando contra `codex`, un
+cliente con 25M acumulados seguiría degradado aunque subas el límite a 30M. Por
+eso:
 
-## 5. Contabilidad
+**Se cuenta contra el alias servido. El tráfico degradado no consume la cuota del
+alias agotado.** El contador de `codex` se congela cuando entra en degradación;
+subir el límite restaura el acceso en la request siguiente.
 
-Se ejecuta **sólo si el request tocó al menos un budget**. Se incrementa cada
-budget aplicable (alias pedido + modelo servido), con una sentencia atómica por budget:
+```
+uso codex = 25M, límite = 20M  → target = slave   (codex: 25M, congelado)
+subís el límite a 30M
+uso codex = 25M, límite = 30M  → target = codex   (vuelve, sin tocar nada más)
+```
+
+SQL de la contabilidad, una sentencia atómica por request:
 
 ```sql
-INSERT INTO quota_usage (client_id, budget_id, period_key, tokens, requests)
+INSERT INTO client_alias_usage (client_id, alias_key, period_key, tokens, requests)
 VALUES (?, ?, ?, ?, 1)
-ON CONFLICT (client_id, budget_id, period_key)
+ON CONFLICT (client_id, alias_key, period_key)
 DO UPDATE SET tokens     = tokens + excluded.tokens,
               requests   = requests + 1,
               updated_at = unixepoch();
 ```
 
 Puntos de enganche en `src/chat/chat.service.ts`:
-- buffered: junto a `recordSuccess` (~línea 74) con `extractTokens`;
-- streaming: junto a `recordSuccess` async (~línea 89) con `extractStreamTokens`;
-- **abort**: `finally` sobre el iterable → si no hubo `usage`, `estimateTokens`.
-  Nunca perder el gasto.
+- buffered: junto a `recordSuccess` (~línea 74), con `extractTokens`;
+- streaming: junto a `recordSuccess` async (~línea 89), con `extractStreamTokens`;
+- **stream abortado por el cliente**: `finally` sobre el iterable; si no llegó
+  `usage`, `estimateTokens`. Nunca perder el gasto.
 
-## 6. Tareas
+### Por qué NO hay cache
 
-Cada tarea cierra con un commit work-unit en la rama. Tests y docs en el mismo commit.
+Subir el límite tiene que verse **en la request siguiente**. Un cache con TTL
+introduce una ventana donde el cliente ya tiene 30M asignados y sigue degradado
+— exactamente el bug que el requisito pide evitar. Dos `SELECT` por PK en SQLite
+sincrónico son microsegundos; el cache no compra nada y sí introduce un modo de
+falla. **Sin cache, sin invalidación, sin staleness.**
 
-### T1 — Schema de cuotas
-- **Superficies:** `migrations/0014_quota_budgets.sql`, `src/database/migrations/quota-schema.spec.ts`
-- **Hacer:** las 4 tablas + índices.
+### Overshoot aceptado (R2)
+
+El gate es pre-flight y la contabilidad post-hoc: un cliente con 19.9M que pide
+una request de 3M la recibe y queda en 22.9M. La siguiente ya se degrada. Es el
+comportamiento estándar de cuota post-paga y evita reservar tokens que el modelo
+puede no usar.
+
+## 6. Observabilidad (mitigación de D1 silencioso)
+
+- `request_logs.served_alias` guarda el alias ruteado. `model_requested` conserva
+  lo que pidió el cliente. `WHERE served_alias <> model_requested` = degradaciones.
+- Evento estructurado `chat.request` gana `servedAlias` y `quotaDivertedFrom`.
+- `GET /admin/logs?diverted=true` para auditarlas.
+- El dashboard ya existente puede mostrar "tokens por alias servido" sin cambios
+  de esquema.
+
+## 7. Tareas (6 work units)
+
+Cada tarea cierra con un commit en la rama. Tests y docs en el mismo commit.
+
+### T1 — Schema
+- **Superficies:** `migrations/0014_client_alias_quotas.sql`,
+  `src/database/migrations/quota-schema.spec.ts`
+- **Hacer:** las 2 tablas + `request_logs.served_alias` + índices.
 - **Test:** migraciones sobre SQLite `:memory:` (patrón `migration-runner.spec.ts`);
-  CHECKs (`token_limit > 0`, `scope_kind`, `tokens >= 0`), PK compuesta de
-  `quota_usage`, `ON DELETE CASCADE`.
-- **Commit:** `feat(quota): add monthly token quota schema`
+  CHECKs (`monthly_token_limit > 0`, `divert_alias_key <> alias_key`,
+  `tokens >= 0`), PK compuestas, ALTER de `served_alias` idempotente.
+- **Commit:** `feat(quota): add per-client alias quota schema`
 
 ### T2 — QuotaRepository
 - **Superficies:** `src/database/repositories/quota.repository.ts` (+spec),
   `src/database/database.module.ts`
-- **Hacer:** CRUD budgets/scopes/bindings; `budgetsForScope(kind, key)`,
-  `bindingsForClient(clientId)`, `getUsage`, `addUsage` (UPSERT atómico),
-  `effectiveLimit(binding, budget)`.
-- **Test:** `:memory:`; override de binding; UPSERT idempotente; cascade delete.
-- **Commit:** `feat(quota): add quota repository`
+- **Hacer:** `upsertQuota`, `deleteQuota`, `listQuotasByClient`, `getQuota`,
+  `getUsage`, `addUsage` (UPSERT atómico), `listUsageByPeriod`.
+- **Test:** `:memory:`; UPSERT idempotente; cambio de límite reflejado en lectura.
+- **Commit:** `feat(quota): add client alias quota repository`
 
 ### T3 — QuotaService
 - **Superficies:** `src/quota/quota.service.ts`, `src/quota/quota.module.ts`,
   `src/quota/quota.service.spec.ts`, `src/app.module.ts`
-- **Hacer:** `periodKey(nowMs)` (UTC), `budgetsFor(clientId, kind, key)`,
-  `isExhausted(...)`, `consume(clientId, budgetIds[], tokens)`,
-  `divertFor(clientId, budgetId)`, `retryAfterSeconds(nowMs)`.
-  Cache en memoria TTL ≤5 s con invalidación en `consume`. **Fast path:** si
-  `budgetsFor` devuelve `[]`, `consume` no toca la DB.
-- **Test:** rollover de mes; `tokens == limit` cuenta como agotado; cliente sin
-  binding = nunca agotado; alias ilimitado = cero llamadas a `addUsage`; TTL.
-- **Commit:** `feat(quota): add quota service with utc period keys`
+- **Hacer:** `periodKey(nowMs)` (UTC), `resolveTarget(clientId, alias)`,
+  `recordUsage(clientId, alias, tokens)`, `retryAfterSeconds(nowMs)`.
+  **Sin cache deliberadamente (§5).** Fast path: sin fila de cuota ⇒ retorna el
+  alias sin leer `client_alias_usage`, y `recordUsage` retorna sin escribir.
+- **Test:** bajo el límite; exactamente en el límite (agotado); sobre el límite;
+  subir el límite restaura el acceso; bajarlo lo vuelve a degradar; alias sin fila
+  ⇒ cero queries de uso; rollover de mes; `divert_alias_key` nulo ⇒ error 429.
+- **Commit:** `feat(quota): resolve serving alias from monthly token quotas`
 
-### T4 — Skip por cuota en el walk (nivel B)
-- **Superficies:** `src/routing/routing.service.ts`, `src/routing/routing.service.spec.ts`
-- **Hacer:** `RouteContext { clientId?: string|null; diverted?: boolean }` como 4º
-  parámetro opcional de `route()`; `quotaExhausted?: boolean` en `RouteAttemptFailed`;
-  gate antes de `breaker.canRequest`; regla de error §4.4.
-- **Test:** posición 0 agotada → intenta 1; todas agotadas → `QuotaExhaustedError`;
-  falla técnica + cuota → `RoutingFailedError`; sin clientId → sin chequeo.
-- **Commit:** `feat(routing): skip quota-exhausted chain entries`
-
-### T5 — Contabilidad en ChatService
+### T4 — Wiring en ChatService
 - **Superficies:** `src/chat/chat.service.ts`, `src/chat/chat.service.spec.ts`,
-  `src/chat/chat.module.ts`
-- **Hacer:** pasar `clientId` al router; contabilizar según §5; emitir
-  `quotaDiverted`/`servedModel` en el log estructurado (mitigación R1).
-- **Test:** buffered con `usage`; streaming con `usage`; streaming sin `usage`;
-  stream abortado; alias ilimitado no escribe en `quota_usage`; doble budget
-  (alias + modelo) incrementa ambos.
-- **Commit:** `feat(chat): account token usage against quotas`
+  `src/chat/chat.module.ts`, `src/observability/request-log.service.ts`
+- **Hacer:** `target = quota.resolveTarget(...)` antes de `route(target, ...)`;
+  `recordUsage(clientId, target, tokens)` en los tres caminos (buffered, streaming,
+  abort); persistir `served_alias` (`target`) manteniendo `model_requested`
+  (`body.model`); `servedAlias`/`quotaDivertedFrom` en el log estructurado.
+- **Test:** buffered dentro de cuota → `codex`, `served_alias` null; sobre cuota →
+  rutea `slave`, `served_alias='slave'`, `model_requested='codex'`, y **no**
+  incrementa `codex`; streaming sin `usage` (estimador); stream abortado; alias
+  sin cuota ⇒ no escribe `client_alias_usage`.
+- **Commit:** `feat(chat): divert to fallback alias when quota is exceeded`
 
-### T6 — Desvío a alias de respaldo (nivel A)
-- **Superficies:** `src/routing/routing.service.ts`,
-  `src/routing/routing.service.spec.ts`,
-  `src/database/repositories/provider-registry.repository.ts`
-- **Hacer:** gate pre-walk; si agotado y hay `divert_alias_key`, resolver la chain
-  del respaldo y recorrerla con `ctx.diverted = true`.
-- **Test:** agotado con respaldo → sirve el respaldo; sin respaldo → 429; respaldo
-  agotado → 429; un solo nivel de desvío.
-- **Commit:** `feat(routing): divert to fallback alias when quota is exhausted`
-
-### T7 — 429 `quota_exhausted`
-- **Superficies:** `src/routing/routing.service.ts` (export del error),
-  `src/chat/chat.controller.ts`, `src/chat/chat.service.ts`,
-  `src/anthropic/anthropic.service.ts`
-- **Hacer:** `429` + `Retry-After` (segundos hasta el 1° del mes UTC) + body
-  `{ code: 'quota_exhausted', budget, resets_at }`. Replicar en `/v1/messages`.
-- **Test:** controller spec → 429, header y shape; sin `Retry-After` negativo.
-- **Commit:** `feat(chat): return 429 when monthly quota is exhausted`
-
-### T8 — Allowlist de aliases (D3)
-- **Superficies:** `migrations/0015_client_alias_access.sql`,
-  `src/database/repositories/client-alias-access.repository.ts` (+spec),
-  `src/auth/client-alias-access.service.ts` (+spec),
-  `src/routing/routing.service.ts`, `src/chat/models.controller.ts` (+spec)
-- **Hacer:** cache por `clientId` con invalidación en mutación; sin filas = permitido;
-  con filas = sólo las listadas y `provider/model` directo rechazado; desvío exento.
-- **Test:** sin filas (retrocompat); permitido/denegado; `provider/model` denegado;
-  desvío exento; `/v1/models` filtrado.
-- **Commit:** `feat(auth): scope client access to allowlisted aliases`
-
-### T9 — Superficie admin y saldo propio
+### T5 — Admin API y saldo propio
 - **Superficies:** `src/admin/admin-quota.controller.ts` (+spec),
-  `src/admin/admin-clients.controller.ts`, `src/admin/admin.module.ts`,
-  `src/quota/quota.controller.ts` (+spec)
-- **Hacer:** `GET/POST/PATCH/DELETE /admin/quota/budgets[/:id]`,
-  `PUT /admin/quota/budgets/:id/scopes`, `GET /admin/clients/:id/quota`,
-  `PUT /admin/clients/:id/quota` (bindings),
-  `PUT /admin/clients/:id/aliases` (allowlist), `GET /v1/quota` (scope `chat.read`).
-- **Test:** specs de controller; shape y status; validación zod.
-- **Commit:** `feat(admin): expose quota and alias access management`
+  `src/admin/admin.module.ts`, `src/quota/quota.controller.ts` (+spec)
+- **Hacer:**
+  `GET /admin/clients/:id/quotas` (lista con uso del mes en curso),
+  `PUT /admin/clients/:id/quotas` (`[{alias_key, monthly_token_limit, divert_alias_key}]`),
+  `DELETE /admin/clients/:id/quotas/:aliasKey`,
+  `GET /v1/quota` (scope `chat.read`, saldo propio del cliente).
+  Validación zod: alias existente en el registry, `divert_alias_key` existente y
+  distinto del alias, límite > 0.
+- **Test:** specs de controller; subir el límite vía API se refleja en
+  `resolveTarget` (integración con SQLite `:memory:`); 404 en alias inexistente.
+- **Commit:** `feat(admin): manage per-client alias quotas`
 
-### T10 — Reconciliación y documentación
+### T6 — Reconciliación y documentación
 - **Superficies:** `src/quota/quota-reconcile.service.ts` (+spec),
-  `src/quota/quota.module.ts`, `docs/API.md`, `docs/ARCHITECTURE.md`, `README.md`
-- **Hacer:** recálculo desde `request_logs` (`client_key`, `model_requested`,
-  `requested_at` en período) por budget de scope alias; `--dry-run`; log de drift.
-  Documentar schema, semántica, endpoints, R1 y actualizar la tabla de migraciones
-  en `docs/ARCHITECTURE.md` §8.
-- **Test:** drift cero; drift detectado y corregido.
-- **Commit:** `feat(quota): reconcile usage from request logs`
+  `docs/API.md`, `docs/ARCHITECTURE.md`, `README.md`
+- **Hacer:** recálculo de `client_alias_usage` desde `request_logs`
+  (`COALESCE(served_alias, model_requested)`, `client_key`, `requested_at` en
+  período), modo `--dry-run`, log de drift. Documentar schema, semántica,
+  endpoints, y actualizar la tabla de migraciones en `docs/ARCHITECTURE.md` §8.
+- **Test:** drift cero con datos consistentes; drift detectado y corregido;
+  las requests degradadas no contaminan el contador de `codex`.
+- **Commit:** `feat(quota): reconcile alias usage from request logs`
 
-### T11 — Guardia de sobresuscripción del pool (opcional)
-- **Superficies:** `migrations/0016_provider_capacity.sql`,
-  `src/admin/admin-quota.controller.ts`, `src/providers/provider.registry.ts`
-- **Hacer:** `providers.monthly_token_capacity INTEGER`; al crear/actualizar un
-  binding, sumar los límites de todos los clientes que consumen budgets apuntando
-  a ese provider y **advertir** (no bloquear) si se supera la capacidad.
-  Endpoint `GET /admin/quota/capacity` con el balance.
-- **Por qué:** es la contracara del problema de negocio ("me deja a otros clientes
-  sin acceso"). Sin esto, `50 clientes × 500k` sobre un pool de `5M` sigue
-  agotando el proveedor aunque cada cliente respete su cuota.
-- **Commit:** `feat(quota): warn on provider capacity oversubscription`
-
-**Total: 11 work units** (T1–T10 core, T11 opcional).
-
-## 7. Riesgos y deuda
+## 8. Riesgos
 
 | ID | Riesgo | Mitigación |
 |----|--------|-----------|
-| R1 | Degradación silenciosa + 429 es indistinguible de un bug | `quotaDiverted`/`servedModel` en logs; documentar en `docs/API.md` |
-| R2 | Overshoot por concurrencia | Aceptado en fase 1; reserva pre-flight en fase 2 |
-| R3 | Stream abortado pierde el gasto | `finally` + estimador (T5) |
-| R4 | Cache de cuota con staleness ≤5 s | Aceptado; invalidación en `consume` |
-| R5 | Reconciliación autoritativa sólo para scope alias (`model_requested` guarda el alias) | Scope model queda best-effort documentado |
-| R6 | Tokens ≠ costo por modelo | Columna `unit` reservada |
-| R7 | Sobresuscripción del pool: cuotas individuales correctas, proveedor igual agotado | T11 |
+| R1 | Degradación silenciosa indistinguible de un bug | `served_alias` + `quotaDivertedFrom` en logs; `?diverted=true` en `/admin/logs` |
+| R2 | Overshoot de una request por contabilidad post-hoc | Aceptado (§5) |
+| R3 | Stream abortado pierde el gasto | `finally` + `estimateTokens` (T4) |
+| R4 | Cliente que pide `slave` directo evita la cuota | **Intencional** (D3 descartada) |
+| R5 | `divert_alias_key` apuntando a un alias que también tiene cuota | Validado en admin API; en runtime se aplica el gate otra vez sólo si esa fila existe |
 
-## 8. Orden y dependencias
+## 9. Orden
 
 ```
-T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 → T10 → (T11)
-                        └──── T8 reusa el punto de intercepción de T4
-T9 depende de T2/T3 (+T8 para allowlist). T11 depende de T2/T9.
+T1 → T2 → T3 → T4 → T5 → T6
 ```
+Sin dependencias cruzadas con routing, circuit breaker ni el walk de fallback.
+
+## 10. Fuera de alcance (cerrado)
+
+- `pnpm-lock.yaml` multi-documento: artefacto del `pnpm i` local del operador; el
+  flujo CI/CD no está operativo. No se toca.
