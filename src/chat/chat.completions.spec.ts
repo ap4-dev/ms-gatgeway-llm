@@ -15,6 +15,7 @@ import type { RouteExecutor, RouteResult, RoutingService } from '../routing/rout
 import { RequestLogService } from '../observability/request-log.service';
 import { LlmLoggingService } from '../observability/llm-logging.service';
 import type { QuotaService } from '../quota/quota.service';
+import type { AliasAccessService } from '../access/alias-access.service';
 import { RoutingFailedError } from '../routing/routing.service';
 
 const OpenAICtor = OpenAI as unknown as jest.Mock;
@@ -87,6 +88,16 @@ function makeFakeQuota(): QuotaService {
     } as unknown as QuotaService;
 }
 
+/** Same idea for the alias allowlist. Unrestricted here so every assertion
+ *  in this file keeps testing exactly what it tested before the access guard
+ *  landed; the guard's own behaviour is covered in `chat.service.spec.ts`. */
+function makeFakeAccess(): AliasAccessService {
+    return {
+        getAccess: () => ({ mode: 'unrestricted' }),
+        isPermitted: () => true,
+    } as unknown as AliasAccessService;
+}
+
 /** A fake RoutingService: invokes the supplied executor and packages the
  *  result. Use `failWith` to simulate a router-level rejection. */
 function makeFakeRouter(
@@ -141,7 +152,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider('gpt-test', 'gpt-real');
         const router = makeFakeRouter(fake.resolved);
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router.router, log, makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, log, makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
         const result = await service.completions(buildSampleBody() as any);
@@ -183,6 +194,7 @@ describe('ChatService.completions', () => {
             log,
             structuredLog,
             makeFakeQuota(),
+            makeFakeAccess(),
         );
 
         fake.create.mockResolvedValueOnce({
@@ -222,6 +234,7 @@ describe('ChatService.completions', () => {
             makeFakeLog(),
             structuredLog,
             makeFakeQuota(),
+            makeFakeAccess(),
         );
         fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
         await service.completions(buildSampleBody() as any);
@@ -238,7 +251,7 @@ describe('ChatService.completions', () => {
     it('forwards the upstream stream live (TTFT preserved) and logs after iteration when stream=true', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         async function* fakeStream() {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
@@ -276,6 +289,7 @@ describe('ChatService.completions', () => {
             log,
             structuredLog,
             makeFakeQuota(),
+            makeFakeAccess(),
         );
 
         async function* fakeStream() {
@@ -329,6 +343,7 @@ describe('ChatService.completions', () => {
             log,
             makeFakeStructuredLog(),
             makeFakeQuota(),
+            makeFakeAccess(),
         );
 
         // 40 chars of completion → ceil(40/4) = 10 completion tokens.
@@ -369,6 +384,7 @@ describe('ChatService.completions', () => {
             makeFakeLog(),
             makeFakeStructuredLog(),
             makeFakeQuota(),
+            makeFakeAccess(),
         );
 
         // Upstream yields the first chunk synchronously, then delays the
@@ -398,7 +414,7 @@ describe('ChatService.completions', () => {
     it('forwards stream_options.include_usage=true to the upstream on streamed requests', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         async function* fakeStream() {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
@@ -415,7 +431,7 @@ describe('ChatService.completions', () => {
     it('does not overwrite caller-provided stream_options', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         async function* fakeStream() {
             yield { id: 'c1', choices: [{ delta: { content: 'a' } }] };
@@ -436,7 +452,7 @@ describe('ChatService.completions', () => {
     it('does not set stream_options for non-streaming requests', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
         fake.create.mockResolvedValueOnce({ id: 'cmpl-1' });
 
         await service.completions(buildSampleBody() as any);
@@ -448,7 +464,7 @@ describe('ChatService.completions', () => {
     it('normalizes the body before calling the upstream (merges system messages)', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions({
@@ -476,7 +492,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody() as any);
@@ -489,7 +505,7 @@ describe('ChatService.completions', () => {
         const fake = makeFakeProvider();
         (fake.resolved.overrides as { maxTokens?: number }).maxTokens = 4096;
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
         fake.create.mockResolvedValueOnce({});
 
         await service.completions(buildSampleBody({ max_tokens: 99 }) as any);
@@ -504,7 +520,7 @@ describe('ChatService.completions', () => {
             route: jest.fn().mockRejectedValue(new Error('Unknown model "nope"')),
         } as unknown as RoutingService;
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(
             /Unknown model/,
@@ -528,7 +544,7 @@ describe('ChatService.completions', () => {
             }),
         } as unknown as RoutingService;
         const log = makeFakeLog();
-        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router, log, makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toBeInstanceOf(
             RoutingFailedError,
@@ -541,7 +557,7 @@ describe('ChatService.completions', () => {
     it('propagates upstream errors from the OpenAI client', async () => {
         const fake = makeFakeProvider();
         const router = makeFakeRouter(fake.resolved);
-        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota());
+        const service = new ChatService(fakeEnv, fake.provider, router.router, makeFakeLog(), makeFakeStructuredLog(), makeFakeQuota(), makeFakeAccess());
         fake.create.mockRejectedValueOnce(new Error('upstream boom'));
 
         await expect(service.completions(buildSampleBody() as any)).rejects.toThrow(

@@ -77,6 +77,9 @@ Swagger (`@nestjs/swagger`).
    `clientId`; `RateLimitGuard` aplica RPM/TPM del cliente. Scope `chat.write`
    requerido si el guard de scopes está activo en esa ruta.
 2. **`ChatService.completions`**:
+   - Verifica la **allowlist del cliente** para `body.model` (el alias
+     **pedido**), antes que cualquier otra decisión. Si no está permitido →
+     `AliasNotPermittedError` → `403` (ver §7).
    - Calcula `promptHash` (hash de messages + model).
    - Delega en `RoutingService.route(model, body, executor)`.
    - `executor` → `callUpstream`: normaliza body (`mergeSystemMessages`),
@@ -211,6 +214,44 @@ Knobs (defaults en `provider.model.ts`):
   **fail-open** (nunca bloquea tráfico legítimo). Los tests usan un fake en
   memoria con la misma interfaz.
 
+### Allowlist de aliases por cliente (`src/access/`)
+
+Qué aliases puede **usar y ver** cada cliente. Almacenamiento en
+`client_alias_access` (migración `0015`, una fila por par `cliente × alias`).
+
+- **Sin filas = ilimitado.** Un cliente sin filas tiene acceso a todos los
+  aliases del registry, igual que antes de que la feature existiera: es el estado
+  de todo cliente que nunca se configuró, y por eso no hace falta backfill. Desde
+  la primera fila el cliente queda **restringido** y el conjunto es
+  **exhaustivo**: un alias que no está en la lista está prohibido aunque "no haya
+  fila para él".
+- **Una sola interpretación.** `AliasAccessService.getAccess(clientId)` devuelve
+  una unión discriminada (`unrestricted` | `restricted` con el set) y
+  `isPermitted(access, alias)` es el único intérprete. El gate de la request y el
+  filtro de `/v1/models` leen **ambos** de ahí: no pueden discrepar sobre qué
+  significa una fila ausente (misma razón de ser que el cache-free del gate de
+  cuotas: revocar un alias aplica en la request siguiente).
+- **Se chequea el alias PEDIDO, nunca el servido.** El gate corre en
+  `ChatService.completions` **antes** de `QuotaService.resolveTarget` y con
+  `body.model`. Una degradación por cuota hacia un alias que no está en la
+  allowlist **sigue funcionando**: el desvío es una decisión del gateway (D1,
+  silenciosa), no del cliente, y no debe castigarlo con un `403` por una request
+  que tiene derecho a hacer. Hay un test de invariante explícito para esto.
+- **`/v1/models` filtra con la misma regla**, así que un alias prohibido no se
+  anuncia: si se anunciara, cada SDK ofrecería un modelo que responde `403`. Un
+  alias filtrado es indistinguible de uno inexistente.
+- **Presentación framework-free** (`alias-access-http.ts`, igual que
+  `quota-http.ts`): `403` + `permission_error` en ambos protocolos, con
+  `code: alias_not_permitted` y el alias en el body OpenAI. Sin `Retry-After`
+  (esperar no otorga un permiso) y con el mismo cuidado de `headersSent` que el
+  `429` en streaming: el status sólo se reclama si no se flusheó ningún byte.
+  El mensaje no enumera los aliases permitidos ni distingue "no está en tu
+  lista" de "no existe en el registry" — si no, el `403` sería un directorio del
+  fleet.
+- **Observabilidad:** la request denegada igual deja su fila `status='error'` en
+  `request_logs` (con `model_requested` = alias pedido), así que un `403` es
+  auditable sin abrir la tabla de permisos.
+
 ---
 
 ## 8. Persistencia (SQLite)
@@ -244,6 +285,7 @@ Tablas (migraciones `0001`–`0014`):
 | `request_logs` | `requested_at`, `client_key`, `model_requested`, `served_alias` (0014), `resolved_provider`, `resolved_model`, `attempts`, `latency_ms`, `status`, `error`, `prompt_hash`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `attempt_details` (+ índices en `0009`) |
 | `client_alias_quotas` | `client_id`, `alias_key`, `monthly_token_limit`, `divert_alias_key` — una fila = el alias está gateado (0014) |
 | `client_alias_usage` | `client_id`, `alias_key` (alias **servido**), `period_key` (`YYYY-MM` UTC), `tokens`, `requests` (0014) |
+| `client_alias_access` | `client_id`, `alias_key` — allowlist; **ninguna fila = ilimitado** (0015) |
 
 > Migraciones `0010` (attempt_details) y `0011` (disable_thinking) — ver
 > `migrations/0010_request_logs_attempts.sql` y `migrations/0011_model_disable_thinking.sql`.
@@ -264,6 +306,12 @@ tablas de cuotas y la columna `request_logs.served_alias`. Igual que
 `request_logs.client_key`, **no** hay foreign key a `clients`: la integridad se
 valida en la capa de aplicación y el historial de uso debe sobrevivir al borrado
 de un cliente.
+
+> Migración `0015` (`migrations/0015_client_alias_access.sql`): agrega
+`client_alias_access`, la allowlist por cliente. También sin foreign key, por la
+misma razón. `client_alias_access` y `client_alias_quotas` son **ortogonales**:
+una fila de cuota dice "este alias está gateado", una fila de access dice "este
+cliente puede usar este alias"; ninguna implica la otra.
 
 ### Cuotas mensuales de tokens por (cliente × alias)
 

@@ -175,6 +175,53 @@ nada. Detalle de endpoints: [`docs/API.md`](docs/API.md) → `POST /admin/quotas
 
 ---
 
+## Allowlist de aliases por cliente
+
+Además de la cuota, un cliente puede tener una **allowlist**: qué aliases puede
+usar y ver. La unidad es `(cliente × alias)`; **sin filas el cliente es
+ilimitado** (ve y usa todos los aliases, como antes de que existiera la feature).
+
+```bash
+KEY="sk-<key-con-scope-admin>"
+
+# Ver la allowlist de un cliente
+curl -s http://localhost:3000/admin/clients/tenant-acme/aliases \
+  -H "Authorization: Bearer $KEY"
+
+# Reemplazar la allowlist (el body ES el conjunto: lo que no está, se revoca)
+curl -s -X PUT http://localhost:3000/admin/clients/tenant-acme/aliases \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"aliases":["codex","slave"]}'
+
+# Borrar la allowlist: el cliente vuelve a ser ilimitado
+curl -s -X DELETE http://localhost:3000/admin/clients/tenant-acme/aliases \
+  -H "Authorization: Bearer $KEY"
+```
+
+**Qué observa el cliente cuando pide un alias que no está en su lista:**
+
+- En `/v1/chat/completions` (y `/v1/messages`): `403` con
+  `error.type: "permission_error"` y `code: "alias_not_permitted"`, **sin**
+  `Retry-After` (esperar no otorga el permiso; lo otorga el operador). En
+  streaming llega como frame SSE de error.
+- En `/v1/models`: el alias **no aparece**. Un alias prohibido es
+  indistinguible de uno que no existe — el listado no filtra información sobre
+  lo que el cliente no puede usar.
+
+Un `PUT` con la lista vacía se rechaza (`400`): como *sin filas = ilimitado*,
+aceptar `[]` daría acceso total justo cuando el operador quería lo contrario. Para
+limpiar, `DELETE`.
+
+**El chequeo usa el alias pedido, nunca el alias servido**, y corre antes del gate
+de cuotas. Consecuencia deliberada: si una request se **degrada por cuota** hacia
+un alias que no está en la allowlist, **sigue funcionando** — el desvío lo decide
+el gateway, no el cliente, y no se lo castiga con un `403`. El caso queda
+auditable en `request_logs` (`model_requested` vs `served_alias`).
+
+Detalle de endpoints: [`docs/API.md`](docs/API.md) → `/admin/clients/:id/aliases`.
+
+---
+
 ## Modificar la estrategia de balanceo
 
 La política de ruteo es **por alias** y se cambia en caliente vía API admin

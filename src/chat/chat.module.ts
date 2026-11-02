@@ -15,6 +15,7 @@ import { LlmLoggingService } from '../observability/llm-logging.service';
 import { RequestLogRepository } from '../database/repositories/request-log.repository';
 import { DatabaseService } from '../database/database.service';
 import { QuotaModule } from '../quota/quota.module';
+import { AliasAccessModule } from '../access/alias-access.module';
 
 /**
  * Feature module for the OpenAI-compatible /chat/completions proxy.
@@ -28,9 +29,13 @@ import { QuotaModule } from '../quota/quota.module';
  *
  * Quota: `QuotaModule` is imported so `ChatService` can inject `QuotaService`.
  * It exports the service and imports nothing from `chat`, so there is no cycle.
+ *
+ * Access: `AliasAccessModule` is imported the same way, so `ChatService` can
+ * enforce the per-client allowlist and `ModelsController` can filter `/v1/models`
+ * with the same rule. It imports nothing from `chat` either, so there is no cycle.
  */
 @Module({
-    imports: [QuotaModule],
+    imports: [QuotaModule, AliasAccessModule],
     controllers: [ChatController, ModelsController],
     providers: [
         ChatService,

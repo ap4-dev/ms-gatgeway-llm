@@ -12,6 +12,9 @@ import {
 import type { ChatMessage } from './chat.service';
 import { QuotaExhaustedError } from '../quota/quota.errors';
 import type { QuotaService } from '../quota/quota.service';
+import { AliasAccessService } from '../access/alias-access.service';
+import type { ClientAliasAccessRepository } from '../database/repositories/client-alias-access.repository';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
 import { RoutingFailedError } from '../routing/routing.service';
 
 describe('clampMaxTokens', () => {
@@ -383,6 +386,33 @@ function failingStream(): AsyncIterable<any> {
 const flushAsync = (): Promise<void> =>
     new Promise<void>((resolve) => setImmediate(resolve));
 
+/**
+ * The REAL `AliasAccessService` over a fake repository.
+ *
+ * Using the production class (instead of a hand-rolled stub) is deliberate: the
+ * "no rows means unrestricted" rule belongs to the service, so a spec that passes
+ * here cannot drift from what the request path actually reads. Only the SQLite
+ * lookup is faked.
+ *
+ * `permitted === undefined` means "the client has no rows at all", which is the
+ * unrestricted case every existing client is in.
+ */
+function makeAccess(permitted?: readonly string[]): {
+    service: AliasAccessService;
+    listByClient: jest.Mock;
+} {
+    const listByClient = jest.fn(() =>
+        (permitted ?? []).map((aliasKey) => ({ clientId: 'client-1', aliasKey })),
+    );
+    const repo = { listByClient } as unknown as ClientAliasAccessRepository;
+    return { service: new AliasAccessService(repo), listByClient };
+}
+
+/** Convenience for specs that are not about access at all. */
+function unrestrictedAccess(): AliasAccessService {
+    return makeAccess().service;
+}
+
 interface QuotaHarness {
     service: ChatService;
     route: jest.Mock;
@@ -434,6 +464,9 @@ function makeQuotaHarness(opts: {
         requestLog,
         structuredLog,
         quota,
+        // Unrestricted: this file tests the quota gate, so the allowlist must
+        // never be the reason a call stops. The guard has its own harness below.
+        unrestrictedAccess(),
     );
     return { service, route, resolveTarget, recordUsage, recordSuccess, recordFailure, structuredLog };
 }
@@ -870,5 +903,215 @@ describe('ChatService quota gate', () => {
         expect(event.servedAlias).toBe('codex');
         // Absent, never `null` — non-diverted events keep their old shape.
         expect('quotaDivertedFrom' in event).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Alias access guard (per-client allowlist enforcement)
+//
+// The guard decides whether the alias the CLIENT ASKED FOR may be used at all.
+// It runs before the quota gate and it never looks at the alias the gate ends up
+// routing to — see the invariant test at the end of this block, which is the
+// whole reason that ordering is load-bearing.
+// ---------------------------------------------------------------------------
+
+interface AccessHarness {
+    service: ChatService;
+    route: jest.Mock;
+    resolveTarget: jest.Mock;
+    recordUsage: jest.Mock;
+    recordFailure: jest.Mock;
+    listByClient: jest.Mock;
+}
+
+function makeAccessHarness(opts: {
+    permitted?: readonly string[];
+    result: CompletionResult;
+    resolveTarget?: (clientId: string | null, alias: string) => string;
+}): AccessHarness {
+    const access = makeAccess(opts.permitted);
+    const quota = makeQuotaHarness({ result: opts.result, resolveTarget: opts.resolveTarget });
+    const service = new ChatService(
+        {} as any,
+        { clientFor: jest.fn() } as any,
+        { route: quota.route } as any,
+        {
+            recordSuccess: quota.recordSuccess,
+            recordFailure: quota.recordFailure,
+            recordAttemptFailure: jest.fn(),
+        } as any,
+        quota.structuredLog as any,
+        { resolveTarget: quota.resolveTarget, recordUsage: quota.recordUsage } as unknown as QuotaService,
+        access.service,
+    );
+    return {
+        service,
+        route: quota.route,
+        resolveTarget: quota.resolveTarget,
+        recordUsage: quota.recordUsage,
+        recordFailure: quota.recordFailure,
+        listByClient: access.listByClient,
+    };
+}
+
+describe('ChatService alias access guard', () => {
+    beforeEach(() => {
+        jest.spyOn(Date, 'now').mockReturnValue(FIXED_NOW_MS);
+    });
+
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it('refuses an alias outside the client allowlist before anything is routed', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'slave', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).rejects.toBeInstanceOf(AliasNotPermittedError);
+
+        // Nothing reached the router and nothing was accounted.
+        expect(harness.route).not.toHaveBeenCalled();
+        expect(harness.recordUsage).not.toHaveBeenCalled();
+    });
+
+    it('runs BEFORE the quota gate, so a forbidden alias never resolves a target', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'slave', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).rejects.toBeInstanceOf(AliasNotPermittedError);
+
+        expect(harness.resolveTarget).not.toHaveBeenCalled();
+    });
+
+    it('still records a failure row for the refused request (audit trail)', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'slave', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).rejects.toBeInstanceOf(AliasNotPermittedError);
+
+        expect(harness.recordFailure).toHaveBeenCalledTimes(1);
+        expect(harness.recordFailure.mock.calls[0][0]).toMatchObject({
+            requestedModel: 'slave',
+            attempts: 0,
+        });
+    });
+
+    it('serves an alias that IS in the allowlist', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'codex', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).resolves.toBeDefined();
+
+        expect(harness.route.mock.calls[0][0]).toBe('codex');
+    });
+
+    it('leaves a client with NO rows unrestricted (every alias usable)', async () => {
+        const harness = makeAccessHarness({
+            permitted: undefined,
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'anything-goes', messages: QUOTA_MESSAGES } as any,
+                'client-1',
+            ),
+        ).resolves.toBeDefined();
+
+        expect(harness.listByClient).toHaveBeenCalledWith('client-1');
+        expect(harness.route.mock.calls[0][0]).toBe('anything-goes');
+    });
+
+    it('does not read the allowlist at all for anonymous traffic', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+        });
+
+        await expect(
+            harness.service.completions(
+                { model: 'slave', messages: QUOTA_MESSAGES } as any,
+                null,
+            ),
+        ).resolves.toBeDefined();
+
+        expect(harness.listByClient).not.toHaveBeenCalled();
+    });
+
+    /**
+     * THE INVARIANT. A quota diversion is silent by design (D1), so the client
+     * keeps its permission for the alias it asked for; the divert target is the
+     * gateway's own choice and is NOT re-checked against the allowlist. If this
+     * ever regresses, every exhausted-but-permitted client starts receiving 403
+     * for a request it is entitled to make.
+     */
+    it('serves a quota diversion into an alias OUTSIDE the allowlist', async () => {
+        const harness = makeAccessHarness({
+            // `codex` is permitted; `slave` deliberately is not.
+            permitted: ['codex'],
+            result: bufferedResult(),
+            resolveTarget: (_clientId, alias) => (alias === 'codex' ? 'slave' : alias),
+        });
+
+        const result = await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES } as any,
+            'client-1',
+        );
+
+        expect(result).toBeDefined();
+        // Routed to the divert alias, which is not in the allowlist…
+        expect(harness.route.mock.calls[0][0]).toBe('slave');
+        // …and charged to it, without any 403 in between.
+        expect(harness.recordUsage).toHaveBeenCalledWith(
+            'client-1',
+            'slave',
+            TOTAL_TOKENS,
+            REQUESTED_AT_MS,
+        );
+    });
+
+    it('checks the alias the client asked for, not the alias it was served by', async () => {
+        const harness = makeAccessHarness({
+            permitted: ['codex'],
+            result: bufferedResult(),
+            resolveTarget: (_clientId, alias) => (alias === 'codex' ? 'slave' : alias),
+        });
+
+        await harness.service.completions(
+            { model: 'codex', messages: QUOTA_MESSAGES } as any,
+            'client-1',
+        );
+
+        // One allowlist read for one request: the guard is not consulted again
+        // with the divert target.
+        expect(harness.listByClient).toHaveBeenCalledTimes(1);
     });
 });

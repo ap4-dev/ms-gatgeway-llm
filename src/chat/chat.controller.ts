@@ -21,6 +21,8 @@ import {
     openAiQuotaErrorBody,
     quotaRetryAfterSeconds,
 } from '../quota/quota-http';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
+import { openAiAliasForbiddenBody } from '../access/alias-access-http';
 
 @Controller('v1/chat')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -53,6 +55,8 @@ export class ChatController {
             } catch (err: any) {
                 if (err instanceof QuotaExhaustedError) {
                     this.writeQuotaErrorFrame(reply, err);
+                } else if (err instanceof AliasNotPermittedError) {
+                    this.writeAliasForbiddenFrame(reply, err);
                 } else {
                     reply.raw.write(`data: ${JSON.stringify({ error: { message: err?.message || 'upstream error' } })}\n\n`);
                     reply.raw.end();
@@ -71,6 +75,13 @@ export class ChatController {
                     .code(429)
                     .header('Retry-After', String(quotaRetryAfterSeconds(err)))
                     .send(openAiQuotaErrorBody(err));
+            }
+            if (err instanceof AliasNotPermittedError) {
+                // 403 with NO `Retry-After`: the refusal is not time-based, so the
+                // header would promise a recovery that waiting cannot deliver.
+                return reply
+                    .code(403)
+                    .send(openAiAliasForbiddenBody(err));
             }
             return reply.code(500).send({ error: { message: err?.message || 'upstream error' } });
         }
@@ -99,6 +110,30 @@ export class ChatController {
         }
         reply.raw.write(
             `data: ${JSON.stringify(openAiQuotaErrorBody(err))}\n\n`,
+        );
+        reply.raw.end();
+    }
+
+    /**
+     * Emit the allowlist 403 frame on an already-hijacked SSE response.
+     *
+     * Same `headersSent` discipline as {@link writeQuotaErrorFrame}, for the same
+     * reason: the status line is only honest while nothing has been flushed, and
+     * once the 200 is on the wire the frame is the only channel left.
+     *
+     * Kept as its own method — rather than parameterising the quota one — because
+     * the two errors differ in exactly the places that matter here: status
+     * (`403` vs `429`), headers (`Retry-After` belongs only to the quota) and body.
+     */
+    private writeAliasForbiddenFrame(
+        reply: FastifyReply,
+        err: AliasNotPermittedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 403;
+        }
+        reply.raw.write(
+            `data: ${JSON.stringify(openAiAliasForbiddenBody(err))}\n\n`,
         );
         reply.raw.end();
     }

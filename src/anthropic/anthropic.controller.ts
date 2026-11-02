@@ -21,6 +21,8 @@ import {
     anthropicQuotaErrorBody,
     quotaRetryAfterSeconds,
 } from '../quota/quota-http';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
+import { anthropicAliasForbiddenBody } from '../access/alias-access-http';
 
 @Controller('v1/messages')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -78,6 +80,8 @@ export class AnthropicController {
             } catch (err: any) {
                 if (err instanceof QuotaExhaustedError) {
                     this.writeQuotaErrorFrame(reply, err);
+                } else if (err instanceof AliasNotPermittedError) {
+                    this.writeAliasForbiddenFrame(reply, err);
                 } else {
                     reply.raw.write(`event: error\n`);
                     reply.raw.write(
@@ -104,6 +108,12 @@ export class AnthropicController {
                     .code(429)
                     .header('Retry-After', String(quotaRetryAfterSeconds(err)))
                     .send(anthropicQuotaErrorBody(err));
+            }
+            if (err instanceof AliasNotPermittedError) {
+                // 403 with NO `Retry-After`: waiting cannot grant a permission.
+                return reply
+                    .code(403)
+                    .send(anthropicAliasForbiddenBody(err));
             }
             return reply.code(500).send({
                 type: 'error',
@@ -139,6 +149,31 @@ export class AnthropicController {
         reply.raw.write(`event: error\n`);
         reply.raw.write(
             `data: ${JSON.stringify(anthropicQuotaErrorBody(err))}\n\n`,
+        );
+        reply.raw.end();
+    }
+
+    /**
+     * Emit the allowlist 403 frame on an already-hijacked Anthropic SSE response.
+     *
+     * Same `headersSent` discipline as {@link writeQuotaErrorFrame}: the status
+     * line is only honest while nothing has been flushed, and once the 200 is on
+     * the wire the frame is the only channel left to explain the refusal.
+     *
+     * Separate from the quota frame because the two differ in status (`403` vs
+     * `429`), headers (`Retry-After` is quota-only) and body (`permission_error`
+     * vs `rate_limit_error`).
+     */
+    private writeAliasForbiddenFrame(
+        reply: FastifyReply,
+        err: AliasNotPermittedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 403;
+        }
+        reply.raw.write(`event: error\n`);
+        reply.raw.write(
+            `data: ${JSON.stringify(anthropicAliasForbiddenBody(err))}\n\n`,
         );
         reply.raw.end();
     }

@@ -1,6 +1,7 @@
 import { AnthropicController } from './anthropic.controller';
 import type { AnthropicService } from './anthropic.service';
 import { QuotaExhaustedError } from '../quota/quota.errors';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
 
 const DEC_2026 = Date.UTC(2026, 11, 1);
 const SECONDS = 1000;
@@ -16,6 +17,10 @@ function quotaError(): QuotaExhaustedError {
         used: 20_500_000,
         resetsAt: DEC_2026 / SECONDS,
     });
+}
+
+function aliasForbiddenError(aliasKey = 'slave'): AliasNotPermittedError {
+    return new AliasNotPermittedError({ clientId: 'client-1', aliasKey });
 }
 
 /** Smallest body that satisfies `AnthropicMessagesSchema`. */
@@ -227,5 +232,106 @@ describe('AnthropicController quota mapping', () => {
             })}\n\n`,
         ]);
         expect(reply.raw.ended).toBe(true);
+    });
+});
+
+/**
+ * The allowlist 403 in Anthropic's vocabulary: `permission_error`, not the
+ * `rate_limit_error` the quota 429 uses. A client that cannot tell the two apart
+ * would retry a permission failure as if it were a temporary limit.
+ */
+describe('AnthropicController alias-forbidden mapping', () => {
+    beforeEach(() => {
+        jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    });
+
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it('maps AliasNotPermittedError to a 403 with the Anthropic permission_error body', async () => {
+        const messages = jest.fn(async () => {
+            throw aliasForbiddenError('slave');
+        });
+        const { controller } = makeController(messages);
+        const reply = makeReply();
+
+        await controller.messages(validBody(), makeRequest(), reply as any);
+
+        expect(reply.code).toHaveBeenCalledWith(403);
+        expect(reply.send).toHaveBeenCalledTimes(1);
+        expect(reply.sent).toEqual({
+            type: 'error',
+            error: {
+                type: 'permission_error',
+                message: expect.stringContaining('slave'),
+            },
+        });
+    });
+
+    it('never sets Retry-After on a 403', async () => {
+        const messages = jest.fn(async () => {
+            throw aliasForbiddenError();
+        });
+        const { controller } = makeController(messages);
+        const reply = makeReply();
+
+        await controller.messages(validBody(), makeRequest(), reply as any);
+
+        expect(reply.header).not.toHaveBeenCalled();
+    });
+
+    it('claims the 403 on a streamed forbidden alias while no byte is flushed', async () => {
+        const messages = jest.fn(async () => {
+            throw aliasForbiddenError('slave');
+        });
+        const { controller } = makeController(messages);
+        const reply = makeReply({ headersSent: false });
+
+        await controller.messages(validBody(true), makeRequest(), reply as any);
+
+        expect(reply.hijack).toHaveBeenCalledTimes(1);
+        expect(reply.raw.statusCode).toBe(403);
+        expect(reply.raw.headers['Retry-After']).toBeUndefined();
+        // Anthropic SSE frames are `event:` + `data:`; the 403 uses the error event.
+        expect(reply.raw.written[0]).toBe('event: error\n');
+        const payload = JSON.parse(
+            reply.raw.written[1].replace(/^data: /, '').trim(),
+        );
+        expect(payload.error.type).toBe('permission_error');
+        expect(reply.raw.ended).toBe(true);
+    });
+
+    it('writes the 403 frame but never rewrites status once bytes are gone', async () => {
+        const messages = jest.fn(async () => {
+            throw aliasForbiddenError('slave');
+        });
+        const { controller } = makeController(messages);
+        const reply = makeReply({ headersSent: true });
+
+        await controller.messages(validBody(true), makeRequest(), reply as any);
+
+        expect(reply.raw.statusCode).toBe(200);
+        expect(reply.raw.written[0]).toBe('event: error\n');
+        expect(reply.raw.ended).toBe(true);
+    });
+
+    it('keeps the quota 429 and the alias 403 apart', async () => {
+        const quota = makeController(async () => {
+            throw quotaError();
+        });
+        const quotaReply = makeReply();
+        await quota.controller.messages(validBody(), makeRequest(), quotaReply as any);
+
+        const forbidden = makeController(async () => {
+            throw aliasForbiddenError('codex');
+        });
+        const forbiddenReply = makeReply();
+        await forbidden.controller.messages(validBody(), makeRequest(), forbiddenReply as any);
+
+        expect(quotaReply.statusCode).toBe(429);
+        expect(forbiddenReply.statusCode).toBe(403);
+        expect((quotaReply.sent as any).error.type).toBe('rate_limit_error');
+        expect((forbiddenReply.sent as any).error.type).toBe('permission_error');
     });
 });

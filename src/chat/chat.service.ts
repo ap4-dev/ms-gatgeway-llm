@@ -17,6 +17,8 @@ import {
 } from '../observability/llm-logging.service';
 import { hashPrompt } from '../observability/prompt-hash.util';
 import { QuotaService } from '../quota/quota.service';
+import { AliasAccessService } from '../access/alias-access.service';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
 
 export type ChatMessage = {
     role: string;
@@ -56,6 +58,13 @@ export class ChatService {
          * actually serves a request and accounts its usage afterwards.
          */
         private readonly quota: QuotaService,
+        /**
+         * Per-client alias allowlist: decides whether the client may use the
+         * alias it ASKED for. Required, not optional — an enforcement point
+         * that silently degrades to "allow" when unwired is worse than no
+         * enforcement at all, so the dependency is DI-or-nothing.
+         */
+        private readonly access: AliasAccessService,
     ) {}
 
     /**
@@ -90,14 +99,24 @@ export class ChatService {
             | { servedAlias: string; divertedFrom: string | null }
             | undefined;
         try {
+            // Allowlist FIRST (feature: per-client alias allowlist). It checks
+            // `body.model` — the alias the client asked for — and never the
+            // target the quota gate picks afterwards: a diversion is the
+            // gateway's own choice, so a client permitted for `codex` must keep
+            // being served when the gate routes it to `slave`, even if `slave`
+            // is not in its allowlist. Placing it before `resolveTarget` also
+            // means a forbidden alias never even resolves a target (and never
+            // touches the quota usage tables).
+            this.assertAliasPermitted(clientId, body.model);
             // Monthly quota gate (feature plan §4). Deliberately the FIRST
-            // statement inside the `try`: a `QuotaExhaustedError` still has to
-            // leave a failure row in `request_logs` before it propagates. The
-            // prompt hash above keeps using `body.model` — the alias the client
-            // ASKED for is client intent and must survive a silent diversion.
-            // `body` itself is never mutated: `applyResolved` already overwrites
-            // `model` with the resolved upstream model, so the diversion only
-            // needs to reach `route()`'s first argument.
+            // statement that can throw a quota error inside the `try`: a
+            // `QuotaExhaustedError` still has to leave a failure row in
+            // `request_logs` before it propagates. The prompt hash above keeps
+            // using `body.model` — the alias the client ASKED for is client
+            // intent and must survive a silent diversion. `body` itself is never
+            // mutated: `applyResolved` already overwrites `model` with the
+            // resolved upstream model, so the diversion only needs to reach
+            // `route()`'s first argument.
             const target = this.quota.resolveTarget(clientId, body.model);
             // Computed once, here, because it is the same answer for every
             // accounting call site below: `null` means "served exactly what was
@@ -264,6 +283,38 @@ export class ChatService {
             );
             throw err;
         }
+    }
+
+    /**
+     * Enforce the per-client allowlist for the alias the client requested.
+     *
+     * `getAccess` is THE single interpretation of the stored rows (no rows ⇒
+     * unrestricted; at least one row ⇒ exhaustive set), so the request gate and
+     * the `/v1/models` filter can never disagree about what "no row" means.
+     * Cache-free, like the quota gate: revoking an alias applies on the very next
+     * request.
+     *
+     * The caller passes `body.model`, never the resolved target. A diversion is
+     * silent by design (D1), and re-checking the divert alias here would turn
+     * every exhausted-but-permitted client into a 403 for a request it is
+     * entitled to make.
+     */
+    private assertAliasPermitted(
+        clientId: string | null,
+        requestedAlias: string,
+    ): void {
+        const access = this.access.getAccess(clientId);
+        if (this.access.isPermitted(access, requestedAlias)) {
+            return;
+        }
+
+        // Unreachable for anonymous traffic: `getAccess(null)` is
+        // `unrestricted`, which permits everything. The error detail keeps
+        // `clientId` nullable for logs rather than branching on it twice.
+        throw new AliasNotPermittedError({
+            clientId,
+            aliasKey: requestedAlias,
+        });
     }
 
     /**

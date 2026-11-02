@@ -57,6 +57,8 @@ List the model aliases the gateway exposes.
 
 Only the alias `id` is ever returned. Real upstream model ids (`qwen3.6`, `deepseek-v4-flash`, etc.) are **never** exposed. Aliases are advertised only if their primary chain entry points to a provider with the API key env configured and the upstream model key exists.
 
+**Per-client allowlist**: the listing is also filtered by the caller's alias allowlist (the same rule `POST /v1/chat/completions` enforces). A client with **no allowlist rows** is *unrestricted* and sees every reachable alias, which is the state of every client that was never configured. A client **with** rows sees exactly those aliases, so an alias it may not call is never advertised — otherwise every SDK would offer a model that answers `403`. Filtered-out aliases are indistinguishable from aliases that do not exist. Allowed aliases that are unreachable remain hidden too: both rules apply.
+
 ---
 
 ### `POST /v1/chat/completions`
@@ -97,8 +99,17 @@ Passthrough: the schema is lenient — unknown fields are forwarded to the upstr
 |---|---|
 | `400` | Body failed zod validation |
 | `401` | Missing or invalid API key |
+| `403` | The alias is not in the caller's allowlist (`{"error":{"type":"permission_error","code":"alias_not_permitted","alias":"slave","message":"…"}}`). No `Retry-After`: waiting does not grant a permission. |
 | `429` | Rate limit exceeded; `Retry-After` header carries seconds |
 | `500` | Upstream or gateway error; `{"error": {"message": "..."}}` |
+
+The allowlist check applies to the alias the client **asked for** (`model`), never
+to the alias the request ends up being served by. A request diverted by the
+monthly quota keeps working even when the divert alias is not in the client's
+allowlist: the diversion is the gateway's own decision, so the client is not
+punished for it. `403` and `429 quota_exhausted` are deliberately different
+errors (`permission_error` vs `insufficient_quota` / `rate_limit_error`) because
+one is fixed by an operator and the other by waiting for the reset.
 
 ---
 
@@ -564,6 +575,68 @@ key.
 
 ---
 
+### `GET /admin/clients/:id/aliases`
+
+Read one client's alias allowlist — which aliases it may call and see.
+
+```json
+{
+  "clientId": "tenant-acme",
+  "mode": "restricted",
+  "aliases": ["codex", "slave"]
+}
+```
+
+| Field | Notes |
+|---|---|
+| `mode` | `unrestricted` \| `restricted`. |
+| `aliases` | Sorted alias keys. Empty when `mode` is `unrestricted`. |
+
+**`unrestricted` is the default state of every client that was never configured**:
+no rows means every alias in the registry is allowed, exactly as before this
+feature existed. From the first row on, the client is `restricted` and the list is
+**exhaustive** — an alias missing from it is forbidden, even though "there is no row
+for it". Both readings come from one accessor (`AliasAccessService.getAccess`), so
+`/v1/models` and `/v1/chat/completions` can never disagree about what a missing row
+means.
+
+`404` if the client id is unknown.
+
+---
+
+### `PUT /admin/clients/:id/aliases`
+
+Replace the whole allowlist of one client. This **is** a replace, unlike the quota
+endpoint: aliases missing from the body are removed, so revoking an alias needs no
+second call.
+
+```json
+{ "aliases": ["codex", "slave"] }
+```
+
+- Every alias must already exist in the alias registry.
+- An alias may appear only once.
+- An **empty array is rejected** (`400`): because no rows means *unrestricted*,
+  accepting `[]` would silently grant full access to an operator who meant the
+  opposite. Use `DELETE` to clear the allowlist.
+
+**Response**: the same envelope as `GET /admin/clients/:id/aliases`, after the write.
+`404` if the client id is unknown.
+
+---
+
+### `DELETE /admin/clients/:id/aliases`
+
+Clear the allowlist, returning the client to `unrestricted` (all aliases allowed
+again). Idempotent: clearing an already-clear client is a `200` no-op that returns
+`{"clientId":"…","mode":"unrestricted","aliases":[]}`. `404` if the client id is
+unknown.
+
+Changes are visible on the **very next request**: there is no cache, so a revoked
+alias stops working immediately and newly granted one starts working immediately.
+
+---
+
 ### `GET /admin/aliases`
 
 List all alias routing chains.
@@ -695,7 +768,7 @@ Query parameters (all optional, AND-combined):
 | `204` | Successful mutation with no body (POST /:id/revoke, PUT /admin/aliases/..., DELETE) |
 | `400` | Body or query failed validation (zod) — `{"error": {"message": "...", "issues": [...]}}` |
 | `401` | Missing / invalid API key, no client attached |
-| `403` | Client authenticated but missing required scope |
+| `403` | Client authenticated but missing required scope — or the requested alias is not in the caller's allowlist (`code: alias_not_permitted`, see `POST /v1/chat/completions`). OpenAI-compatible body: `{"error":{"message":"…","type":"permission_error","code":"alias_not_permitted","alias":"codex"}}`; Anthropic body: `{"type":"error","error":{"type":"permission_error","message":"…"}}`. No `Retry-After`. On streaming, the error is emitted as an SSE error frame and the HTTP status stays `200` if headers were already flushed. |
 | `404` | Resource id unknown |
 | `429` | Rate limit exceeded. `Retry-After: <seconds>` header set. `{"statusCode":429,"error":"Too Many Requests","message":"...","retryAfterMs":...}` |
 | `429` (`quota_exhausted`) | Monthly token quota for the requested alias exhausted **and** no `divertAliasKey` configured. `Retry-After: <seconds>` points at the 1st of the next UTC month (the only instant the counter resets). OpenAI-compatible body: `{"error":{"message":"…","type":"insufficient_quota","code":"quota_exhausted","alias":"codex","resets_at":<unix seconds>}}`; Anthropic body: `{"type":"error","error":{"type":"rate_limit_error","message":"…"}}`. On streaming, the error is emitted as an SSE `data: {"error":…}` frame and the HTTP status stays `200` if headers were already flushed. |
