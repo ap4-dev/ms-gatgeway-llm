@@ -17,12 +17,13 @@ import { AnthropicModule } from './anthropic/anthropic.module';
 import { HealthModule } from './health/health.module';
 import { AdminModule } from './admin/admin.module';
 import { CoreModule } from './config/core.module';
+import { QuotaModule } from './quota/quota.module';
 
 @Module({
     imports: [
         ConfigModule.forRoot({ isGlobal: true }), TerminusModule,
         SentryModule.forRoot(), CoreModule, RedisModule,
-        ChatModule, HealthModule, AdminModule, SearchModule, McpModule, ToolsModule, AnthropicModule,
+        ChatModule, HealthModule, AdminModule, SearchModule, McpModule, ToolsModule, AnthropicModule, QuotaModule,
     ],
     controllers: [AppController],
     providers: [

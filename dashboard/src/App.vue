@@ -12,6 +12,7 @@ const navItems = [
   { name: 'models', label: 'Model catalog' },
   { name: 'aliases', label: 'Aliases' },
   { name: 'clients', label: 'Clients' },
+  { name: 'quotas', label: 'Client access' },
   { name: 'logs', label: 'Logs' },
 ] as const;
 

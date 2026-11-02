@@ -59,6 +59,17 @@ interface LogItemView {
     requestedAt: number;
     /** The alias the client sent (e.g. `code`, `coder`). */
     modelRequested: string;
+    /**
+     * The alias that was ACTUALLY routed for this request.
+     *
+     * Equal to `modelRequested` on a normal request, `null` for rows written
+     * before migration `0014`, and different from `modelRequested` exactly when
+     * a monthly quota was exhausted and the request was diverted (the silent
+     * degradation of D1). `resolvedModel` cannot prove a diversion on its own:
+     * an alias's OWN fallback chain can reach the same upstream model as the
+     * divert target's primary.
+     */
+    servedAlias: string | null;
     /** The upstream provider that handled the request (admin-only). */
     resolvedProvider: string | null;
     /** The upstream model id that handled the request (admin-only). */
@@ -105,6 +116,15 @@ interface ListLogsResponse {
  * admin endpoints are privileged (require `admin` scope), so operators
  * can see which upstream actually served each request. The public
  * surface (`/v1/models`, `/v1/metrics/summary`) stays alias-only.
+ *
+ * It also exposes `servedAlias`, the alias the request was actually routed
+ * to. `modelRequested` is what the client ASKED for and `servedAlias` is what
+ * the gate CHOSE; `servedAlias !== modelRequested` means the request was
+ * diverted because the client's monthly token quota for the requested alias
+ * was exhausted (silent degradation — no header, no body change). Note that
+ * `resolvedModel` alone cannot prove a diversion: an alias's own fallback
+ * chain can produce the same upstream model as the divert target's primary,
+ * so only the alias pair is evidence.
  *
  * Auth: `admin` scope required. Rate-limit per `RateLimitGuard`,
  * which already enforces per-client RPM.
@@ -176,6 +196,7 @@ export class AdminLogsController {
                     {
                         requestedAt: 1783353000,
                         modelRequested: 'code',
+                        servedAlias: 'code',
                         resolvedProvider: 'nan',
                         resolvedModel: 'qwen3-coder',
                         attempts: 1,
@@ -250,6 +271,7 @@ function toView(r: RequestLogRow): LogItemView {
     return {
         requestedAt: r.requestedAt,
         modelRequested: r.modelRequested,
+        servedAlias: r.servedAlias ?? null,
         resolvedProvider: r.resolvedProvider ?? null,
         resolvedModel: r.resolvedModel ?? null,
         attempts: r.attempts,

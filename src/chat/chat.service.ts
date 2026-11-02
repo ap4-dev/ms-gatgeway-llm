@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import type {
     ChatCompletion,
     ChatCompletionChunk,
@@ -16,6 +16,9 @@ import {
     type RequestLogEvent,
 } from '../observability/llm-logging.service';
 import { hashPrompt } from '../observability/prompt-hash.util';
+import { QuotaService } from '../quota/quota.service';
+import { AliasAccessService } from '../access/alias-access.service';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
 
 export type ChatMessage = {
     role: string;
@@ -42,12 +45,26 @@ export type CompletionResult =
  */
 @Injectable()
 export class ChatService {
+    private readonly logger = new Logger(ChatService.name);
+
     constructor(
         @Inject(ENV_CONFIG) private readonly env: Env,
         private readonly providers: ProviderService,
         private readonly router: RoutingService,
         private readonly requestLog: RequestLogService,
         private readonly structuredLog: LlmLoggingService,
+        /**
+         * Monthly quota gate for frontier aliases: resolves the alias that
+         * actually serves a request and accounts its usage afterwards.
+         */
+        private readonly quota: QuotaService,
+        /**
+         * Per-client alias allowlist: decides whether the client may use the
+         * alias it ASKED for. Required, not optional — an enforcement point
+         * that silently degrades to "allow" when unwired is worse than no
+         * enforcement at all, so the dependency is DI-or-nothing.
+         */
+        private readonly access: AliasAccessService,
     ) {}
 
     /**
@@ -72,8 +89,42 @@ export class ChatService {
             (body.messages ?? []) as any,
             body.model,
         );
+        // Declared OUTSIDE the `try` so the FAILURE path can attribute the alias
+        // that was routed too: a diverted request that then fails is still a
+        // diverted request, and without this its failure row would read as if the
+        // client had asked for `slave`. Left undefined when the gate itself
+        // throws (`QuotaExhaustedError`): nothing was served, so there is no
+        // served alias to record.
+        let quotaOutcome:
+            | { servedAlias: string; divertedFrom: string | null }
+            | undefined;
         try {
-            const r = await this.router.route(body.model, body, (resolved, signal) =>
+            // Allowlist FIRST (feature: per-client alias allowlist). It checks
+            // `body.model` — the alias the client asked for — and never the
+            // target the quota gate picks afterwards: a diversion is the
+            // gateway's own choice, so a client permitted for `codex` must keep
+            // being served when the gate routes it to `slave`, even if `slave`
+            // is not in its allowlist. Placing it before `resolveTarget` also
+            // means a forbidden alias never even resolves a target (and never
+            // touches the quota usage tables).
+            this.assertAliasPermitted(clientId, body.model);
+            // Monthly quota gate (feature plan §4). Deliberately the FIRST
+            // statement that can throw a quota error inside the `try`: a
+            // `QuotaExhaustedError` still has to leave a failure row in
+            // `request_logs` before it propagates. The prompt hash above keeps
+            // using `body.model` — the alias the client ASKED for is client
+            // intent and must survive a silent diversion. `body` itself is never
+            // mutated: `applyResolved` already overwrites `model` with the
+            // resolved upstream model, so the diversion only needs to reach
+            // `route()`'s first argument.
+            const target = this.quota.resolveTarget(clientId, body.model);
+            // Computed once, here, because it is the same answer for every
+            // accounting call site below: `null` means "served exactly what was
+            // asked for", a value means a silent quota diversion. Without it
+            // `request_logs` cannot tell a downgraded request from a normal one.
+            const divertedFrom = target === body.model ? null : body.model;
+            quotaOutcome = { servedAlias: target, divertedFrom };
+            const r = await this.router.route(target, body, (resolved, signal) =>
                 this.callUpstream(resolved, body, signal),
             );
             const resolvedModel = r.attempts.at(-1)?.upstreamModel ?? 'unknown';
@@ -103,6 +154,13 @@ export class ChatService {
                     promptHash,
                     clientId,
                     tokens,
+                    quotaOutcome,
+                );
+                this.accountUsage(
+                    clientId,
+                    target,
+                    tokens?.totalTokens,
+                    requestedAt * 1000,
                 );
                 return r.result;
             }
@@ -114,50 +172,194 @@ export class ChatService {
             // finishes iterating. Latency is measured end-to-end — from
             // requestedAt to the last byte the client received.
             const messagesForEstimation = (body.messages ?? []) as unknown[];
+            // Set the instant BOTH halves of the accounting have run. The tail
+            // below reads it to decide whether the quota counter still has to
+            // move; see R3-001 there.
+            let accounted = false;
             const { stream, logged } = teeStream(r.result);
+            // Two-argument `then`, NOT `then(...).catch(...)`: a single-argument
+            // chain also routes an exception thrown by OUR success handler into
+            // the rejected-stream handler, which would write a SECOND
+            // `request_logs` row and account the same request twice — the exact
+            // table reconciliation later trusts. The trailing `catch` therefore
+            // only ever sees a failure of our own post-processing.
             logged
-                .then((chunks) => {
-                    const tokens = extractStreamTokens(
-                        chunks,
-                        messagesForEstimation,
-                    );
-                    this.recordSuccess(
-                        requestedAt,
-                        body.model,
-                        r.providerId,
-                        resolvedModel,
-                        r.attempts.length,
-                        promptHash,
-                        clientId,
-                        tokens,
-                    );
-                })
-                .catch(() => {
-                    // Stream aborted mid-flight or threw before completing.
-                    // Log a best-effort partial row — `extractStreamTokens`
-                    // will fall back to the local estimator on whatever the
-                    // tap captured.
-                    this.recordSuccess(
-                        requestedAt,
-                        body.model,
-                        r.providerId,
-                        resolvedModel,
-                        r.attempts.length,
-                        promptHash,
-                        clientId,
-                        undefined,
+                .then(
+                    (chunks) => {
+                        const tokens = extractStreamTokens(
+                            chunks,
+                            messagesForEstimation,
+                        );
+                        this.recordSuccess(
+                            requestedAt,
+                            body.model,
+                            r.providerId,
+                            resolvedModel,
+                            r.attempts.length,
+                            promptHash,
+                            clientId,
+                            tokens,
+                            quotaOutcome,
+                        );
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            tokens?.totalTokens,
+                            requestedAt * 1000,
+                        );
+                        accounted = true;
+                    },
+                    () => {
+                        // Stream aborted mid-flight or threw before completing.
+                        // Log a best-effort partial row — `extractStreamTokens`
+                        // will fall back to the local estimator on whatever the
+                        // tap captured.
+                        this.recordSuccess(
+                            requestedAt,
+                            body.model,
+                            r.providerId,
+                            resolvedModel,
+                            r.attempts.length,
+                            promptHash,
+                            clientId,
+                            undefined,
+                            quotaOutcome,
+                        );
+                        // The request DID consume upstream prompt tokens even though
+                        // the stream died, and the tap lost its chunk buffer with the
+                        // rejection — so this is a PROMPT-ONLY estimate, produced by
+                        // the same local estimator the stream fallback uses
+                        // (`estimateTokens`), applied to an empty chunk list. Never
+                        // lose the spend (feature plan §5, risk R3).
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            estimateTokens([], messagesForEstimation)
+                                .promptTokens,
+                            requestedAt * 1000,
+                        );
+                        accounted = true;
+                    },
+                )
+                // Reachable ONLY when our own handler above threw: the derived
+                // promise rejected. Node 15+ terminates the process on an
+                // unhandled rejection, so this tail is mandatory, not defensive
+                // noise. A throw out of `recordSuccess` happens BEFORE the
+                // `accountUsage` call that follows it, so neither half ran: the
+                // log row is lost, and the quota counter still has to move or
+                // that spend becomes unrecoverable (reconciliation can only
+                // repair under-counting when a row exists). `accountUsage`
+                // swallows its own failures, so this fallback cannot re-enter
+                // the tail. `accounted` — never call ordering — is what keeps a
+                // request that already accounted from being charged twice.
+                .catch((err) => {
+                    if (!accounted) {
+                        this.accountUsage(
+                            clientId,
+                            target,
+                            estimateTokens([], messagesForEstimation)
+                                .promptTokens,
+                            requestedAt * 1000,
+                        );
+                    }
+                    this.logger.warn(
+                        `stream post-processing failed: ${
+                            err instanceof Error ? err.message : String(err)
+                        }`,
                     );
                 });
             return stream;
         } catch (err) {
-            this.recordFailure(err, body, requestedAt, promptHash, clientId);
+            // Same outcome object as the success path, so a diverted-then-failed
+            // request still records `served_alias` alongside the alias the client
+            // asked for (`model_requested` stays `body.model`).
+            this.recordFailure(
+                err,
+                body,
+                requestedAt,
+                promptHash,
+                clientId,
+                quotaOutcome,
+            );
             throw err;
+        }
+    }
+
+    /**
+     * Enforce the per-client allowlist for the alias the client requested.
+     *
+     * `getAccess` is THE single interpretation of the stored rows (no rows ⇒
+     * unrestricted; at least one row ⇒ exhaustive set), so the request gate and
+     * the `/v1/models` filter can never disagree about what "no row" means.
+     * Cache-free, like the quota gate: revoking an alias applies on the very next
+     * request.
+     *
+     * The caller passes `body.model`, never the resolved target. A diversion is
+     * silent by design (D1), and re-checking the divert alias here would turn
+     * every exhausted-but-permitted client into a 403 for a request it is
+     * entitled to make.
+     */
+    private assertAliasPermitted(
+        clientId: string | null,
+        requestedAlias: string,
+    ): void {
+        const access = this.access.getAccess(clientId);
+        if (this.access.isPermitted(access, requestedAlias)) {
+            return;
+        }
+
+        // Unreachable for anonymous traffic: `getAccess(null)` is
+        // `unrestricted`, which permits everything. The error detail keeps
+        // `clientId` nullable for logs rather than branching on it twice.
+        throw new AliasNotPermittedError({
+            clientId,
+            aliasKey: requestedAlias,
+        });
+    }
+
+    /**
+     * Account one completed request against the alias that actually served it.
+     *
+     * `requestedAtMs` is the instant the request STARTED (unix ms) so the gate
+     * and the accounting always resolve the same UTC month, even for a request
+     * that crosses a month boundary in flight (review finding R3-001).
+     *
+     * Wrapped in `try/catch` on purpose: accounting runs AFTER the response has
+     * been produced, so a DB failure must never turn a successful request into
+     * an error. Under-counting is repaired later by reconciliation (T6); a
+     * broken response is not recoverable. `tokens ?? 0` keeps the request
+     * counted when the upstream surfaced no `usage` at all.
+     */
+    private accountUsage(
+        clientId: string | null,
+        servedAlias: string,
+        tokens: number | undefined,
+        requestedAtMs: number,
+    ): void {
+        try {
+            this.quota.recordUsage(
+                clientId,
+                servedAlias,
+                tokens ?? 0,
+                requestedAtMs,
+            );
+        } catch (err) {
+            this.logger.warn(
+                `quota accounting failed for client ${clientId ?? 'anonymous'} on alias ${servedAlias}: ${
+                    err instanceof Error ? err.message : String(err)
+                }`,
+            );
         }
     }
 
     /** Build the success-log row + structured event from captured token
      *  data. Shared between the sync (non-streaming) and async (streaming)
-     *  paths so the columns and the JSON shape stay aligned. */
+     *  paths so the columns and the JSON shape stay aligned.
+     *
+     *  `quota` is a single TRAILING argument on purpose: the positional
+     *  signature is historical and every existing call site keeps reading the
+     *  same way. It carries the alias actually routed plus, when a silent
+     *  diversion happened, the alias the client asked for. */
     private recordSuccess(
         requestedAt: number,
         requestedModel: string,
@@ -167,12 +369,14 @@ export class ChatService {
         promptHash: string,
         clientId: string | null,
         tokens: ReturnType<typeof extractTokens>,
+        quota?: { servedAlias: string; divertedFrom: string | null },
     ): void {
         const latencyMs = nowSeconds() - requestedAt;
         const body = { model: requestedModel } as ChatCompletionCreateParams;
         this.requestLog.recordSuccess({
             requestedAt,
             requestedModel,
+            servedAlias: quota?.servedAlias,
             resolvedProvider: providerId,
             resolvedModel,
             attempts,
@@ -193,16 +397,33 @@ export class ChatService {
                 status: 'ok',
                 tokens,
                 clientKey: clientId,
+                servedAlias: quota?.servedAlias,
+                // Spread only on an actual diversion: a non-diverted row must
+                // not gain the field, not even as `null`.
+                ...(quota?.divertedFrom
+                    ? { quotaDivertedFrom: quota.divertedFrom }
+                    : {}),
             }),
         );
     }
 
+    /** Build the failure-log row + structured event.
+     *
+     *  `quota` is the same trailing optional object the success path takes, for
+     *  the same reason: the divert decision happens BEFORE the attempt, so a
+     *  request that was silently downgraded and then failed must still be
+     *  attributable to the alias that actually served it. It is absent entirely
+     *  when the gate threw before routing (`QuotaExhaustedError`) — nothing was
+     *  served, so there is nothing to attribute. `quotaDivertedFrom` keeps the
+     *  same absent-not-null rule as the success path: the field only appears on
+     *  real diversions, never as `null`. */
     private recordFailure(
         err: unknown,
         body: ChatCompletionCreateParams,
         requestedAt: number,
         promptHash: string,
         clientId: string | null,
+        quota?: { servedAlias: string; divertedFrom: string | null },
     ): void {
         const argsBase = {
             requestedAt,
@@ -218,6 +439,7 @@ export class ChatService {
             this.requestLog.recordFailure({
                 ...argsBase,
                 requestedModel: err.requestedModel,
+                servedAlias: quota?.servedAlias,
                 attempts: err.attempts.length,
                 error: err,
                 attemptDetails: details,
@@ -250,6 +472,10 @@ export class ChatService {
                     tokens: undefined,
                     errorMessage,
                     attemptDetails: details,
+                    servedAlias: quota?.servedAlias,
+                    ...(quota?.divertedFrom
+                        ? { quotaDivertedFrom: quota.divertedFrom }
+                        : {}),
                 }),
             );
             return;
@@ -257,6 +483,7 @@ export class ChatService {
         this.requestLog.recordFailure({
             ...argsBase,
             requestedModel: body.model,
+            servedAlias: quota?.servedAlias,
             attempts: 0,
             error: err,
             requestParams,
@@ -272,6 +499,10 @@ export class ChatService {
                 tokens: undefined,
                 errorMessage:
                     err instanceof Error ? err.message : String(err),
+                servedAlias: quota?.servedAlias,
+                ...(quota?.divertedFrom
+                    ? { quotaDivertedFrom: quota.divertedFrom }
+                    : {}),
             }),
         );
     }
@@ -730,6 +961,10 @@ interface BuildEventArgs {
     errorMessage?: string;
     attemptDetails?: string | null;
     clientKey: string | null;
+    /** Alias actually routed; only the success path knows it today. */
+    servedAlias?: string;
+    /** Set only when a quota diversion served the request. */
+    quotaDivertedFrom?: string;
 }
 
 function buildEvent(a: BuildEventArgs): RequestLogEvent {
@@ -737,6 +972,10 @@ function buildEvent(a: BuildEventArgs): RequestLogEvent {
         event: 'chat.request',
         ts: a.requestedAt,
         model: a.body.model,
+        ...(a.servedAlias ? { servedAlias: a.servedAlias } : {}),
+        ...(a.quotaDivertedFrom
+            ? { quotaDivertedFrom: a.quotaDivertedFrom }
+            : {}),
         resolvedProvider: a.resolvedProvider,
         resolvedModel: a.resolvedModel,
         promptHash: a.promptHash,

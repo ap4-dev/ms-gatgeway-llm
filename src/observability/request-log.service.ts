@@ -8,6 +8,11 @@ import {
 export interface RecordSuccessArgs {
     requestedAt: number;
     requestedModel: string;
+    /**
+     * The alias actually routed (migration 0014). Differs from
+     * `requestedModel` exactly when a quota diversion served the request.
+     */
+    servedAlias?: string | null;
     resolvedProvider: string;
     /** Nullable since Phase-search: chat always resolves a model, search does not. */
     resolvedModel?: string | null;
@@ -23,6 +28,12 @@ export interface RecordSuccessArgs {
 export interface RecordFailureArgs {
     requestedAt: number;
     requestedModel: string;
+    /**
+     * The alias actually routed (migration 0014). A failed request can be
+     * diverted too — the divert decision happens before the attempt — so the
+     * failure row carries it as well.
+     */
+    servedAlias?: string | null;
     attempts: number;
     latencyMs: number;
     error?: unknown;
@@ -64,6 +75,7 @@ export class RequestLogService {
         const row: RequestLogRow = {
             requestedAt: args.requestedAt,
             modelRequested: args.requestedModel,
+            servedAlias: args.servedAlias ?? null,
             resolvedProvider: args.resolvedProvider,
             resolvedModel: args.resolvedModel ?? null,
             attempts: args.attempts,
@@ -89,6 +101,7 @@ export class RequestLogService {
         const row: RequestLogRow = {
             requestedAt: args.requestedAt,
             modelRequested: args.requestedModel,
+            servedAlias: args.servedAlias ?? null,
             resolvedProvider: args.resolvedProvider ?? null,
             resolvedModel: args.resolvedModel ?? null,
             attempts: args.attempts,

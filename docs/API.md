@@ -57,6 +57,8 @@ List the model aliases the gateway exposes.
 
 Only the alias `id` is ever returned. Real upstream model ids (`qwen3.6`, `deepseek-v4-flash`, etc.) are **never** exposed. Aliases are advertised only if their primary chain entry points to a provider with the API key env configured and the upstream model key exists.
 
+**Per-client allowlist**: the listing is also filtered by the caller's alias allowlist (the same rule `POST /v1/chat/completions` enforces). A client with **no allowlist rows** is *unrestricted* and sees every reachable alias, which is the state of every client that was never configured. A client **with** rows sees exactly those aliases, so an alias it may not call is never advertised — otherwise every SDK would offer a model that answers `403`. Filtered-out aliases are indistinguishable from aliases that do not exist. Allowed aliases that are unreachable remain hidden too: both rules apply.
+
 ---
 
 ### `POST /v1/chat/completions`
@@ -97,8 +99,17 @@ Passthrough: the schema is lenient — unknown fields are forwarded to the upstr
 |---|---|
 | `400` | Body failed zod validation |
 | `401` | Missing or invalid API key |
+| `403` | The alias is not in the caller's allowlist (`{"error":{"type":"permission_error","code":"alias_not_permitted","alias":"slave","message":"…"}}`). No `Retry-After`: waiting does not grant a permission. |
 | `429` | Rate limit exceeded; `Retry-After` header carries seconds |
 | `500` | Upstream or gateway error; `{"error": {"message": "..."}}` |
+
+The allowlist check applies to the alias the client **asked for** (`model`), never
+to the alias the request ends up being served by. A request diverted by the
+monthly quota keeps working even when the divert alias is not in the client's
+allowlist: the diversion is the gateway's own decision, so the client is not
+punished for it. `403` and `429 quota_exhausted` are deliberately different
+errors (`permission_error` vs `insufficient_quota` / `rate_limit_error`) because
+one is fixed by an operator and the other by waiting for the reset.
 
 ---
 
@@ -237,6 +248,62 @@ Aggregation is by alias only (`model_requested`). When a single alias routes to 
 
 ---
 
+### `GET /v1/quota`
+
+The caller's own monthly token balance per alias, for the UTC calendar month in progress.
+
+**Auth: valid API key + rate limit only — no scope guard.** `ApiKeyAuthGuard`
+plus `RateLimitGuard` protect it exactly like `/v1/chat/completions`; there is no
+`chat.read` gate on this route. That is intentional: the API key IS the
+authorization, and the endpoint can only ever read the balance of the key's own
+client — the client id is taken from the authenticated request and is never
+taken from a path or query parameter, so one client cannot read another's
+balance.
+
+No query parameters. Response:
+
+```json
+{
+  "clientId": "tenant-acme",
+  "periodKey": "2026-11",
+  "resetsAt": 1798761600,
+  "retryAfterSeconds": 1411200,
+  "quotas": [
+    {
+      "aliasKey": "codex",
+      "monthlyTokenLimit": 20000000,
+      "divertAliasKey": "slave",
+      "periodKey": "2026-11",
+      "tokens": 12345678,
+      "requests": 812,
+      "remaining": 7654322,
+      "exhausted": false,
+      "resetsAt": 1798761600,
+      "retryAfterSeconds": 1411200
+    }
+  ]
+}
+```
+
+| Field | Notes |
+|---|---|
+| `periodKey` | UTC calendar month (`YYYY-MM`). There is no reset job: a new month is simply a new key. |
+| `tokens` / `requests` | Usage accounted for the alias **actually served** in this period. Tokens are the sum of `total_tokens`; requests is the row count. |
+| `remaining` | `monthlyTokenLimit - tokens`, clamped at `0`. Post-paid accounting accepts overshoot, so it can go negative internally. |
+| `exhausted` | Strict `tokens >= monthlyTokenLimit` — the same rule the request gate applies, so a client at exactly the limit no longer gets the alias. |
+| `resetsAt` | Unix **seconds** of the next UTC month start, identical to the `429` body. |
+| `retryAfterSeconds` | Seconds until `resetsAt`, identical to the `Retry-After` header of a `429`. |
+
+- `quotas` is `[]` when the caller has no quota assigned: **no row means unlimited**, and nothing is gated.
+- Read-only and cache-free, so an admin limit change is visible on the very next call and on the very next request.
+- `401` if the request carries no authenticated client. `429` only for the per-client rate limit.
+
+Exhausting an alias does **not** necessarily fail the request: if `divertAliasKey`
+is set, the gateway silently routes to that alias instead (see `PUT
+/admin/clients/:id/quotas`).
+
+---
+
 ## Admin surface (`/admin/...`)
 
 Every admin endpoint requires:
@@ -362,6 +429,214 @@ Hard-delete a client row. `204` on success (idempotent — `204` also if id unkn
 
 ---
 
+### `GET /admin/clients/:id/quotas`
+
+List the monthly token quotas of one client, each joined with the usage of the UTC
+month in progress. Same envelope as `GET /v1/quota`, for any client.
+
+```json
+{
+  "clientId": "tenant-acme",
+  "periodKey": "2026-11",
+  "resetsAt": 1798761600,
+  "retryAfterSeconds": 1411200,
+  "quotas": [
+    {
+      "aliasKey": "codex",
+      "monthlyTokenLimit": 20000000,
+      "divertAliasKey": "slave",
+      "periodKey": "2026-11",
+      "tokens": 12345678,
+      "requests": 812,
+      "remaining": 7654322,
+      "exhausted": false,
+      "resetsAt": 1798761600,
+      "retryAfterSeconds": 1411200
+    }
+  ]
+}
+```
+
+Field semantics are identical to `GET /v1/quota`. `404` if the client id is unknown.
+
+---
+
+### `PUT /admin/clients/:id/quotas`
+
+Upsert one or more `(client, alias)` allowances. **Idempotent.**
+
+```json
+{
+  "quotas": [
+    { "aliasKey": "codex", "monthlyTokenLimit": 20000000, "divertAliasKey": "slave" },
+    { "aliasKey": "atlas", "monthlyTokenLimit": 5000000, "divertAliasKey": null }
+  ]
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `quotas` | yes | Array of **upserts**: every listed entry is written (inserted or updated), and quotas **not** present in the list are left untouched. Removing an allowance is `DELETE`, not omission. |
+| `quotas[].aliasKey` | yes | Must already exist in the alias registry — aliases are **not** created here. |
+| `quotas[].monthlyTokenLimit` | yes | Integer `> 0` (numeric string accepted). |
+| `quotas[].divertAliasKey` | no | Alias served once the limit is reached. Must exist in the registry and must differ from `aliasKey`. Omit or send `null` to make an exhausted alias answer `429` instead of degrading. |
+
+**Semantics that matter for operators:**
+
+- The list is a set of **upserts**, not a replace: entries not included in the request keep their stored value. Removing an allowance is `DELETE`, not omission.
+- Every entry is written before the response is built, and the whole set is re-described afterwards, so the response already reflects the new limits (and their current usage).
+- A raised limit applies on the **next request**, in both directions (raise and lower). No cache, no invalidation, no waiting for a reset.
+- `divertAliasKey` pointing at an alias that also has a quota row is legal, but that row's own gate is **not** re-applied: there is no recursion, so the divert target simply takes its normal routing chain.
+
+**Response**: the same envelope as `GET /admin/clients/:id/quotas`, after the writes.
+
+**Errors**:
+
+| Status | When |
+|---|---|
+| `400` | Body failed zod (`quotas` missing, empty `aliasKey`, non-positive/fractional `monthlyTokenLimit`), an alias is not in the registry, `divertAliasKey` equals `aliasKey`, or `divertAliasKey` is not in the registry. |
+| `404` | Client id unknown. Nothing is written. |
+
+---
+
+### `DELETE /admin/clients/:id/quotas/:aliasKey`
+
+Remove one allowance. The pair becomes **unlimited** again: no usage read, no
+usage write, zero extra cost per request.
+
+```json
+{ "deleted": true, "clientId": "tenant-acme", "aliasKey": "codex" }
+```
+
+`404` if the client id is unknown **or** if there was no quota row for that alias
+— so a typo is visible instead of silently succeeding. Usage already recorded for
+that pair is left untouched.
+
+---
+
+### `POST /admin/quotas/reconcile`
+
+Recompute `client_alias_usage` for one UTC month from `request_logs`, which is the
+durable record of what was actually served. This is the repair path for a
+counter that lost a write.
+
+Query parameters (both optional):
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `periodKey` | `YYYY-MM` | month in progress (UTC) | Bad value → `400`. |
+| `dryRun` | boolean (`true`/`false`/`1`/`0`) | **`true`** | `true` reports drift without writing; `false` repairs it. A destructive recompute is never the accidental default. |
+
+`?dryRun=false` must be spelled out: `?dryRun=false` is a write, and any value
+that is not a boolean literal (`?dryRun=yes`, `?dryRun=`) is a `400`.
+
+**Rules the recomputation follows:**
+
+- Who pays is decided by `served_alias` (`COALESCE(served_alias, model_requested)` for rows written before migration `0014`). A request diverted from `codex` to `slave` is charged to **`slave`**, never to the exhausted alias it was diverted from.
+- Only `(client, alias)` pairs that **own a quota row** are reconciled — exactly the rule the live accounting applies (`QuotaService.recordUsage` returns early when the alias has no quota). Traffic for an ungated alias such as `slave` therefore never creates a usage row.
+- Only `request_logs` rows with a non-NULL `client_key` and `requested_at` inside the half-open UTC month window `[start, next start)` are attributed.
+- Writes are absolute values (`tokens`, `requests`, `updated_at`), never deltas, so running reconcile twice is a **no-op**: the second pass reports zero drift.
+
+**Response**:
+
+```json
+{
+  "periodKey": "2026-11",
+  "dryRun": true,
+  "rowsScanned": 4120,
+  "pairsConsidered": 3,
+  "drift": [
+    {
+      "clientId": "tenant-acme",
+      "aliasKey": "codex",
+      "storedTokens": 19999000,
+      "computedTokens": 20000150,
+      "storedRequests": 120,
+      "computedRequests": 121
+    }
+  ],
+  "repaired": 0
+}
+```
+
+| Field | Notes |
+|---|---|
+| `rowsScanned` | `request_logs` rows attributed in the window (rows with a `client_key`). |
+| `pairsConsidered` | `(client, alias)` pairs that own a quota row. |
+| `drift` | Pairs whose stored counters differ from the computed ones, including a pair whose usage row is missing (`stored*` = `0`). Pairs already in sync are not listed. |
+| `repaired` | Pairs actually written. Always `0` under `dryRun`. |
+
+One log line per repaired pair plus a summary line; a clean run logs only the
+summary.
+
+**Errors**: `400` for a malformed query (`periodKey` not `YYYY-MM`, non-boolean
+`dryRun`, unknown parameter). `403` for a non-admin key. `401` for a missing/invalid
+key.
+
+---
+
+### `GET /admin/clients/:id/aliases`
+
+Read one client's alias allowlist — which aliases it may call and see.
+
+```json
+{
+  "clientId": "tenant-acme",
+  "mode": "restricted",
+  "aliases": ["codex", "slave"]
+}
+```
+
+| Field | Notes |
+|---|---|
+| `mode` | `unrestricted` \| `restricted`. |
+| `aliases` | Sorted alias keys. Empty when `mode` is `unrestricted` — and that empty array means **every** alias is allowed, never "none". |
+
+**`unrestricted` is the default state of every client that was never configured**:
+no rows means every alias in the registry is allowed, exactly as before this
+feature existed. From the first row on, the client is `restricted` and the list is
+**exhaustive** — an alias missing from it is forbidden, even though "there is no row
+for it". Both readings come from one accessor (`AliasAccessService.getAccess`), so
+`/v1/models` and `/v1/chat/completions` can never disagree about what a missing row
+means.
+
+`404` if the client id is unknown.
+
+---
+
+### `PUT /admin/clients/:id/aliases`
+
+Replace the whole allowlist of one client. This **is** a replace, unlike the quota
+endpoint: aliases missing from the body are removed, so revoking an alias needs no
+second call.
+
+```json
+{ "aliases": ["codex", "slave"] }
+```
+
+- Every alias must already exist in the alias registry.
+- An alias may appear only once.
+- An **empty array is rejected** (`400`): because no rows means *unrestricted*,
+  accepting `[]` would silently grant full access to an operator who meant the
+  opposite. Use `DELETE` to clear the allowlist.
+
+**Response**: the same envelope as `GET /admin/clients/:id/aliases`, after the write.
+`404` if the client id is unknown.
+
+---
+
+### `DELETE /admin/clients/:id/aliases`
+
+Clear the allowlist, returning the client to `unrestricted` (all aliases allowed
+again). Idempotent: clearing an already-clear client is a `200` no-op that returns
+`{"clientId":"…","mode":"unrestricted","aliases":[]}`. `404` if the client id is
+unknown.
+
+Changes are visible on the **very next request**: there is no cache, so a revoked
+alias stops working immediately and newly granted one starts working immediately.
+
+---
+
 ### `GET /admin/aliases`
 
 List all alias routing chains.
@@ -453,6 +728,7 @@ Query parameters (all optional, AND-combined):
     {
       "requestedAt": 1783353000,
       "modelRequested": "code",
+      "servedAlias": "code",
       "resolvedProvider": "nan",
       "resolvedModel": "qwen3-coder",
       "attempts": 1,
@@ -473,6 +749,8 @@ Query parameters (all optional, AND-combined):
 }
 ```
 
+- `modelRequested` is the alias the client **asked for**; `servedAlias` is the alias the request was actually **routed to**. `servedAlias !== modelRequested` means a quota diversion happened: the client's monthly token quota for the requested alias was exhausted and the request was silently served by its `divertAliasKey` (no header, no body change). `servedAlias` is `null` for rows written before migration `0014`.
+- **Read `servedAlias`, not `resolvedModel`, when checking whether a client was degraded by quota.** `resolvedModel` alone cannot prove a diversion: an alias's own fallback chain can produce the same upstream model as the divert target's primary, so two rows can share `resolvedModel` while only one of them was diverted. Only the alias pair is evidence.
 - Newest first, ordered by `(requestedAt DESC, id DESC)`.
 - `attemptDetails` (JSON string): per-attempt metadata — provider, model, duration, error, circuit-open flag. Populated when a fallback chain had >1 attempt; `null` otherwise. Each failed attempt is also its own `status: "error"` row.
 - `hasMore: true` means at least one row matched beyond `items`.
@@ -490,12 +768,20 @@ Query parameters (all optional, AND-combined):
 | `204` | Successful mutation with no body (POST /:id/revoke, PUT /admin/aliases/..., DELETE) |
 | `400` | Body or query failed validation (zod) — `{"error": {"message": "...", "issues": [...]}}` |
 | `401` | Missing / invalid API key, no client attached |
-| `403` | Client authenticated but missing required scope |
+| `403` | Client authenticated but missing required scope — or the requested alias is not in the caller's allowlist (`code: alias_not_permitted`, see `POST /v1/chat/completions`). OpenAI-compatible body: `{"error":{"message":"…","type":"permission_error","code":"alias_not_permitted","alias":"codex"}}`; Anthropic body: `{"type":"error","error":{"type":"permission_error","message":"…"}}`. No `Retry-After`. On streaming, the error is emitted as an SSE error frame and the HTTP status stays `200` if headers were already flushed. |
 | `404` | Resource id unknown |
 | `429` | Rate limit exceeded. `Retry-After: <seconds>` header set. `{"statusCode":429,"error":"Too Many Requests","message":"...","retryAfterMs":...}` |
+| `429` (`quota_exhausted`) | Monthly token quota for the requested alias exhausted **and** no `divertAliasKey` configured. `Retry-After: <seconds>` points at the 1st of the next UTC month (the only instant the counter resets). OpenAI-compatible body: `{"error":{"message":"…","type":"insufficient_quota","code":"quota_exhausted","alias":"codex","resets_at":<unix seconds>}}`; Anthropic body: `{"type":"error","error":{"type":"rate_limit_error","message":"…"}}`. On streaming, the error is emitted as an SSE `data: {"error":…}` frame and the HTTP status stays `200` if headers were already flushed. |
 | `500` | Upstream error or unhandled gateway error — `{"error": {"message": "..."}}` |
 
 Streaming `chat/completions` errors: errors are emitted as `data: {"error":{"message":"..."}}\n\n` followed by `data: [DONE]\n\n`. The HTTP status is `200` even on streaming errors (chunk-by-chunk).
+
+The `429 quota_exhausted` case is the only quota outcome the client can observe
+directly, and it is reachable **only** when the alias has no `divertAliasKey`:
+with a divert alias configured the request is silently served by that alias
+(status `200`, unchanged body, no extra headers). `GET /v1/quota` shows which
+alias is in which state, and `POST /admin/quotas/reconcile` repairs a counter that
+lost a write.
 
 ---
 

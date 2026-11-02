@@ -213,6 +213,19 @@ export interface LogItem {
   modelRequested: string;
   resolvedProvider: string | null;
   resolvedModel: string | null;
+  /**
+   * The alias the request was actually ROUTED to.
+   *
+   * `modelRequested` is the alias the client asked for; `servedAlias` is the one
+   * the quota gate chose. `servedAlias !== modelRequested` means a quota
+   * diversion happened: the requested alias's monthly token limit was exhausted
+   * and the request was silently served by its `divertAliasKey`.
+   *
+   * `resolvedModel` cannot prove a diversion: an alias's own fallback chain can
+   * produce the same upstream model as the divert target's primary, so only the
+   * alias pair is evidence. Rows written before migration `0014` carry `null`.
+   */
+  servedAlias: string | null;
   attempts: number;
   latencyMs: number;
   status: LogStatus;

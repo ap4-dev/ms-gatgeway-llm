@@ -16,6 +16,13 @@ import { ApiKeyAuthGuard } from '../auth/api-key.guard';
 import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 import type { Client } from '../auth/client.repository';
 import type { AnthropicStreamEvent } from './types';
+import { QuotaExhaustedError } from '../quota/quota.errors';
+import {
+    anthropicQuotaErrorBody,
+    quotaRetryAfterSeconds,
+} from '../quota/quota-http';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
+import { anthropicAliasForbiddenBody } from '../access/alias-access-http';
 
 @Controller('v1/messages')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -71,17 +78,23 @@ export class AnthropicController {
                 }
                 reply.raw.end();
             } catch (err: any) {
-                reply.raw.write(`event: error\n`);
-                reply.raw.write(
-                    `data: ${JSON.stringify({
-                        type: 'error',
-                        error: {
-                            type: 'api_error',
-                            message: err?.message || 'upstream error',
-                        },
-                    })}\n\n`,
-                );
-                reply.raw.end();
+                if (err instanceof QuotaExhaustedError) {
+                    this.writeQuotaErrorFrame(reply, err);
+                } else if (err instanceof AliasNotPermittedError) {
+                    this.writeAliasForbiddenFrame(reply, err);
+                } else {
+                    reply.raw.write(`event: error\n`);
+                    reply.raw.write(
+                        `data: ${JSON.stringify({
+                            type: 'error',
+                            error: {
+                                type: 'api_error',
+                                message: err?.message || 'upstream error',
+                            },
+                        })}\n\n`,
+                    );
+                    reply.raw.end();
+                }
             }
             return reply;
         }
@@ -90,6 +103,18 @@ export class AnthropicController {
             const result = await this.anthropic.messages(body, clientId);
             return reply.send(result);
         } catch (err: any) {
+            if (err instanceof QuotaExhaustedError) {
+                return reply
+                    .code(429)
+                    .header('Retry-After', String(quotaRetryAfterSeconds(err)))
+                    .send(anthropicQuotaErrorBody(err));
+            }
+            if (err instanceof AliasNotPermittedError) {
+                // 403 with NO `Retry-After`: waiting cannot grant a permission.
+                return reply
+                    .code(403)
+                    .send(anthropicAliasForbiddenBody(err));
+            }
             return reply.code(500).send({
                 type: 'error',
                 error: {
@@ -98,5 +123,58 @@ export class AnthropicController {
                 },
             });
         }
+    }
+
+    /**
+     * Emit the quota error frame on an already-hijacked Anthropic SSE response.
+     *
+     * The 429 claim is only truthful while the status line is still unflushed:
+     * `reply.raw.statusCode` is applied when headers are written, so assigning
+     * it after the first byte is silently ignored and the client keeps the 200
+     * it already received. Hence the `headersSent` guard — once the bytes are
+     * gone the frame is the only channel left to explain the cut, and writing
+     * it unconditionally keeps that explanation coming.
+     */
+    private writeQuotaErrorFrame(
+        reply: FastifyReply,
+        err: QuotaExhaustedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 429;
+            reply.raw.setHeader(
+                'Retry-After',
+                String(quotaRetryAfterSeconds(err)),
+            );
+        }
+        reply.raw.write(`event: error\n`);
+        reply.raw.write(
+            `data: ${JSON.stringify(anthropicQuotaErrorBody(err))}\n\n`,
+        );
+        reply.raw.end();
+    }
+
+    /**
+     * Emit the allowlist 403 frame on an already-hijacked Anthropic SSE response.
+     *
+     * Same `headersSent` discipline as {@link writeQuotaErrorFrame}: the status
+     * line is only honest while nothing has been flushed, and once the 200 is on
+     * the wire the frame is the only channel left to explain the refusal.
+     *
+     * Separate from the quota frame because the two differ in status (`403` vs
+     * `429`), headers (`Retry-After` is quota-only) and body (`permission_error`
+     * vs `rate_limit_error`).
+     */
+    private writeAliasForbiddenFrame(
+        reply: FastifyReply,
+        err: AliasNotPermittedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 403;
+        }
+        reply.raw.write(`event: error\n`);
+        reply.raw.write(
+            `data: ${JSON.stringify(anthropicAliasForbiddenBody(err))}\n\n`,
+        );
+        reply.raw.end();
     }
 }

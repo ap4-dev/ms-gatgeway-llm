@@ -16,6 +16,13 @@ import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import { ApiKeyAuthGuard } from '../auth/api-key.guard';
 import { RateLimitGuard } from '../ratelimit/rate-limit.guard';
 import type { Client } from '../auth/client.repository';
+import { QuotaExhaustedError } from '../quota/quota.errors';
+import {
+    openAiQuotaErrorBody,
+    quotaRetryAfterSeconds,
+} from '../quota/quota-http';
+import { AliasNotPermittedError } from '../access/alias-access.errors';
+import { openAiAliasForbiddenBody } from '../access/alias-access-http';
 
 @Controller('v1/chat')
 @UseGuards(ApiKeyAuthGuard, RateLimitGuard)
@@ -46,8 +53,14 @@ export class ChatController {
                 reply.raw.write('data: [DONE]\n\n');
                 reply.raw.end();
             } catch (err: any) {
-                reply.raw.write(`data: ${JSON.stringify({ error: { message: err?.message || 'upstream error' } })}\n\n`);
-                reply.raw.end();
+                if (err instanceof QuotaExhaustedError) {
+                    this.writeQuotaErrorFrame(reply, err);
+                } else if (err instanceof AliasNotPermittedError) {
+                    this.writeAliasForbiddenFrame(reply, err);
+                } else {
+                    reply.raw.write(`data: ${JSON.stringify({ error: { message: err?.message || 'upstream error' } })}\n\n`);
+                    reply.raw.end();
+                }
             }
             return reply;
         }
@@ -57,7 +70,71 @@ export class ChatController {
             const obj = (result as any)?.toJSON ? (result as any).toJSON() : result;
             return reply.send(obj);
         } catch (err: any) {
+            if (err instanceof QuotaExhaustedError) {
+                return reply
+                    .code(429)
+                    .header('Retry-After', String(quotaRetryAfterSeconds(err)))
+                    .send(openAiQuotaErrorBody(err));
+            }
+            if (err instanceof AliasNotPermittedError) {
+                // 403 with NO `Retry-After`: the refusal is not time-based, so the
+                // header would promise a recovery that waiting cannot deliver.
+                return reply
+                    .code(403)
+                    .send(openAiAliasForbiddenBody(err));
+            }
             return reply.code(500).send({ error: { message: err?.message || 'upstream error' } });
         }
+    }
+
+    /**
+     * Emit the quota error frame on an already-hijacked SSE response.
+     *
+     * The 429 claim is only truthful while the status line is still unflushed:
+     * `reply.raw.statusCode` is applied when headers are written, so assigning
+     * it after the first byte is silently ignored and the client keeps the 200
+     * it already received. Hence the `headersSent` guard — once the bytes are
+     * gone the frame is the only channel left to explain the cut, and writing
+     * it unconditionally keeps that explanation coming.
+     */
+    private writeQuotaErrorFrame(
+        reply: FastifyReply,
+        err: QuotaExhaustedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 429;
+            reply.raw.setHeader(
+                'Retry-After',
+                String(quotaRetryAfterSeconds(err)),
+            );
+        }
+        reply.raw.write(
+            `data: ${JSON.stringify(openAiQuotaErrorBody(err))}\n\n`,
+        );
+        reply.raw.end();
+    }
+
+    /**
+     * Emit the allowlist 403 frame on an already-hijacked SSE response.
+     *
+     * Same `headersSent` discipline as {@link writeQuotaErrorFrame}, for the same
+     * reason: the status line is only honest while nothing has been flushed, and
+     * once the 200 is on the wire the frame is the only channel left.
+     *
+     * Kept as its own method — rather than parameterising the quota one — because
+     * the two errors differ in exactly the places that matter here: status
+     * (`403` vs `429`), headers (`Retry-After` belongs only to the quota) and body.
+     */
+    private writeAliasForbiddenFrame(
+        reply: FastifyReply,
+        err: AliasNotPermittedError,
+    ): void {
+        if (!reply.raw.headersSent) {
+            reply.raw.statusCode = 403;
+        }
+        reply.raw.write(
+            `data: ${JSON.stringify(openAiAliasForbiddenBody(err))}\n\n`,
+        );
+        reply.raw.end();
     }
 }

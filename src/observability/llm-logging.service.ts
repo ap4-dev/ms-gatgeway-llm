@@ -42,6 +42,22 @@ export interface RequestLogEvent {
     /** Unix-seconds timestamp captured at the start of ChatService.completions. */
     ts: number;
     model: string;
+    /**
+     * The alias that was actually routed. `model` keeps what the client asked
+     * for, so `servedAlias !== model` marks a degraded request.
+     */
+    servedAlias?: string;
+    /**
+     * Present ONLY when a monthly-quota diversion happened; the value is the
+     * alias the client asked for. Absent on non-diverted requests.
+     *
+     * `servedAlias` + `quotaDivertedFrom` together make a SILENT downgrade
+     * auditable: the client is never told it was moved from `codex` to
+     * `slave`, so the log line is the only evidence that it happened. They are
+     * omitted (not `null`) when no diversion occurred, which leaves the
+     * existing event shape of every non-diverted request unchanged.
+     */
+    quotaDivertedFrom?: string;
     resolvedProvider: string | null;
     resolvedModel: string | null;
     promptHash: string;

@@ -413,6 +413,152 @@ export function deleteClient(id: string): Promise<void> {
   });
 }
 
+// ── /admin/clients/:id/quotas ───────────────────────────────────────────────
+
+/**
+ * One `(client, alias)` monthly token allowance joined with the usage of the UTC
+ * month in progress. Mirrors `ClientQuotaView` in `src/quota/quota.service.ts`
+ * field for field; `exhausted` uses the same strict `tokens >= limit` rule as
+ * the request gate, so a row marked `exhausted` is already being diverted.
+ */
+export interface ClientQuota {
+  aliasKey: string;
+  monthlyTokenLimit: number;
+  divertAliasKey: string | null;
+  /** UTC calendar month (`YYYY-MM`) these counters belong to. */
+  periodKey: string;
+  tokens: number;
+  requests: number;
+  /** Clamped at 0: the post-hoc accounting accepts one request of overshoot. */
+  remaining: number;
+  exhausted: boolean;
+  /** Unix SECONDS of the next UTC month start, matching the 429 detail. */
+  resetsAt: number;
+  retryAfterSeconds: number;
+}
+
+/**
+ * Shared envelope of `GET`/`PUT /admin/clients/:id/quotas` (and `/v1/quota`).
+ * The period fields are hoisted here because every row in a response belongs to
+ * the same month.
+ */
+export interface ClientQuotasResponse {
+  clientId: string;
+  periodKey: string;
+  resetsAt: number;
+  retryAfterSeconds: number;
+  quotas: ClientQuota[];
+}
+
+/**
+ * One entry of the `PUT` body. The API upserts these and deletes nothing: an
+ * alias absent from the array keeps its stored allowance, so removing one is a
+ * `DELETE`, never an omission.
+ */
+export interface ClientQuotaEntry {
+  aliasKey: string;
+  monthlyTokenLimit: number;
+  /** `null` means an exhausted alias answers `429` instead of degrading. */
+  divertAliasKey: string | null;
+}
+
+/** `DELETE /admin/clients/:id/quotas/:aliasKey` response. */
+export interface ClientQuotaDeletedResponse {
+  deleted: true;
+  clientId: string;
+  aliasKey: string;
+}
+
+export function listClientQuotas(clientId: string): Promise<ClientQuotasResponse> {
+  return apiFetch<ClientQuotasResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas`,
+  );
+}
+
+export function putClientQuotas(
+  clientId: string,
+  quotas: ClientQuotaEntry[],
+): Promise<ClientQuotasResponse> {
+  return apiFetch<ClientQuotasResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas`,
+    { method: 'PUT', body: JSON.stringify({ quotas }) },
+  );
+}
+
+/** Removing the row makes the alias unlimited again (`404` if it was already gone). */
+export function deleteClientQuota(
+  clientId: string,
+  aliasKey: string,
+): Promise<ClientQuotaDeletedResponse> {
+  return apiFetch<ClientQuotaDeletedResponse>(
+    `/admin/clients/${encodeURIComponent(clientId)}/quotas/${encodeURIComponent(aliasKey)}`,
+    { method: 'DELETE' },
+  );
+}
+
+// ── /admin/clients/:id/aliases ──────────────────────────────────────────────
+
+/**
+ * Administrative read model of one client's alias allowlist. Mirrors
+ * `AliasAccessDescription` in `src/access/alias-access.service.ts` field for
+ * field; `aliases` is sorted by the server.
+ *
+ * TWO FACTS that are easy to re-learn painfully:
+ *
+ * 1. `mode: 'unrestricted'` ALWAYS comes with `aliases: []`, and that empty
+ *    list does **not** mean "nothing is permitted" — it means the opposite:
+ *    the client may use every alias in the registry. The empty array is the
+ *    rendering of a `Set` that does not exist, not a denial. Never read it as
+ *    "no access", and never send it back as if it were a valid target state.
+ * 2. `mode: 'restricted'` means the returned set is EXHAUSTIVE: an alias
+ *    missing from it is forbidden, even though "there is no row for it".
+ */
+export interface AliasAccessDescription {
+  clientId: string;
+  mode: 'unrestricted' | 'restricted';
+  /** Sorted alias keys; empty when `mode` is `unrestricted`. */
+  aliases: string[];
+}
+
+/** `GET /admin/clients/:id/aliases`. `404` if the client id is unknown. */
+export function getClientAliases(clientId: string): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+  );
+}
+
+/**
+ * `PUT /admin/clients/:id/aliases`. **Replaces the entire set**: aliases
+ * missing from `aliases` are revoked, so revoking one needs no second call.
+ *
+ * An empty array is rejected with `400` on purpose: because no rows means
+ * *unrestricted*, accepting `[]` would silently grant full access to an
+ * operator who meant the opposite. Use {@link deleteClientAliases} to clear
+ * the allowlist. Aliases the registry does not know are also a `400`.
+ */
+export function putClientAliases(
+  clientId: string,
+  aliases: string[],
+): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+    { method: 'PUT', body: JSON.stringify({ aliases }) },
+  );
+}
+
+/**
+ * `DELETE /admin/clients/:id/aliases`. Removes every row of the client, which
+ * returns it to `unrestricted` — it may use every alias in the registry again
+ * (the same state it had before anyone configured it). Idempotent: clearing an
+ * already-clear client is a `200` no-op, not a `404`.
+ */
+export function deleteClientAliases(clientId: string): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+    { method: 'DELETE' },
+  );
+}
+
 // ── GET /admin/logs ─────────────────────────────────────────────────────────
 
 export function listLogs(params: ListLogsParams = {}): Promise<LogsResponse> {

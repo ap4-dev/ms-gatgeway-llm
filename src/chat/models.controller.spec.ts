@@ -1,5 +1,7 @@
 import { ModelsController } from './models.controller';
 import { ProviderRegistryService } from '../providers/provider.registry';
+import { AliasAccessService } from '../access/alias-access.service';
+import type { ClientAliasAccessRepository } from '../database/repositories/client-alias-access.repository';
 
 function makeRegistry(
     overrides: { aliases?: Record<string, string> } = {},
@@ -47,6 +49,27 @@ function makeRegistry(
     } as unknown as ProviderRegistryService;
 }
 
+/**
+ * The REAL `AliasAccessService` over a fake repository.
+ *
+ * "No rows means unrestricted" is as much the rule under test as the filtering
+ * itself, so it is not stubbed away: both `list()` and the request gate read the
+ * same `getAccess` answer, which is the whole point of the shared accessor.
+ * `permitted === undefined` means the client has no rows at all.
+ */
+function makeAccess(permitted?: readonly string[]): AliasAccessService {
+    const repo = {
+        listByClient: () =>
+            (permitted ?? []).map((aliasKey) => ({ clientId: 'client-1', aliasKey })),
+    } as unknown as ClientAliasAccessRepository;
+    return new AliasAccessService(repo);
+}
+
+/** Authenticated request stub; `null` id models anonymous traffic. */
+function makeRequest(clientId: string | null = 'client-1') {
+    return { client: clientId === null ? undefined : { id: clientId } } as any;
+}
+
 function setUpKeys(setup: { nan?: boolean; openai?: boolean }) {
     if (setup.nan) process.env.NAN_API_KEY = 'sk-nan';
     else delete process.env.NAN_API_KEY;
@@ -67,9 +90,9 @@ describe('ModelsController', () => {
 
     it('lists ONLY aliases — never the underlying real model keys', () => {
         setUpKeys({ nan: true, openai: true });
-        const controller = new ModelsController(makeRegistry());
+        const controller = new ModelsController(makeRegistry(), makeAccess());
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
 
         expect(res.object).toBe('list');
         const ids = res.data.map((d) => d.id).sort();
@@ -79,9 +102,9 @@ describe('ModelsController', () => {
 
     it('does NOT leak any real model key (qwen3.6 / qwen3-coder / gpt-4o-mini)', () => {
         setUpKeys({ nan: true, openai: true });
-        const controller = new ModelsController(makeRegistry());
+        const controller = new ModelsController(makeRegistry(), makeAccess());
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         const payload = JSON.stringify(res);
         // Provider-side model ids must never appear in the response.
         expect(payload).not.toContain('qwen3.6');
@@ -99,9 +122,10 @@ describe('ModelsController', () => {
                     awesome: ['nan/qwen3-coder'],
                 },
             }),
+            makeAccess(),
         );
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         const aliased = res.data.find((d) => d.id === 'awesome');
 
         expect(aliased).toBeDefined();
@@ -123,9 +147,10 @@ describe('ModelsController', () => {
                     'qwen3-coder': ['nan/qwen3-coder'],
                 },
             }),
+            makeAccess(),
         );
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         expect(res.data.find((d) => d.id === 'qwen3-coder')).toBeDefined();
         // Only the alias is exposed, not the model-key entry separately.
         expect(res.data.filter((d) => d.id === 'qwen3-coder')).toHaveLength(1);
@@ -133,9 +158,9 @@ describe('ModelsController', () => {
 
     it('skips aliases that point to providers without their API key set', () => {
         setUpKeys({ nan: true, openai: false });
-        const controller = new ModelsController(makeRegistry());
+        const controller = new ModelsController(makeRegistry(), makeAccess());
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         // All three default aliases are nan-routed, so they all show.
         // (`fast` points to openai/gpt-4o-mini — api key missing — skipped.)
         const ids = res.data.map((d) => d.id).sort();
@@ -153,9 +178,10 @@ describe('ModelsController', () => {
                     valid: ['nan/qwen3-coder'],
                 },
             }),
+            makeAccess(),
         );
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         expect(res.data.find((d) => d.id === 'ghost')).toBeUndefined();
         expect(res.data.find((d) => d.id === 'broken')).toBeUndefined();
         expect(res.data.find((d) => d.id === 'valid')).toBeDefined();
@@ -163,18 +189,108 @@ describe('ModelsController', () => {
 
     it('returns an empty list when no providers are configured', () => {
         setUpKeys({});
-        const controller = new ModelsController(makeRegistry());
+        const controller = new ModelsController(makeRegistry(), makeAccess());
 
-        const res = controller.list();
+        const res = controller.list(makeRequest());
         expect(res.data).toEqual([]);
     });
 
     it('uses a stable created timestamp per process instance', () => {
         setUpKeys({ nan: true });
-        const controller = new ModelsController(makeRegistry());
+        const controller = new ModelsController(makeRegistry(), makeAccess());
 
-        const first = controller.list();
-        const second = controller.list();
+        const first = controller.list(makeRequest());
+        const second = controller.list(makeRequest());
         expect(first.data[0].created).toBe(second.data[0].created);
+    });
+});
+
+/**
+ * Allowlist filtering. Same `getAccess`/`isPermitted` rule as the request gate:
+ * an alias the client may not CALL must not be ADVERTISED, or every client SDK
+ * would offer a model that answers 403.
+ */
+describe('ModelsController allowlist filtering', () => {
+    // Same instant the block above pins, so `created` stays deterministic.
+    const createdAtFloor = 1_700_000_000;
+
+    beforeEach(() => {
+        jest.spyOn(Date, 'now').mockReturnValue(createdAtFloor * 1000);
+    });
+
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it('lists every reachable alias for a client with NO rows (unrestricted)', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(makeRegistry(), makeAccess());
+
+        const res = controller.list(makeRequest());
+
+        expect(res.data.map((d) => d.id).sort()).toEqual(['coder', 'default', 'fast']);
+    });
+
+    it('lists ONLY the aliases in a restricted client allowlist', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(
+            makeRegistry(),
+            makeAccess(['coder', 'fast']),
+        );
+
+        const res = controller.list(makeRequest());
+
+        expect(res.data.map((d) => d.id).sort()).toEqual(['coder', 'fast']);
+    });
+
+    it('hides a permitted alias that is not reachable (both rules compose)', () => {
+        // `fast` needs the openai key; permitted but unreachable must stay hidden,
+        // exactly as it is for an unrestricted client.
+        setUpKeys({ nan: true, openai: false });
+        const controller = new ModelsController(
+            makeRegistry(),
+            makeAccess(['coder', 'fast']),
+        );
+
+        const res = controller.list(makeRequest());
+
+        expect(res.data.map((d) => d.id)).toEqual(['coder']);
+    });
+
+    it('returns an empty list when the allowlist matches no alias', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(
+            makeRegistry(),
+            makeAccess(['ghost-alias']),
+        );
+
+        const res = controller.list(makeRequest());
+
+        expect(res.data).toEqual([]);
+        // Still a well-formed OpenAI list, not an error.
+        expect(res.object).toBe('list');
+    });
+
+    it('does not leak aliases the client is not permitted to use', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(makeRegistry(), makeAccess(['coder']));
+
+        const payload = JSON.stringify(controller.list(makeRequest()));
+
+        expect(payload).toContain('coder');
+        expect(payload).not.toContain('default');
+        expect(payload).not.toContain('fast');
+    });
+
+    it('leaves anonymous traffic unrestricted', () => {
+        setUpKeys({ nan: true, openai: true });
+        const controller = new ModelsController(
+            makeRegistry(),
+            makeAccess(['coder']),
+        );
+
+        const res = controller.list(makeRequest(null));
+
+        expect(res.data.map((d) => d.id).sort()).toEqual(['coder', 'default', 'fast']);
     });
 });
