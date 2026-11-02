@@ -496,6 +496,69 @@ export function deleteClientQuota(
   );
 }
 
+// ── /admin/clients/:id/aliases ──────────────────────────────────────────────
+
+/**
+ * Administrative read model of one client's alias allowlist. Mirrors
+ * `AliasAccessDescription` in `src/access/alias-access.service.ts` field for
+ * field; `aliases` is sorted by the server.
+ *
+ * TWO FACTS that are easy to re-learn painfully:
+ *
+ * 1. `mode: 'unrestricted'` ALWAYS comes with `aliases: []`, and that empty
+ *    list does **not** mean "nothing is permitted" — it means the opposite:
+ *    the client may use every alias in the registry. The empty array is the
+ *    rendering of a `Set` that does not exist, not a denial. Never read it as
+ *    "no access", and never send it back as if it were a valid target state.
+ * 2. `mode: 'restricted'` means the returned set is EXHAUSTIVE: an alias
+ *    missing from it is forbidden, even though "there is no row for it".
+ */
+export interface AliasAccessDescription {
+  clientId: string;
+  mode: 'unrestricted' | 'restricted';
+  /** Sorted alias keys; empty when `mode` is `unrestricted`. */
+  aliases: string[];
+}
+
+/** `GET /admin/clients/:id/aliases`. `404` if the client id is unknown. */
+export function getClientAliases(clientId: string): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+  );
+}
+
+/**
+ * `PUT /admin/clients/:id/aliases`. **Replaces the entire set**: aliases
+ * missing from `aliases` are revoked, so revoking one needs no second call.
+ *
+ * An empty array is rejected with `400` on purpose: because no rows means
+ * *unrestricted*, accepting `[]` would silently grant full access to an
+ * operator who meant the opposite. Use {@link deleteClientAliases} to clear
+ * the allowlist. Aliases the registry does not know are also a `400`.
+ */
+export function putClientAliases(
+  clientId: string,
+  aliases: string[],
+): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+    { method: 'PUT', body: JSON.stringify({ aliases }) },
+  );
+}
+
+/**
+ * `DELETE /admin/clients/:id/aliases`. Removes every row of the client, which
+ * returns it to `unrestricted` — it may use every alias in the registry again
+ * (the same state it had before anyone configured it). Idempotent: clearing an
+ * already-clear client is a `200` no-op, not a `404`.
+ */
+export function deleteClientAliases(clientId: string): Promise<AliasAccessDescription> {
+  return apiFetch<AliasAccessDescription>(
+    `/admin/clients/${encodeURIComponent(clientId)}/aliases`,
+    { method: 'DELETE' },
+  );
+}
+
 // ── GET /admin/logs ─────────────────────────────────────────────────────────
 
 export function listLogs(params: ListLogsParams = {}): Promise<LogsResponse> {

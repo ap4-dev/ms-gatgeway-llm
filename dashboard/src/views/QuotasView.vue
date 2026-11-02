@@ -2,15 +2,19 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import {
   ApiError,
+  deleteClientAliases,
   deleteClientQuota,
   extractIssues,
+  getClientAliases,
   listAliases,
   listClientQuotas,
   listClients,
+  putClientAliases,
   putClientQuotas,
 } from '../api/client';
 import type {
   Alias,
+  AliasAccessDescription,
   Client,
   ClientQuota,
   ClientQuotaEntry,
@@ -20,18 +24,30 @@ import ConfirmDialog from '../components/ConfirmDialog.vue';
 import type { ConfirmOptions } from '../components/ConfirmDialog.vue';
 
 /**
- * Operator surface for the monthly token quotas (feature: cuotas mensuales,
- * T8). One `(client, alias)` allowance = a row; **no row means unlimited**.
+ * Operator surface for BOTH access controls of one client (feature: cuotas
+ * mensuales + alias allowlist): **which aliases it may use** (allowlist) and
+ * **how much of each** (monthly token quota). One `(client, alias)` allowance =
+ * a quota row; **no quota row means unlimited**. The allowlist is
+ * `unrestricted` when the client has no rows (every alias allowed) and
+ * `restricted` to an EXHAUSTIVE set otherwise.
  *
- * Every read goes through `GET /admin/clients/:id/quotas`, which joins the
- * stored allowance with the usage of the UTC month in progress, so this view
- * never computes a counter itself. Every mutation re-reads that endpoint
- * instead of patching local state: the server response is the truth, the
- * format is small, and a stale optimistic row here would hide exactly the
- * drift an operator is looking at.
+ * The two are orthogonal and are edited here, for the same selected client, on
+ * purpose: only side by side can the operator see a contradictory config — a
+ * quota on an alias the client is not permitted to request is dead config,
+ * because the request is refused with `403` before the quota gate runs. This
+ * view warns about that and blocks nothing: the server is the authority.
  *
- * The alias inputs are selects fed by `GET /admin/aliases`, because the API
- * refuses unknown aliases (`400`) and typing one by hand could only produce an
+ * Every read goes through the admin API (`GET /admin/clients/:id/quotas`,
+ * `GET /admin/clients/:id/aliases`), so this view never computes a counter or
+ * an access mode itself. Every mutation re-reads instead of patching local
+ * state: the server response is the truth, the payloads are small, and a stale
+ * optimistic row here would hide exactly the drift an operator is looking at.
+ * The same rule is why the allowlist editor stages edits in a local DRAFT —
+ * `PUT` replaces the whole set — but commits them through the server and then
+ * re-reads, never by writing the draft back as if it were saved state.
+ *
+ * The alias inputs are selects fed by `GET /admin/aliases`, because both APIs
+ * refuse unknown aliases (`400`) and typing one by hand could only produce an
  * error. Nothing is pre-validated beyond that: the server stays the authority.
  */
 
@@ -50,6 +66,25 @@ const formMessage = ref('');
 
 const rowBusy = ref<string | null>(null);
 const rowError = ref('');
+
+// ── Allowlist state ────────────────────────────────────────────────────────
+
+/** `null` until the first successful read; `unrestricted` is a real value. */
+const access = ref<AliasAccessDescription | null>(null);
+const accessLoading = ref(false);
+const accessError = ref('');
+const accessMessage = ref('');
+
+/**
+ * Local DRAFT of the permitted set. `PUT /aliases` replaces the whole set, so
+ * edits are staged here and committed with an explicit Save; the draft is
+ * re-seeded from the server after every successful read/write. `access` holds
+ * what the server currently says and is the ONLY source for the warnings and
+ * the Save/Clear affordances — never the draft.
+ */
+const draftAliases = ref<string[]>([]);
+const addAliasChoice = ref('');
+const accessSaving = ref(false);
 
 const confirmRef = ref<{ confirm: (o: ConfirmOptions) => Promise<boolean> } | null>(null);
 
@@ -141,6 +176,192 @@ function hasQuota(aliasKey: string): boolean {
   return (envelope.value?.quotas ?? []).some((quota) => quota.aliasKey === aliasKey);
 }
 
+// ── Allowlist derived state ────────────────────────────────────────────────
+
+const accessMode = computed(() => access.value?.mode ?? null);
+
+/**
+ * The set the SERVER says the client may use. Empty is correct when the mode is
+ * `unrestricted` — it means "every alias", never "none" — so this set is only
+ * consulted as an allowlist while the mode is `restricted`.
+ */
+const permittedAliases = computed(() => access.value?.aliases ?? []);
+
+/** Aliases of the registry that the draft does not contain yet (no free text). */
+const addableAliases = computed(() =>
+  aliasIds.value.filter((aliasId) => !draftAliases.value.includes(aliasId)),
+);
+
+/**
+ * Draft vs saved set, order-insensitive: the server returns a sorted list but
+ * the operator's staging order is whatever they clicked, and neither is
+ * meaningful to an API that stores a SET.
+ */
+const draftDirty = computed(() => {
+  if (access.value === null) return false;
+  const saved = [...permittedAliases.value].sort().join('\u0000');
+  const staged = [...draftAliases.value].sort().join('\u0000');
+  return saved !== staged;
+});
+
+/**
+ * An empty draft is never sendable: `PUT` with `[]` is a `400` by design
+ * (no rows means UNRESTRICTED, so accepting it would grant everything instead
+ * of nothing). Disabling Save here mirrors the server rule instead of
+ * discovering it as an error.
+ */
+const canSaveAliases = computed(
+  () => access.value !== null && draftDirty.value && draftAliases.value.length > 0 && !accessSaving.value,
+);
+
+/**
+ * A quota on an alias this client may not request is DEAD CONFIG: the 403 is
+ * returned by the alias gate before the quota gate is ever consulted, so the
+ * allowance never decrements and never diverts. Evaluated against the SAVED set
+ * (never the draft) because the server is the authority and the operator may be
+ * mid-edit. Nothing is blocked: this is a warning, not a validation.
+ */
+function isDeadQuota(aliasKey: string): boolean {
+  return accessMode.value === 'restricted' && !permittedAliases.value.includes(aliasKey);
+}
+
+const hasDeadQuota = computed(
+  () => accessMode.value === 'restricted' && (envelope.value?.quotas ?? []).some((quota) => isDeadQuota(quota.aliasKey)),
+);
+
+// ── Allowlist draft + mutations ────────────────────────────────────────────
+
+/** Re-seed the draft from the server state (after every read and every write). */
+function seedDraft(): void {
+  draftAliases.value = [...permittedAliases.value];
+  addAliasChoice.value = '';
+}
+
+/** Drop the draft: re-seeded from the server state ("Discard changes"). */
+function discardDraft(): void {
+  seedDraft();
+  accessMessage.value = '';
+}
+
+/** Drop the draft AND the loaded state (leaving one client for another). */
+function clearDraft(): void {
+  access.value = null;
+  draftAliases.value = [];
+  addAliasChoice.value = '';
+  accessMessage.value = '';
+}
+
+function addDraftAlias(): void {
+  const aliasId = addAliasChoice.value;
+  if (aliasId === '') return;
+  // Guard against a stale choice (the registry can change between two reads).
+  if (!aliasIds.value.includes(aliasId)) {
+    addAliasChoice.value = '';
+    return;
+  }
+  if (!draftAliases.value.includes(aliasId)) draftAliases.value.push(aliasId);
+  addAliasChoice.value = '';
+  accessMessage.value = '';
+}
+
+function removeDraftAlias(aliasKey: string): void {
+  draftAliases.value = draftAliases.value.filter((id) => id !== aliasKey);
+  accessMessage.value = '';
+}
+
+/** A 404 on `/admin/clients/:id/aliases` means the client itself is gone. */
+function describeAccessError(err: unknown, action: string): string {
+  if (err instanceof ApiError && err.status === 404) {
+    return (
+      `${action}: the client "${selectedClientId.value}" no longer exists (404). ` +
+      'Its access rows are gone with it; reload the client list.'
+    );
+  }
+  return formatError(err);
+}
+
+async function loadAccess(): Promise<void> {
+  if (selectedClientId.value === '') {
+    access.value = null;
+    seedDraft();
+    return;
+  }
+  accessLoading.value = true;
+  accessError.value = '';
+  try {
+    access.value = await getClientAliases(selectedClientId.value);
+    seedDraft();
+  } catch (err) {
+    access.value = null;
+    draftAliases.value = [];
+    addAliasChoice.value = '';
+    accessError.value = describeAccessError(err, 'Could not load the alias allowlist');
+  } finally {
+    accessLoading.value = false;
+  }
+}
+
+async function saveAliases(): Promise<void> {
+  accessError.value = '';
+  accessMessage.value = '';
+  if (selectedClientId.value === '') {
+    accessError.value = 'Select a client first.';
+    return;
+  }
+  if (draftAliases.value.length === 0) {
+    // Belt and braces: Save is disabled in this state, and the server would
+    // answer 400 anyway. Never fall through to a PUT that cannot succeed.
+    accessError.value =
+      'An empty allowlist cannot be saved: the API rejects `[]` because no rows means ' +
+      'UNRESTRICTED. Add at least one alias, or use "Return to unrestricted".';
+    return;
+  }
+
+  accessSaving.value = true;
+  try {
+    // The PUT response is the new state, but it is still re-read below so this
+    // view has exactly one way of learning the truth.
+    await putClientAliases(selectedClientId.value, [...draftAliases.value]);
+    await refresh();
+    accessMessage.value =
+      `Allowlist saved (${draftAliases.value.length} alias` +
+      `${draftAliases.value.length === 1 ? '' : 'es'}). It applies from the next request.`;
+  } catch (err) {
+    accessError.value = describeAccessError(err, 'Could not save the alias allowlist');
+  } finally {
+    accessSaving.value = false;
+  }
+}
+
+async function onReturnToUnrestricted(): Promise<void> {
+  const clientLabel = selectedClient.value?.name ?? selectedClientId.value;
+  const ok = await askConfirm({
+    title: 'Return to unrestricted',
+    message:
+      `Clear the alias allowlist of "${clientLabel}"? ` +
+      `The client regains access to EVERY alias in the registry: it may call and see all of ` +
+      `them again, not just the ones listed now. ` +
+      `Monthly quotas are left untouched — they are a separate control and keep applying.`,
+    confirmLabel: 'Return to unrestricted',
+    danger: true,
+  });
+  if (!ok) return;
+
+  accessSaving.value = true;
+  accessError.value = '';
+  accessMessage.value = '';
+  try {
+    await deleteClientAliases(selectedClientId.value);
+    await refresh();
+    accessMessage.value =
+      `Allowlist cleared: "${clientLabel}" is unrestricted and may use every alias in the registry.`;
+  } catch (err) {
+    accessError.value = describeAccessError(err, 'Could not clear the alias allowlist');
+  } finally {
+    accessSaving.value = false;
+  }
+}
+
 // ── Loading ─────────────────────────────────────────────────────────────────
 
 async function loadClients(): Promise<void> {
@@ -151,6 +372,9 @@ async function loadClients(): Promise<void> {
   if (!stillThere) {
     selectedClientId.value = response.clients[0]?.id ?? '';
     resetForm();
+    // A different client means a different allowlist: the draft is dropped
+    // rather than carried over (see `onClientChange`).
+    clearDraft();
   }
 }
 
@@ -185,15 +409,16 @@ async function loadQuotas(): Promise<void> {
 
 /** One reload after any mutation: the server response is the only truth here. */
 async function refresh(): Promise<void> {
-  await loadQuotas();
+  await Promise.all([loadQuotas(), loadAccess()]);
 }
 
 async function loadAll(): Promise<void> {
   loading.value = true;
   loadError.value = '';
+  accessError.value = '';
   try {
     await Promise.all([loadClients(), loadAliases()]);
-    await loadQuotas();
+    await refresh();
   } catch (err) {
     loadError.value = formatError(err);
   } finally {
@@ -205,8 +430,12 @@ async function onClientChange(): Promise<void> {
   rowError.value = '';
   formError.value = '';
   formMessage.value = '';
+  accessError.value = '';
   resetForm();
-  await loadQuotas();
+  // A draft belongs to ONE client: carrying it to another would offer to save
+  // a set the operator never intended for that client.
+  clearDraft();
+  await refresh();
 }
 
 function resetForm(): void {
@@ -326,7 +555,15 @@ onMounted(() => {
 
 <template>
   <div>
-    <h1>Quotas</h1>
+    <h1>Client access</h1>
+
+    <p class="muted view-intro">
+      Both access controls of one client in one place: <strong>which aliases it may use</strong>
+      (the allowlist) and <strong>how much of each it may use</strong> (the monthly quotas). They
+      are orthogonal, and they are shown together on purpose — a quota on an alias the client is
+      not permitted to request is dead configuration, because the request is refused with
+      <code>403</code> before the quota gate ever runs.
+    </p>
 
     <section class="panel">
       <div class="toolbar">
@@ -363,10 +600,158 @@ onMounted(() => {
 
     <p v-if="loadError" class="error">{{ loadError }}</p>
     <p v-if="rowError" class="error">{{ rowError }}</p>
+
+    <section v-if="selectedClientId !== ''" class="panel">
+      <h2 class="section-title">Alias allowlist</h2>
+
+      <p v-if="accessLoading && access === null" class="muted">Loading…</p>
+
+      <template v-else-if="access">
+        <p class="access-mode">
+          <span v-if="access.mode === 'unrestricted'" class="badge badge-warn">unrestricted</span>
+          <span v-else class="badge badge-ok">restricted</span>
+          <span v-if="access.mode === 'unrestricted'" class="muted">
+            This client has no allowlist rows: it may call and see <strong>every</strong> alias in
+            the registry.
+          </span>
+          <span v-else class="muted">
+            This list is <strong>exhaustive</strong> — an alias missing from it is refused with
+            <code>403</code> and is not advertised in <code>/v1/models</code>. Saved:
+            {{ access.aliases.length }} permitted.
+          </span>
+          <span v-if="draftDirty" class="badge badge-warn">unsaved draft</span>
+        </p>
+
+        <div class="field">
+          <label>Aliases the client may use</label>
+          <div v-if="draftAliases.length > 0" class="chip-row">
+            <span v-for="aliasKey in draftAliases" :key="aliasKey" class="tag chip">
+              <span class="mono">{{ aliasKey }}</span>
+              <button
+                class="chip-remove"
+                type="button"
+                :aria-label="`Remove ${aliasKey} from the draft`"
+                :title="`Remove ${aliasKey}`"
+                @click="removeDraftAlias(aliasKey)"
+              >
+                ×
+              </button>
+            </span>
+          </div>
+          <p v-else-if="access.mode === 'unrestricted'" class="muted">
+            Nothing staged. <em>Unrestricted</em> means every alias in the registry is permitted —
+            add one or more below to start restricting this client.
+          </p>
+          <p v-else class="muted">
+            Nothing staged — an empty allowlist cannot be saved (see below).
+          </p>
+        </div>
+
+        <div class="form-grid access-add">
+          <div class="field">
+            <label for="access-add-alias">Add an alias from the registry</label>
+            <select
+              id="access-add-alias"
+              v-model="addAliasChoice"
+              :disabled="addableAliases.length === 0"
+            >
+              <option value="">— select an alias —</option>
+              <option v-for="aliasId in addableAliases" :key="aliasId" :value="aliasId">
+                {{ aliasId }}
+              </option>
+            </select>
+          </div>
+          <div class="field field-action">
+            <button
+              class="btn btn-ghost"
+              type="button"
+              :disabled="addAliasChoice === ''"
+              @click="addDraftAlias"
+            >
+              Add
+            </button>
+            <button
+              class="btn"
+              type="button"
+              :disabled="!canSaveAliases"
+              @click="saveAliases"
+            >
+              {{ accessSaving ? 'Saving…' : 'Save allowlist' }}
+            </button>
+            <button
+              class="btn btn-ghost"
+              type="button"
+              :disabled="!draftDirty || accessSaving"
+              @click="discardDraft"
+            >
+              Discard changes
+            </button>
+            <button
+              v-if="access.mode === 'restricted'"
+              class="btn btn-danger"
+              type="button"
+              :disabled="accessSaving"
+              @click="onReturnToUnrestricted"
+            >
+              Return to unrestricted
+            </button>
+          </div>
+        </div>
+
+        <small v-if="addableAliases.length === 0 && aliasIds.length === 0" class="muted access-hint">
+          No aliases in the registry yet — create one in the Aliases view first. The API only
+          accepts aliases that already exist.
+        </small>
+        <small v-else-if="addableAliases.length === 0" class="muted access-hint">
+          Every alias in the registry is already in the draft.
+        </small>
+
+        <small
+          v-if="access.mode === 'restricted' && draftAliases.length === 0"
+          class="warning access-hint"
+        >
+          An empty allowlist cannot be saved: <code>PUT</code> with <code>[]</code> is rejected with
+          <code>400</code> on purpose, because no rows means <em>unrestricted</em> — the opposite of
+          "no access at all". That state is deliberately not expressible here. Use
+          <strong>Return to unrestricted</strong> instead.
+        </small>
+        <small v-else-if="draftAliases.length === 0" class="muted access-hint">
+          Add at least one alias to save a restricted allowlist. With nothing staged there is
+          nothing to save and the client stays unrestricted.
+        </small>
+
+        <small class="muted access-hint">
+          Saving replaces the <strong>entire</strong> set: an alias whose chip you remove is
+          revoked for this client, and the change applies from the next request. No cache, no
+          restart.
+        </small>
+
+        <p v-if="accessError" class="error">{{ accessError }}</p>
+        <p v-if="accessMessage" class="success">{{ accessMessage }}</p>
+      </template>
+
+      <template v-else>
+        <p class="error">
+          {{ accessError || 'Could not load the alias allowlist for this client.' }}
+        </p>
+        <button class="btn btn-ghost" type="button" :disabled="accessLoading" @click="refresh">
+          Retry
+        </button>
+      </template>
+    </section>
+
     <p v-if="loading" class="muted">Loading…</p>
 
     <section v-else-if="envelope" class="panel">
       <h2 class="section-title">Allowances</h2>
+
+      <p v-if="hasDeadQuota" class="notice dead-quota-notice">
+        <span class="badge badge-warn">unreachable</span>
+        The rows marked below are on aliases this client is <strong>not permitted</strong> to request.
+        A request for one of them is refused with <code>403</code> by the alias allowlist
+        <em>before</em> the quota gate runs, so the allowance is never consulted: no counter moves,
+        no divert happens, and the limit has no effect. Allow the alias above, or remove the quota.
+      </p>
 
       <table v-if="envelope.quotas.length > 0">
         <thead>
@@ -383,7 +768,13 @@ onMounted(() => {
         </thead>
         <tbody>
           <tr v-for="quota in envelope.quotas" :key="quota.aliasKey">
-            <td class="mono">{{ quota.aliasKey }}</td>
+            <td class="mono">
+              {{ quota.aliasKey }}
+              <span v-if="isDeadQuota(quota.aliasKey)" class="badge badge-warn">unreachable</span>
+              <small v-if="isDeadQuota(quota.aliasKey)" class="warning dead-quota-line">
+                never reached: <code>403</code> before the quota gate
+              </small>
+            </td>
             <td>
               {{ quota.monthlyTokenLimit.toLocaleString('en-US') }}
               <span class="muted">({{ humanizeTokens(quota.monthlyTokenLimit) }})</span>
@@ -432,7 +823,7 @@ onMounted(() => {
         </tbody>
       </table>
       <p v-else class="muted">
-        This client has no quotas: every alias is unlimited and nothing is gated.
+        This client has no quotas: every permitted alias is unlimited and nothing is gated.
         Add one below.
       </p>
     </section>
@@ -501,7 +892,67 @@ onMounted(() => {
 </template>
 
 <style scoped>
-/* Only what the shared stylesheet does not provide: the usage bar. */
+/* Only what the shared stylesheet does not provide: the usage bar and the
+   removable chip. Everything else (panels, badges, warnings) is global. */
+.view-intro {
+  margin-top: -6px;
+  max-width: 90ch;
+}
+
+.access-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.chip-remove {
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--danger);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chip-remove:hover {
+  color: var(--text);
+}
+
+.access-add {
+  margin-top: 16px;
+}
+
+.access-hint {
+  display: block;
+  margin-top: 10px;
+}
+
+.dead-quota-notice {
+  margin-bottom: 16px;
+}
+
+.dead-quota-line {
+  display: block;
+  margin-top: 2px;
+  font-weight: 500;
+}
+
 .usage-cell {
   min-width: 140px;
 }

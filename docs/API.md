@@ -590,7 +590,7 @@ Read one client's alias allowlist — which aliases it may call and see.
 | Field | Notes |
 |---|---|
 | `mode` | `unrestricted` \| `restricted`. |
-| `aliases` | Sorted alias keys. Empty when `mode` is `unrestricted`. |
+| `aliases` | Sorted alias keys. Empty when `mode` is `unrestricted` — and that empty array means **every** alias is allowed, never "none". |
 
 **`unrestricted` is the default state of every client that was never configured**:
 no rows means every alias in the registry is allowed, exactly as before this

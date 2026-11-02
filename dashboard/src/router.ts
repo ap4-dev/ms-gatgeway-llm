@@ -57,7 +57,9 @@ export const router = createRouter({
       path: '/quotas',
       name: 'quotas',
       component: QuotasView,
-      meta: { title: 'Quotas' },
+      // Covers both access controls (allowlist + quotas). The path stays
+      // `/quotas` so bookmarks and docs links keep working.
+      meta: { title: 'Client access' },
     },
     {
       path: '/logs',

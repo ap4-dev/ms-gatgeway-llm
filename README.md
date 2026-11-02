@@ -181,6 +181,16 @@ Además de la cuota, un cliente puede tener una **allowlist**: qué aliases pued
 usar y ver. La unidad es `(cliente × alias)`; **sin filas el cliente es
 ilimitado** (ve y usa todos los aliases, como antes de que existiera la feature).
 
+Se administra desde el dashboard, en la vista **Client access**
+(`/dashboard/quotas`): elegí el cliente, agregá o quitá aliases y guardá. Es la
+misma vista donde se cargan las cuotas mensuales, a propósito: con la allowlist y
+las cuotas del mismo cliente en pantalla, una **config contradictoria** se ve —
+una cuota sobre un alias que el cliente no tiene permitido es config muerta,
+porque la request se rechaza con `403` antes de que corra el gate de cuotas. El
+dashboard marca esas filas, pero no bloquea nada: el servidor es la autoridad.
+
+Para uso scripteado, los mismos endpoints:
+
 ```bash
 KEY="sk-<key-con-scope-admin>"
 
@@ -198,6 +208,22 @@ curl -s -X DELETE http://localhost:3000/admin/clients/tenant-acme/aliases \
   -H "Authorization: Bearer $KEY"
 ```
 
+**`unrestricted` viene con `aliases: []`, y esa lista vacía no significa "no
+puede usar nada"**: significa lo contrario, que puede usar **todos** los aliases
+del registry. Es el estado de todo cliente que nunca se configuró, y por eso un
+`PUT` con la lista vacía se rechaza (`400`): como *sin filas = ilimitado*,
+aceptar `[]` daría acceso total justo cuando el operador quería lo contrario. Para
+limpiar, `DELETE` (o **Return to unrestricted** en el dashboard).
+
+**Al activar la allowlist, el cliente tiene que pedir un alias.** El gate compara
+`body.model` tal cual contra la lista. Un request con un path `provider/model`
+(`nan/qwen3.6`) o con una model key suelta (`qwen3.6`) — que sin allowlist
+funcionan, porque el gateway los resuelve fuera del registry de aliases — pasa a
+responder `403` para un cliente restringido: ese string no es un alias permitido.
+Es deliberado: la allowlist habla de aliases, y cualquier otra forma de nombrar un
+modelo es ambigua para el operador que la configuró. Cargá el alias que el cliente
+debe usar y hacé que el cliente lo pida por ese nombre.
+
 **Qué observa el cliente cuando pide un alias que no está en su lista:**
 
 - En `/v1/chat/completions` (y `/v1/messages`): `403` con
@@ -207,10 +233,6 @@ curl -s -X DELETE http://localhost:3000/admin/clients/tenant-acme/aliases \
 - En `/v1/models`: el alias **no aparece**. Un alias prohibido es
   indistinguible de uno que no existe — el listado no filtra información sobre
   lo que el cliente no puede usar.
-
-Un `PUT` con la lista vacía se rechaza (`400`): como *sin filas = ilimitado*,
-aceptar `[]` daría acceso total justo cuando el operador quería lo contrario. Para
-limpiar, `DELETE`.
 
 **El chequeo usa el alias pedido, nunca el alias servido**, y corre antes del gate
 de cuotas. Consecuencia deliberada: si una request se **degrada por cuota** hacia
