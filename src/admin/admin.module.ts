@@ -2,12 +2,14 @@ import { Module } from '@nestjs/common';
 import { AdminClientsController } from './admin-clients.controller';
 import { AdminAliasesController } from './admin-aliases.controller';
 import { AdminQuotaController } from './admin-quota.controller';
+import { AdminAliasAccessController } from './admin-alias-access.controller';
 import { AdminProvidersController } from './admin-providers.controller';
 import { AdminLogsController } from './admin-logs.controller';
 import { AdminStatsController } from './admin-stats.controller';
 import { SQLiteAdminController } from './sqlite-admin.controller';
 import { ChatModule } from '../chat/chat.module';
 import { QuotaModule } from '../quota/quota.module';
+import { AliasAccessModule } from '../access/alias-access.module';
 
 /**
  * Phase 5.5+ admin module. Imports {@link ChatModule} only because the
@@ -19,13 +21,18 @@ import { QuotaModule } from '../quota/quota.module';
  *
  * {@link QuotaModule} is imported explicitly because `AdminQuotaController`
  * needs `QuotaService` and `ChatModule` does not re-export it.
+ *
+ * {@link AliasAccessModule} is imported the same way, for the same reason:
+ * `AdminAliasAccessController` needs `AliasAccessService`, which no other
+ * module re-exports.
  */
 @Module({
-    imports: [ChatModule, QuotaModule],
+    imports: [ChatModule, QuotaModule, AliasAccessModule],
     controllers: [
         AdminClientsController,
         AdminAliasesController,
         AdminQuotaController,
+        AdminAliasAccessController,
         AdminProvidersController,
         AdminLogsController,
         AdminStatsController,
