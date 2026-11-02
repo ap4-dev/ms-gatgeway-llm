@@ -313,13 +313,42 @@ pnpm db:migrate -- --dry-run
 # Copia consistente de la DB antes de aplicar (VACUUM INTO)
 pnpm db:migrate -- --backup
 
-# Apuntar a otra base (por defecto toma DATABASE_PATH de .env)
+# Apuntar a otra base (omite Doppler: es la vía offline)
 pnpm db:migrate -- --db ./data/otra.db
 ```
 
-Cada corrida imprime la **ruta absoluta de la base y del directorio de
-migraciones** al empezar: este comando puede tocar un entorno real, así que no
-deja lugar a dudas sobre qué base se modificó.
+**Resuelve la base igual que el servidor.** `src/main.ts` llama `inyectEnv()`
+(Doppler) **antes** de `getEnv()`, así que en un entorno real el
+`DATABASE_PATH` que el gateway abre viene de Doppler. Este comando hace lo
+mismo:
+
+- **Con `START_TOKEN` definido:** carga los mismos secretos desde Doppler
+  (proyecto `MS`, config según `NODE_ENV`, p. ej. `ms-proxy-llm/prd`) y recién
+  entonces resuelve `DATABASE_PATH` — el mismo archivo que leerá el gateway.
+- **Si esa consulta falla:** aborta con exit 1. Nunca cae al default del schema
+  (`./data/ms-gateway.db`): un fallback silencioso es exactamente cómo se
+  termina migrando la base equivocada. El mensaje pide arreglar
+  `START_TOKEN`/`MS`/`NODE_ENV` o pasar `--db`.
+- **`--db <path>`:** overrides todo y no contacta Doppler — es la vía
+  deliberada y offline (sin red).
+- **Sin `START_TOKEN`:** comportamiento local de siempre — `.env`, luego el
+  shell, luego el default; no hay red.
+
+Cada corrida imprime la **ruta absoluta de la base, el directorio de
+migraciones y el origen de esa ruta** al empezar:
+
+```text
+db-migrate · status
+  database:   /srv/app/data/gateway.db  (from Doppler ms-proxy-llm/prd)
+  migrations: /srv/app/migrations
+```
+
+El origen puede ser `Doppler <proyecto>/<config>`, `.env`, `shell`, `default`
+o `--db`. Este comando puede tocar un entorno real, así que no deja lugar a
+dudas sobre qué base se modificó ni por qué se eligió.
+
+> ⚠️ **Sin `--db`, en un entorno con Doppler configurado, el comando apunta a
+> lo que Doppler diga.** Antes de confirmar, lee la línea `database:` impresa.
 
 - `--backup` escribe `<db-sin-extensión>.backup-<timestamp-UTC>.db` con
   `VACUUM INTO` (síncrono, copia consistente y compactada; requiere SQLite

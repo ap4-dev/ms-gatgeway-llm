@@ -18,6 +18,22 @@ import { MigrationRunner, type MigrationRecord } from './migration-runner';
  * exported pure/reporting helpers, and a `main(argv, deps?)` entry that returns
  * `{ text, exitCode }` and never calls `process.exit` itself. The thin runtime
  * shim is `scripts/db-migrate.js`, which runs the compiled `dist/` output.
+ *
+ * **It resolves the target exactly like the server does.** `main.ts` calls
+ * `inyectEnv()` (Doppler) BEFORE `getEnv()`, so Doppler's `DATABASE_PATH` is
+ * the one the gateway opens. A CLI that only read `.env` could migrate one
+ * file while the gateway served another, so:
+ *
+ *   - `--db <path>` is the explicit operator escape hatch (no network).
+ *   - with `START_TOKEN` set the secrets are loaded through the SAME
+ *     `inyectEnv()` the server uses, with the per-key value logging muted.
+ *   - if that lookup fails the command aborts with exit 1. Falling back to the
+ *     schema default would silently migrate the wrong database.
+ *   - without `START_TOKEN` nothing changes: `.env`, then the shell, then the
+ *     default.
+ *
+ * Every run prints where the path came from (`database: … (from …)`) so an
+ * operator can see why that file was chosen before confirming anything.
  */
 
 /** Path used by `env.schema.ts` when `DATABASE_PATH` is unset. */
@@ -54,7 +70,30 @@ export interface MainDeps {
     now?: () => Date;
     /** Version seam; when it reports < 3.27 the async backup fallback is used. */
     sqliteVersion?: string;
+    /**
+     * Loads the secrets the server loads at boot (Doppler) and must populate
+     * `opts.env` with them, exactly like `inyectEnv` populates `process.env`.
+     * Defaults to the real `inyectEnv`; tests inject a double instead of
+     * touching the network.
+     */
+    loadSecrets?: SecretsLoader;
 }
+
+export interface SecretsLoaderOptions {
+    /** The environment object the loader must write the loaded secrets into. */
+    env: NodeJS.ProcessEnv;
+    /** True when per-key value logging must be suppressed. */
+    quiet: boolean;
+}
+
+export interface SecretsProvenance {
+    /** Doppler project (`MS`). */
+    project: string;
+    /** Doppler config (`dev` | `stg` | `prd`). */
+    config: string;
+}
+
+export type SecretsLoader = (opts: SecretsLoaderOptions) => Promise<SecretsProvenance>;
 
 export class CliError extends Error {
     constructor(
@@ -112,9 +151,24 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
 
 // --- path resolution ----------------------------------------------------
 
+/** Provenance labels printed next to the resolved path. */
+export const PROVENANCE_FLAG = '--db';
+export const PROVENANCE_ENV_FILE = '.env';
+export const PROVENANCE_SHELL = 'shell';
+export const PROVENANCE_DEFAULT = 'default';
+
+/** `Doppler <project>/<config>` — the values `inyectEnv` derives. */
+export function dopplerProvenanceLabel(p: SecretsProvenance): string {
+    return `Doppler ${p.project}/${p.config}`;
+}
+
 /**
  * Resolve the database path exactly like the app does: `--db`, else
  * `DATABASE_PATH`, else `./data/ms-gateway.db`, relative to `cwd`.
+ *
+ * Resolution assumes the caller has already merged the sources in the same
+ * order the server does (`.env`, then Doppler, then the process environment).
+ * `resolveTarget` below is the entry point that guarantees that.
  */
 export function resolveDatabasePath(opts: {
     db?: string;
@@ -260,10 +314,15 @@ function readSqliteVersion(db: Database.Database): string {
 
 // --- rendering ----------------------------------------------------------
 
-function targetHeader(mode: Mode, dbPath: string, migrationsDir: string): string[] {
+function targetHeader(
+    mode: Mode,
+    dbPath: string,
+    migrationsDir: string,
+    provenance: string,
+): string[] {
     return [
         `db-migrate · ${mode}`,
-        `  database:   ${dbPath}`,
+        `  database:   ${dbPath}  (from ${provenance})`,
         `  migrations: ${migrationsDir}`,
     ];
 }
@@ -376,6 +435,7 @@ function isPromise<T>(value: T | Promise<T>): value is Promise<T> {
 interface ApplyOptions {
     dbPath: string;
     migrationsDir: string;
+    provenance: string;
     backup: boolean;
     now: () => Date;
     sqliteVersion?: string;
@@ -438,7 +498,7 @@ function runApply(o: ApplyOptions): CliResult | Promise<CliResult> {
         return failureResult(err);
     }
 
-    const header = targetHeader('apply', o.dbPath, o.migrationsDir);
+    const header = targetHeader('apply', o.dbPath, o.migrationsDir, o.provenance);
 
     const finish = (backup?: BackupOutcome): CliResult => {
         try {
@@ -491,6 +551,7 @@ function runApply(o: ApplyOptions): CliResult | Promise<CliResult> {
 function runStatus(o: {
     dbPath: string;
     migrationsDir: string;
+    provenance: string;
     mode: Extract<Mode, 'status' | 'dry-run'>;
 }): CliResult {
     let files: string[];
@@ -518,7 +579,7 @@ function runStatus(o: {
     const known = new Set(appliedNames);
     return {
         text: renderStatus({
-            header: targetHeader(o.mode, o.dbPath, o.migrationsDir),
+            header: targetHeader(o.mode, o.dbPath, o.migrationsDir, o.provenance),
             applied: appliedNames,
             pending: files.filter((f) => !known.has(f)),
             mode: o.mode,
@@ -527,13 +588,163 @@ function runStatus(o: {
     };
 }
 
-/** Load `<cwd>/.env` so `DATABASE_PATH` matches what `@nestjs/config` reads. */
-function loadDotenv(cwd: string): void {
+/**
+ * Load `<cwd>/.env` into `env` so `DATABASE_PATH` matches what `dotenv/config`
+ * seeds before Doppler (and before `@nestjs/config`) reads it. `env` defaults
+ * to `process.env`, but an injected environment (tests) is honoured so the
+ * merge is observable.
+ */
+function loadDotenv(cwd: string, env: NodeJS.ProcessEnv): void {
     try {
-        loadDotenvFile({ path: resolve(cwd, '.env'), quiet: true });
+        loadDotenvFile({ path: resolve(cwd, '.env'), quiet: true, processEnv: env });
     } catch {
         // No .env (or dotenv unavailable) — fall back to the shell environment.
     }
+}
+
+/**
+ * The real secrets loader: the SAME `inyectEnv` the server calls at boot
+ * (`main.ts`), with per-key value logging muted. Loaded lazily so the CLI does
+ * not drag `@nestjs/common` / the Doppler SDK into every invocation (and so
+ * `--db` really is an offline path).
+ *
+ * `inyectEnv` writes into `process.env`; when the caller injected a different
+ * `env` object (tests), that object is the one resolution reads, so the loaded
+ * `DATABASE_PATH` is mirrored onto it.
+ */
+async function loadSecretsWithDoppler(
+    opts: SecretsLoaderOptions,
+): Promise<SecretsProvenance> {
+    const { inyectEnv } = await import('../../app.enviroment.js');
+    const result = await inyectEnv({ quiet: opts.quiet });
+    if (opts.env !== process.env && process.env.DATABASE_PATH !== undefined) {
+        opts.env.DATABASE_PATH = process.env.DATABASE_PATH;
+    }
+    return { project: result.project, config: result.config };
+}
+
+/**
+ * A short reason for a failed Doppler lookup.
+ *
+ * The SDK rejects with a plain object (`{ title, statusCode, detail }`), and
+ * `String(err)` would print `[object Object]`. Summarise status + title only:
+ * never dump the payload, because an error body is untrusted text that can end
+ * up in a ticket next to real secrets.
+ */
+function describeSecretsError(err: unknown): string {
+    if (err === null || err === undefined) return 'unknown error';
+    const o = err as { title?: unknown; message?: unknown; statusCode?: unknown };
+    const parts: Array<string | number> = [];
+    if (typeof o.statusCode === 'number') parts.push(o.statusCode);
+    if (typeof o.title === 'string' && o.title.trim() !== '') {
+        parts.push(o.title.trim());
+    } else if (
+        typeof o.message === 'string' &&
+        o.message.trim() !== '' &&
+        o.message.trim() !== '[object Object]'
+    ) {
+        parts.push(o.message.trim());
+    }
+    if (parts.length > 0) return parts.join(' ');
+    if (typeof err === 'string' && err.trim() !== '') return err.trim();
+    return 'unknown error';
+}
+
+/**
+ * Abort rather than guess. A silent fallback to `./data/ms-gateway.db` here is
+ * exactly how the wrong database gets migrated: the server would have read
+ * `DATABASE_PATH` from Doppler and opened a different file.
+ */
+function secretsFailure(err: unknown): CliError {
+    return new CliError(
+        1,
+        [
+            'the database path could not be resolved safely: the Doppler secrets the',
+            `server loads at boot could not be loaded (${describeSecretsError(err)}).`,
+            '',
+            'The gateway takes DATABASE_PATH from Doppler, so continuing with the .env or',
+            'schema default here could migrate a DIFFERENT file than the one the gateway',
+            'will read. Nothing was written and no migration was applied.',
+            '',
+            'Fix START_TOKEN / MS / NODE_ENV so the lookup succeeds, or pass --db <path>',
+            'to target a database deliberately (--db never contacts Doppler).',
+        ].join('\n'),
+    );
+}
+
+export interface ResolvedTarget {
+    dbPath: string;
+    /** Human label explaining why that path was chosen. */
+    provenance: string;
+}
+
+/**
+ * Resolve the database the way the server does, and label the provenance.
+ *
+ * Priority: `--db` (offline) → Doppler `DATABASE_PATH` (when `START_TOKEN` is
+ * set) → `.env` → shell → schema default. Note that `.env` is loaded FIRST and
+ * Doppler second, which is the order `dotenv/config` + `inyectEnv` produce at
+ * boot: Doppler wins because it is applied later.
+ */
+export async function resolveTarget(
+    opts: {
+        db?: string;
+        env: NodeJS.ProcessEnv;
+        cwd: string;
+        loadEnv: boolean;
+        loadSecrets?: SecretsLoader;
+    },
+): Promise<ResolvedTarget> {
+    const { db, env, cwd } = opts;
+
+    // The explicit override: no Doppler, no network, no guessing.
+    if (db !== undefined) {
+        if (opts.loadEnv) loadDotenv(cwd, env);
+        return {
+            dbPath: resolveDatabasePath({ db, env, cwd }),
+            provenance: PROVENANCE_FLAG,
+        };
+    }
+
+    // Capture the shell value before `.env` is merged: dotenv never overrides
+    // an existing variable, so a pre-existing value is the shell's.
+    const shellHasPath = env.DATABASE_PATH !== undefined && env.DATABASE_PATH !== '';
+    if (opts.loadEnv) loadDotenv(cwd, env);
+    const localProvenance = shellHasPath
+        ? PROVENANCE_SHELL
+        : env.DATABASE_PATH !== undefined && env.DATABASE_PATH !== ''
+          ? PROVENANCE_ENV_FILE
+          : PROVENANCE_DEFAULT;
+
+    const startToken = env.START_TOKEN;
+    if (!startToken) {
+        // Local-development path: no network, no Doppler, unchanged behaviour.
+        return { dbPath: resolveDatabasePath({ env, cwd }), provenance: localProvenance };
+    }
+
+    const beforeDoppler = env.DATABASE_PATH;
+    let secrets: SecretsProvenance;
+    try {
+        secrets = await (opts.loadSecrets ?? loadSecretsWithDoppler)({
+            env,
+            quiet: true,
+        });
+    } catch (err) {
+        throw secretsFailure(err);
+    }
+
+    const dopplerLabel = dopplerProvenanceLabel(secrets);
+    const suppliedByDoppler =
+        env.DATABASE_PATH !== undefined && env.DATABASE_PATH !== beforeDoppler;
+
+    return {
+        dbPath: resolveDatabasePath({ env, cwd }),
+        provenance: suppliedByDoppler
+            ? dopplerLabel
+            : // Doppler was consulted but did not carry the path: say both,
+              // so the label never claims more than it knows.
+              `${dopplerLabel} + ${localProvenance}`,
+    };
 }
 
 export const HELP = `
@@ -554,9 +765,21 @@ USAGE
   pnpm db:migrate -- --help
 
 TARGET
-  database:   --db, else DATABASE_PATH from <cwd>/.env, else ./data/ms-gateway.db
+  database:   --db, else resolved EXACTLY like the server does.
+              main.ts calls inyectEnv() (Doppler) before getEnv(), so with
+              START_TOKEN set this command loads the same secrets first and
+              DATABASE_PATH is the file the gateway will actually open.
+              If that lookup fails the command aborts (exit 1) instead of
+              falling back to the default: guessing is how the wrong database
+              gets migrated.
+              Without START_TOKEN: <cwd>/.env, then the shell, then the default.
   migrations: resolve(cwd, 'migrations') — the same path the gateway resolves
-  Both are printed on every run so there is no ambiguity about what was touched.
+
+  Every run prints the resolved path AND where it came from, so read that line
+  before confirming:
+    database:   /srv/app/data/gateway.db  (from Doppler ms-proxy-llm/prd)
+    database:   /srv/app/data/ms-gateway.db  (from .env)
+    database:   /tmp/other.db  (from --db)
 
 BACKUP
   --backup writes <db-without-extension>.backup-<UTC-timestamp>.db using
@@ -577,14 +800,15 @@ STOP THE GATEWAY FIRST
 /**
  * Entry point. Returns text + exit code (never calls `process.exit`).
  *
- * Synchronous for the normal paths. When `--backup` runs against a SQLite older
- * than 3.27 the copy falls back to better-sqlite3's async `db.backup()` API and
- * the returned value is a promise, so callers should `await`/`Promise.resolve`.
+ * Unconditionally async: resolving the target may require the Doppler lookup
+ * the server performs at boot. `scripts/db-migrate.js` normalises with
+ * `Promise.resolve(...).then(...)`, which awaits it and propagates the exit
+ * code; the apply path keeps its own async backup fallback.
  */
-export function main(
+export async function main(
     argv: readonly string[],
     deps: MainDeps = {},
-): CliResult | Promise<CliResult> {
+): Promise<CliResult> {
     const args = parseArgs(argv);
 
     if (args.help) return { text: HELP, exitCode: 0 };
@@ -599,22 +823,28 @@ export function main(
 
     const cwd = deps.cwd ?? process.cwd();
     try {
-        if (deps.loadEnv !== false) loadDotenv(cwd);
-        const env = deps.env ?? process.env;
-        const dbPath = resolveDatabasePath({ db: args.db, env, cwd });
+        const target = await resolveTarget({
+            db: args.db,
+            env: deps.env ?? process.env,
+            cwd,
+            loadEnv: deps.loadEnv !== false,
+            loadSecrets: deps.loadSecrets,
+        });
         const migrationsDir = resolveMigrationsDir(cwd);
 
         if (args.status || args.dryRun) {
             return runStatus({
-                dbPath,
+                dbPath: target.dbPath,
                 migrationsDir,
+                provenance: target.provenance,
                 mode: args.dryRun ? 'dry-run' : 'status',
             });
         }
 
-        return runApply({
-            dbPath,
+        return await runApply({
+            dbPath: target.dbPath,
             migrationsDir,
+            provenance: target.provenance,
             backup: Boolean(args.backup),
             now: deps.now ?? (() => new Date()),
             sqliteVersion: deps.sqliteVersion,

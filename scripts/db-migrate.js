@@ -9,6 +9,13 @@
      pnpm db:migrate -- --backup    # consistent DB copy before applying
      pnpm db:migrate -- --db ./data/other.db
 
+   The target database is resolved the same way the server resolves it: with
+   START_TOKEN set the CLI loads Doppler exactly as `inyectEnv()` does at boot,
+   so DATABASE_PATH is the file the gateway actually opens. If that lookup
+   fails the command aborts (exit 1) instead of guessing. `--db <path>` skips
+   Doppler entirely and is the offline path. Every run prints the resolved
+   database path and where it came from.
+
    This is a thin shim: it runs the COMPILED output in dist/ so the migration
    applied is exactly the one the built server expects to find recorded in
    `_migrations`. The pure logic + spec live in
@@ -34,8 +41,9 @@ function run() {
         throw err;
     }
 
-    // `main` is synchronous unless --backup had to fall back to the async
-    // better-sqlite3 backup API, so normalise with Promise.resolve.
+    // `main` is unconditionally async (it may need the Doppler lookup the
+    // server performs at boot). Promise.resolve keeps the sync-or-async
+    // contract moot and `.then` still sees the reported exit code.
     Promise.resolve(cli.main(process.argv.slice(2)))
         .then((result) => {
             if (result && typeof result.text === 'string') {
